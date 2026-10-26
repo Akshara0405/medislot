@@ -4,11 +4,10 @@ name: MediSlot Milestone 2 CI and Deployment
 on:
   pull_request:
     branches: [main]
-
   push:
-    branches:
-      - main
-      - "feature/**"
+    branches: 
+        - main
+        - "feature/**"
     paths:
       - "cloudformation/**"
       - "lambdas/**"
@@ -18,7 +17,6 @@ on:
       - "requirements-dev.txt"
       - "README.md"
       - "schema/**"
-
   workflow_dispatch:
 
 permissions:
@@ -106,20 +104,17 @@ jobs:
             exit 1
           fi
 
-      # Diagnostic step: checks branch, region, and whether the role ARN exists.
-      - name: Check deployment configuration
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Branch: $GITHUB_REF"
-          echo "AWS region: $AWS_REGION"
+      - name: Diagnose GitHub OIDC claims
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const token = await core.getIDToken('sts.amazonaws.com');
+            const payload = JSON.parse(
+              Buffer.from(token.split('.')[1], 'base64url').toString()
+            );
 
-          if [[ -n "$AWS_DEPLOY_ROLE_ARN" ]]; then
-            echo "Role ARN is configured: yes"
-          else
-            echo "::error::Role ARN is not configured."
-            exit 1
-          fi
+            console.log('OIDC subject (sub):', payload.sub);
+            console.log('OIDC audience (aud):', payload.aud);
 
       - name: Configure AWS credentials with OIDC
         uses: aws-actions/configure-aws-credentials@v4
@@ -281,3 +276,4 @@ jobs:
               body = json.loads(body)
           assert body.get("connected") is True, result
           '
+#
