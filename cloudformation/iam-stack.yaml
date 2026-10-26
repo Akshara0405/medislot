@@ -1,0 +1,100 @@
+
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  MediSlot IAM deployment permissions for GitHub Actions,
+  including the regional API Gateway CloudWatch logging role.
+  Lambda execution roles remain managed by auth-stack.yaml.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+
+  GitHubActionsRoleName:
+    Type: String
+    Default: MediSlot-GitHubActions-DeployRole
+
+Resources:
+  MediSlotGitHubActionsDeploymentPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub MediSlot-${Environment}-GitHubActionsDeploymentPolicy
+      Roles:
+        - !Ref GitHubActionsRoleName
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ManageMediSlotChangeSets
+            Effect: Allow
+            Action:
+              - cloudformation:CreateChangeSet
+              - cloudformation:DescribeChangeSet
+              - cloudformation:ExecuteChangeSet
+              - cloudformation:DeleteChangeSet
+              - cloudformation:DescribeStacks
+              - cloudformation:DescribeStackEvents
+              - cloudformation:DescribeStackResources
+              - cloudformation:GetTemplate
+            Resource:
+              - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-iam/*
+              - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-network/*
+              - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-data/*
+              - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-auth/*
+
+          - Sid: InspectCloudFormation
+            Effect: Allow
+            Action:
+              - cloudformation:ValidateTemplate
+              - cloudformation:DescribeStackResources
+            Resource: "*"
+
+          - Sid: ReadCallerIdentity
+            Effect: Allow
+            Action:
+              - sts:GetCallerIdentity
+            Resource: "*"
+
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: MediSlotApiGatewayCloudWatchRole
+      Description: Allows API Gateway to publish execution logs to CloudWatch.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+      Tags:
+        - Key: Project
+          Value: MediSlot
+
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+
+Outputs:
+  DeploymentRoleName:
+    Description: GitHub Actions deployment role receiving the policy.
+    Value: !Ref GitHubActionsRoleName
+
+  DeploymentPolicyName:
+    Description: Name of the attached deployment policy.
+    Value: !Ref MediSlotGitHubActionsDeploymentPolicy
+
+  ApiGatewayCloudWatchRoleArn:
+    Description: Regional API Gateway CloudWatch logging role.
+    Value: !GetAtt ApiGatewayCloudWatchRole.Arn
+     

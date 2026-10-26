@@ -1,0 +1,264 @@
+
+name: MediSlot Milestone 2 CI and Deployment
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    paths:
+      - "cloudformation/**"
+      - "lambdas/**"
+      - "tests/**"
+      - "scripts/**"
+      - ".github/workflows/**"
+      - "requirements-dev.txt"
+      - "README.md"
+      - "schema/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+
+concurrency:
+  group: medislot-m2-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+  AWS_DEFAULT_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+  ENVIRONMENT: ${{ vars.ENVIRONMENT || 'dev' }}
+  AWS_DEPLOY_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN || secrets.AWS_DEPLOY_ROLE_ARN }}
+
+jobs:
+  ci:
+    name: ci
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install test dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Unit tests
+        env:
+          AWS_REGION: ap-south-1
+          AWS_DEFAULT_REGION: ap-south-1
+        run: pytest -q
+
+      - name: Python syntax check
+        run: python -m compileall -q lambdas tests
+
+      - name: Validate CloudFormation templates
+        run: |
+          pip install cfn-lint
+          cfn-lint cloudformation/*.yaml
+
+      - name: Secret scanning
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Infrastructure-as-code scanning
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: cloudformation
+          framework: cloudformation
+          soft_fail: true
+
+  deploy:
+    name: deploy
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: ci
+    runs-on: ubuntu-latest
+    environment: dev
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate required OIDC configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$AWS_DEPLOY_ROLE_ARN" ]]; then
+            echo "::error::Set AWS_DEPLOY_ROLE_ARN in GitHub repository variables or secrets."
+            exit 1
+          fi
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify OIDC identity
+        run: aws sts get-caller-identity
+
+      # The initial IAM bootstrap must be deployed by an authorized
+      # AWS administrator before this step can run successfully.
+      - name: Deploy IAM permissions stack
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python scripts/deploy_stack.py \
+            cloudformation/iam-stack.yaml \
+            "medislot-${ENVIRONMENT}-iam" \
+            "Environment=${ENVIRONMENT}" \
+            "GitHubActionsRoleName=MediSlot-GitHubActions-DeployRole"
+
+      - name: Deploy network stack
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python scripts/deploy_stack.py \
+            cloudformation/network-stack.yaml \
+            "medislot-${ENVIRONMENT}-network" \
+            "Environment=${ENVIRONMENT}"
+
+      - name: Create or verify SSM secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DB_PASSWORD_PARAMETER="/medislot/${ENVIRONMENT}/db/password"
+          JWT_SECRET_PARAMETER="/medislot/${ENVIRONMENT}/auth/jwt-secret"
+
+          if ! aws ssm get-parameter \
+            --name "$DB_PASSWORD_PARAMETER" \
+            --region "$AWS_REGION" >/dev/null 2>&1; then
+
+            DB_PASSWORD="$(python -c 'import secrets,string; a=string.ascii_letters+string.digits+"!_-+="; print("".join(secrets.choice(a) for _ in range(32)))')"
+
+            aws ssm put-parameter \
+              --name "$DB_PASSWORD_PARAMETER" \
+              --type SecureString \
+              --value "$DB_PASSWORD" \
+              --region "$AWS_REGION" >/dev/null
+
+            unset DB_PASSWORD
+          fi
+
+          if ! aws ssm get-parameter \
+            --name "$JWT_SECRET_PARAMETER" \
+            --region "$AWS_REGION" >/dev/null 2>&1; then
+
+            JWT_SECRET="$(python -c 'import secrets; print(secrets.token_urlsafe(64))')"
+
+            aws ssm put-parameter \
+              --name "$JWT_SECRET_PARAMETER" \
+              --type SecureString \
+              --value "$JWT_SECRET" \
+              --region "$AWS_REGION" >/dev/null
+
+            unset JWT_SECRET
+          fi
+
+      - name: Deploy data stack
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python scripts/deploy_stack.py \
+            cloudformation/data-stack.yaml \
+            "medislot-${ENVIRONMENT}-data" \
+            "Environment=${ENVIRONMENT}"
+
+      - name: Package and upload Lambda code
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          BUCKET="medislot-${ENVIRONMENT}-artifacts-${AWS_ACCOUNT_ID}"
+
+          for fn in authentication authorization; do
+            tmp="$(mktemp -d)"
+
+            cp -R "lambdas/${fn}/." "$tmp/"
+            cp "lambdas/common.py" "$tmp/common.py"
+
+            pip install --quiet \
+              -r "lambdas/${fn}/requirements.txt" \
+              -t "$tmp"
+
+            (
+              cd "$tmp"
+              zip -qr "$GITHUB_WORKSPACE/${fn}.zip" .
+            )
+
+            aws s3 cp \
+              "$GITHUB_WORKSPACE/${fn}.zip" \
+              "s3://${BUCKET}/lambda/${GITHUB_SHA}/${fn}.zip" \
+              --sse AES256 \
+              --region "$AWS_REGION"
+
+            rm -rf "$tmp" "$GITHUB_WORKSPACE/${fn}.zip"
+          done
+
+      - name: Deploy authentication API stack
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+
+          python scripts/deploy_stack.py \
+            cloudformation/auth-stack.yaml \
+            "medislot-${ENVIRONMENT}-auth" \
+            "Environment=${ENVIRONMENT}" \
+            "ArtifactBucket=medislot-${ENVIRONMENT}-artifacts-${ACCOUNT}" \
+            "ArtifactPrefix=lambda/${GITHUB_SHA}"
+
+      - name: Print deployed API outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws cloudformation describe-stacks \
+            --stack-name "medislot-${ENVIRONMENT}-auth" \
+            --region "$AWS_REGION" \
+            --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' \
+            --output table
+
+      - name: Test RDS connectivity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws lambda invoke \
+            --function-name "medislot-${ENVIRONMENT}-authentication" \
+            --payload '{"action":"health","correlationId":"github-actions-smoke-test"}' \
+            --cli-binary-format raw-in-base64-out \
+            /tmp/auth-health.json \
+            --region "$AWS_REGION" >/dev/null
+
+          cat /tmp/auth-health.json
+
+          python -c '
+          import json
+          with open("/tmp/auth-health.json") as f:
+              result = json.load(f)
+          body = result.get("body", {})
+          if isinstance(body, str):
+              body = json.loads(body)
+          assert body.get("connected") is True, result
+          '

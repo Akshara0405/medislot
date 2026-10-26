@@ -1,0 +1,301 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: MediSlot private RDS MySQL, DynamoDB state tables, S3 buckets and SSM runtime configuration.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, prod]
+
+Resources:
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets across two AZs for MediSlot RDS.
+      SubnetIds:
+        - Fn::ImportValue: !Sub 'MediSlot-${Environment}-PrivateSubnet1Id'
+        - Fn::ImportValue: !Sub 'MediSlot-${Environment}-PrivateSubnet2Id'
+      Tags: [{Key: Project, Value: MediSlot}]
+
+  MediSlotDatabase:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub 'medislot-${Environment}-mysql'
+      Engine: mysql
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+      StorageType: gp3
+      StorageEncrypted: true
+      PubliclyAccessible: false
+      MultiAZ: false
+      DBName: medislot
+      MasterUsername: medislot_admin
+      MasterUserPassword: !Sub '{{resolve:ssm-secure:/medislot/${Environment}/db/password}}'
+      Port: 3306
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - Fn::ImportValue: !Sub 'MediSlot-${Environment}-DatabaseSecurityGroupId'
+      BackupRetentionPeriod: 1
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'medislot-${Environment}-mysql'
+        - Key: Project
+          Value: MediSlot
+
+  SlotsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'MediSlot-${Environment}-Slots'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: slot_id
+          AttributeType: S
+        - AttributeName: doctor_date
+          AttributeType: S
+        - AttributeName: start_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: slot_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: GSI_DoctorDate
+          KeySchema:
+            - AttributeName: doctor_date
+              KeyType: HASH
+            - AttributeName: start_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'MediSlot-${Environment}-Idempotency'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: idempotency_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: idempotency_key
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  AuthTokensTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'MediSlot-${Environment}-AuthTokens'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: token_key
+          AttributeType: S
+        - AttributeName: token_type
+          AttributeType: S
+      KeySchema:
+        - AttributeName: token_key
+          KeyType: HASH
+        - AttributeName: token_type
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  WaitlistTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'MediSlot-${Environment}-Waitlist'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: slot_id
+          AttributeType: S
+        - AttributeName: waitlist_entry
+          AttributeType: S
+        - AttributeName: patient_id
+          AttributeType: S
+        - AttributeName: joined_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: slot_id
+          KeyType: HASH
+        - AttributeName: waitlist_entry
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI_PatientWaitlists
+          KeySchema:
+            - AttributeName: patient_id
+              KeyType: HASH
+            - AttributeName: joined_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+
+  HoldOffersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'MediSlot-${Environment}-HoldOffers'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: slot_id
+          AttributeType: S
+        - AttributeName: offer_id
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: expires_at
+          AttributeType: N
+      KeySchema:
+        - AttributeName: slot_id
+          KeyType: HASH
+        - AttributeName: offer_id
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI_OfferExpiry
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: expires_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  NotificationLogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'MediSlot-${Environment}-NotificationLog'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: dispatch_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: dispatch_key
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  DoctorPhotosBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'medislot-${Environment}-doctor-photos-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'medislot-${Environment}-artifacts-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+
+  DBHostParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/medislot/${Environment}/db/host'
+      Type: String
+      Value: !GetAtt MediSlotDatabase.Endpoint.Address
+      Description: MediSlot RDS endpoint hostname.
+
+  DBPortParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/medislot/${Environment}/db/port'
+      Type: String
+      Value: '3306'
+
+  DBNameParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/medislot/${Environment}/db/name'
+      Type: String
+      Value: medislot
+
+  DBUsernameParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/medislot/${Environment}/db/username'
+      Type: String
+      Value: medislot_admin
+
+  PasswordPolicyParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/medislot/${Environment}/auth/password-min-length'
+      Type: String
+      Value: '10'
+
+  AccessTokenMinutesParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/medislot/${Environment}/auth/access-token-minutes'
+      Type: String
+      Value: '15'
+
+  RefreshTokenDaysParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/medislot/${Environment}/auth/refresh-token-days'
+      Type: String
+      Value: '7'
+
+Outputs:
+  DBEndpoint:
+    Value: !GetAtt MediSlotDatabase.Endpoint.Address
+  DBName:
+    Value: medislot
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+  DoctorPhotosBucketName:
+    Value: !Ref DoctorPhotosBucket
+  SlotsTableName:
+    Value: !Ref SlotsTable
+  IdempotencyTableName:
+    Value: !Ref IdempotencyTable
+  AuthTokensTableName:
+    Value: !Ref AuthTokensTable
+  WaitlistTableName:
+    Value: !Ref WaitlistTable
+  HoldOffersTableName:
+    Value: !Ref HoldOffersTable
+  NotificationLogTableName:
+    Value: !Ref NotificationLogTable
