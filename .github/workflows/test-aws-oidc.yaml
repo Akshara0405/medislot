@@ -25,4 +25,6 @@ jobs:
           allowed-account-ids: 084767318885
 
       - name: Verify AWS connection
-        run: aws sts get-caller-identity
+        run: |
+          aws sts get-caller-identity
+          echo "Expected AWS account: 084767318885"
