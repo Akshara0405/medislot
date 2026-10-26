@@ -22,7 +22,7 @@ jobs:
           role-to-assume: arn:aws:iam::084767318885:role/MediSlot-GitHubActions-DeployRole
           aws-region: ap-south-1
           role-session-name: MediSlotOIDCTest
-          allowed-account-ids: 084767318885
+          
 
       - name: Verify AWS connection
         run: |
