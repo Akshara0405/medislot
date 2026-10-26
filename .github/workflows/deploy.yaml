@@ -4,10 +4,11 @@ name: MediSlot Milestone 2 CI and Deployment
 on:
   pull_request:
     branches: [main]
+
   push:
-    branches: 
-        - main
-        - "feature/**"
+    branches:
+      - main
+      - "feature/**"
     paths:
       - "cloudformation/**"
       - "lambdas/**"
@@ -17,6 +18,7 @@ on:
       - "requirements-dev.txt"
       - "README.md"
       - "schema/**"
+
   workflow_dispatch:
 
 permissions:
@@ -101,6 +103,21 @@ jobs:
 
           if [[ -z "$AWS_DEPLOY_ROLE_ARN" ]]; then
             echo "::error::Set AWS_DEPLOY_ROLE_ARN in GitHub repository variables or secrets."
+            exit 1
+          fi
+
+      # Diagnostic step: checks branch, region, and whether the role ARN exists.
+      - name: Check deployment configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Branch: $GITHUB_REF"
+          echo "AWS region: $AWS_REGION"
+
+          if [[ -n "$AWS_DEPLOY_ROLE_ARN" ]]; then
+            echo "Role ARN is configured: yes"
+          else
+            echo "::error::Role ARN is not configured."
             exit 1
           fi
 
@@ -264,4 +281,3 @@ jobs:
               body = json.loads(body)
           assert body.get("connected") is True, result
           '
-#
