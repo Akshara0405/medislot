@@ -80,7 +80,7 @@ jobs:
 
   deploy:
     name: deploy
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: github.ref == 'refs/heads/feature/milestone-2-foundation' && github.event_name != 'pull_request'
     needs: ci
     runs-on: ubuntu-latest
     environment: dev
