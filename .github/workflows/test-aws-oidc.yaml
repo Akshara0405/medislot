@@ -1,0 +1,28 @@
+
+name: Test GitHub OIDC Connection to AWS
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  test-aws-connection:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd
+        with:
+          role-to-assume: arn:aws:iam::084767318885:role/MediSlot-GitHubActions-DeployRole
+          aws-region: ap-south-1
+          role-session-name: MediSlotOIDCTest
+          allowed-account-ids: 084767318885
+
+      - name: Verify AWS connection
+        run: aws sts get-caller-identity
