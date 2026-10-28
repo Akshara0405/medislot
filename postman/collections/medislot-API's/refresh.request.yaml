@@ -1,0 +1,12 @@
+$kind: http-request
+description: ""
+url: https://3e8vm2fqga.execute-api.ap-south-1.amazonaws.com/dev/auth/refresh
+method: POST
+body:
+  type: json
+  content: "{\r
+
+    \    \"refreshToken\":\"_Q0x6mkN-6jvTFOaJo0XJp8ALVJYrabWOW2Jix8zXyITnSUvAnIjjTm2aUhUMpWl\"\r
+
+    }"
+order: 7000

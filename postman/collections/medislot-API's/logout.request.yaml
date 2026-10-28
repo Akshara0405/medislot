@@ -1,0 +1,16 @@
+$kind: http-request
+description: ""
+url: https://3e8vm2fqga.execute-api.ap-south-1.amazonaws.com/dev/auth/logout
+method: POST
+body:
+  type: json
+  content: "{\r
+
+    \  \"refreshToken\": \"0UOxy_P8iMdBp02GTkcNT2otvBKB5-XMyZpLmsQccPSODY4zGOQyVWRHXqoFzNEu\"\r
+
+    }"
+auth:
+  type: bearer
+  credentials:
+    token: "{{json_web_token_0nmg}}"
+order: 8000
