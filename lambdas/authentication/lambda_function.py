@@ -63,12 +63,12 @@ def register(data, role, cid):
     phone = str(data.get("phone", "")).strip()
     c = config()
     minimum = int(get_param(f"{c['prefix']}/auth/password-min-length"))
-    if (not re.fullmatch(r"[^@\\s]+@[^@\\s]+\\.[^@\\s]+", email) or len(email) > 254
+    if (not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or len(email) > 254
             or not first_name or len(first_name) > 75 or not last_name or len(last_name) > 75
             or not phone or len(phone) > 25):
         return response(400, {"message": "Valid email, firstName, lastName, and phone are required", "correlationId": cid})
     if (not isinstance(password, str) or len(password) < minimum or len(password.encode()) > 72
-            or not re.search(r"[A-Za-z]", password) or not re.search(r"\\d", password)):
+            or not re.search(r"[A-Za-z]", password) or not re.search(r"\d", password)):
         return response(400, {"message": f"Password must be at least {minimum} characters and include a letter and a digit", "correlationId": cid})
 
     if role == "patient":
@@ -85,7 +85,7 @@ def register(data, role, cid):
         hospital_id = data.get("hospitalId")
         qualification = str(data.get("qualification", "")).strip()
         experience = data.get("experienceYears", 0)
-        if not re.fullmatch(r"[A-Z]{2}-\\d{6}", license_number):
+        if not re.fullmatch(r"[A-Z]{2}-\d{6}", license_number):
             return response(400, {"message": "licenseNumber must match the format ST-123456 (two-letter state code, hyphen, six digits)", "correlationId": cid})
         if not specialization or len(specialization) > 120 or not qualification or len(qualification) > 150:
             return response(400, {"message": "specialization and qualification are required", "correlationId": cid})
@@ -193,3 +193,4 @@ def logout(event, data, cid):
             table.delete_item(Key={"token_key": key, "token_type": "REFRESH"})
     table.put_item(Item={"token_key": "JTI#" + claims["jti"], "token_type": "DENYLIST", "user_id": claims["sub"], "created_at": int(time.time()), "expires_at": int(claims["exp"]), "status": "REVOKED"})
     return response(200, {"message": "Logged out"})
+    
