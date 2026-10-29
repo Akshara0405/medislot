@@ -29,10 +29,50 @@ def dbconn(c):
           email VARCHAR(254) NOT NULL UNIQUE,
           password_hash VARCHAR(255) NOT NULL,
           role ENUM('patient','doctor') NOT NULL,
-          full_name VARCHAR(150) NOT NULL,
+          full_name VARCHAR(150) NULL,
           is_active BOOLEAN NOT NULL DEFAULT TRUE,
           created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
           updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)
+        ) ENGINE=InnoDB""")
+        # Keep the legacy column for backward compatibility, but stop requiring or populating it.
+        cur.execute("""SELECT IS_NULLABLE FROM information_schema.COLUMNS
+                       WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='users' AND COLUMN_NAME='full_name'""")
+        legacy_name = cur.fetchone()
+        if legacy_name and legacy_name["IS_NULLABLE"] == "NO":
+            cur.execute("ALTER TABLE users MODIFY full_name VARCHAR(150) NULL")
+        cur.execute("""CREATE TABLE IF NOT EXISTS hospitals (
+          hospital_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+          name VARCHAR(150) NOT NULL,
+          address VARCHAR(500) NULL,
+          city VARCHAR(100) NULL,
+          is_active BOOLEAN NOT NULL DEFAULT TRUE,
+          created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+          UNIQUE KEY uq_hospitals_name_city (name, city)
+        ) ENGINE=InnoDB""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS patients (
+          user_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+          first_name VARCHAR(75) NOT NULL,
+          last_name VARCHAR(75) NOT NULL,
+          phone VARCHAR(25) NOT NULL,
+          date_of_birth DATE NULL,
+          gender VARCHAR(30) NULL,
+          address VARCHAR(500) NULL,
+          created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+          CONSTRAINT fk_patients_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+        ) ENGINE=InnoDB""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS doctors (
+          user_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+          first_name VARCHAR(75) NOT NULL,
+          last_name VARCHAR(75) NOT NULL,
+          phone VARCHAR(25) NOT NULL,
+          specialization VARCHAR(120) NOT NULL,
+          license_number VARCHAR(32) NOT NULL UNIQUE,
+          hospital_id BIGINT UNSIGNED NOT NULL,
+          qualification VARCHAR(150) NOT NULL,
+          experience_years SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+          created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+          CONSTRAINT fk_doctors_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+          CONSTRAINT fk_doctors_hospital FOREIGN KEY (hospital_id) REFERENCES hospitals(hospital_id)
         ) ENGINE=InnoDB""")
     conn.commit()
     return conn

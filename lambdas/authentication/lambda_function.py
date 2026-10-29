@@ -58,20 +58,65 @@ def handler(event, context):
 def register(data, role, cid):
     email = str(data.get("email", "")).strip().lower()
     password = data.get("password", "")
-    full_name = str(data.get("fullName", "")).strip()
+    first_name = str(data.get("firstName", "")).strip()
+    last_name = str(data.get("lastName", "")).strip()
+    phone = str(data.get("phone", "")).strip()
     c = config()
     minimum = int(get_param(f"{c['prefix']}/auth/password-min-length"))
-    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or len(email) > 254 or not full_name or len(full_name) > 150:
-        return response(400, {"message": "Valid email and fullName are required", "correlationId": cid})
+    if (not re.fullmatch(r"[^@\\s]+@[^@\\s]+\\.[^@\\s]+", email) or len(email) > 254
+            or not first_name or len(first_name) > 75 or not last_name or len(last_name) > 75
+            or not phone or len(phone) > 25):
+        return response(400, {"message": "Valid email, firstName, lastName, and phone are required", "correlationId": cid})
     if (not isinstance(password, str) or len(password) < minimum or len(password.encode()) > 72
-            or not re.search(r"[A-Za-z]", password) or not re.search(r"\d", password)):
+            or not re.search(r"[A-Za-z]", password) or not re.search(r"\\d", password)):
         return response(400, {"message": f"Password must be at least {minimum} characters and include a letter and a digit", "correlationId": cid})
+
+    if role == "patient":
+        date_of_birth = data.get("dateOfBirth") or None
+        gender = str(data.get("gender", "")).strip() or None
+        address = str(data.get("address", "")).strip() or None
+        if gender and len(gender) > 30:
+            return response(400, {"message": "gender must be at most 30 characters", "correlationId": cid})
+        if address and len(address) > 500:
+            return response(400, {"message": "address must be at most 500 characters", "correlationId": cid})
+    else:
+        specialization = str(data.get("specialization", "")).strip()
+        license_number = str(data.get("licenseNumber", "")).strip().upper()
+        hospital_id = data.get("hospitalId")
+        qualification = str(data.get("qualification", "")).strip()
+        experience = data.get("experienceYears", 0)
+        if not re.fullmatch(r"[A-Z]{2}-\\d{6}", license_number):
+            return response(400, {"message": "licenseNumber must match the format ST-123456 (two-letter state code, hyphen, six digits)", "correlationId": cid})
+        if not specialization or len(specialization) > 120 or not qualification or len(qualification) > 150:
+            return response(400, {"message": "specialization and qualification are required", "correlationId": cid})
+        try:
+            hospital_id = int(hospital_id)
+            experience = int(experience)
+            if hospital_id <= 0 or experience < 0 or experience > 65535:
+                raise ValueError()
+        except (TypeError, ValueError):
+            return response(400, {"message": "A valid existing hospitalId and non-negative experienceYears are required", "correlationId": cid})
+
     hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12)).decode()
     conn = dbconn(c)
     try:
         with conn.cursor() as cur:
-            cur.execute("INSERT INTO users(email,password_hash,role,full_name) VALUES(%s,%s,%s,%s)", (email, hashed, role, full_name))
-            user_id = str(cur.lastrowid)
+            if role == "doctor":
+                cur.execute("SELECT hospital_id FROM hospitals WHERE hospital_id=%s AND is_active=TRUE", (hospital_id,))
+                if not cur.fetchone():
+                    conn.rollback()
+                    return response(400, {"message": "hospitalId must reference an existing active hospital", "correlationId": cid})
+            cur.execute("INSERT INTO users(email,password_hash,role,full_name) VALUES(%s,%s,%s,NULL)", (email, hashed, role))
+            user_id = int(cur.lastrowid)
+            if role == "patient":
+                cur.execute("""INSERT INTO patients(user_id,first_name,last_name,phone,date_of_birth,gender,address)
+                               VALUES(%s,%s,%s,%s,%s,%s,%s)""",
+                            (user_id, first_name, last_name, phone, date_of_birth, gender, address))
+            else:
+                cur.execute("""INSERT INTO doctors(user_id,first_name,last_name,phone,specialization,license_number,
+                               hospital_id,qualification,experience_years) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                            (user_id, first_name, last_name, phone, specialization, license_number,
+                             hospital_id, qualification, experience))
         conn.commit()
     except Exception as exc:
         conn.rollback()
@@ -80,8 +125,8 @@ def register(data, role, cid):
         raise
     finally:
         conn.close()
-    emit("info", "registration_succeeded", cid, role=role, userId=user_id)
-    return response(201, {"userId": user_id, "role": role, "message": "Registration successful"})
+    emit("info", "registration_succeeded", cid, role=role, userId=str(user_id))
+    return response(201, {"userId": str(user_id), "role": role, "message": "Registration successful"})
 
 
 def issue_access_token(user_id, role, secret, minutes):
@@ -126,16 +171,10 @@ def refresh(data, cid):
     now = int(time.time())
     if not item or item.get("status") != "ACTIVE" or int(item.get("expires_at", 0)) <= now:
         return response(401, {"message": "Invalid or revoked refresh token", "correlationId": cid})
-    try:
-        table.update_item(Key={"token_key": key, "token_type": "REFRESH"}, UpdateExpression="SET #s=:revoked", ConditionExpression="#s=:active", ExpressionAttributeNames={"#s": "status"}, ExpressionAttributeValues={":revoked": "REVOKED", ":active": "ACTIVE"})
-    except ClientError:
-        return response(401, {"message": "Invalid or already used refresh token", "correlationId": cid})
     minutes = int(get_param(f"{c['prefix']}/auth/access-token-minutes"))
-    days = int(get_param(f"{c['prefix']}/auth/refresh-token-days"))
-    access, now, _ = issue_access_token(item["user_id"], item["role"], c["jwt"], minutes)
-    new_raw = secrets.token_urlsafe(48)
-    table.put_item(Item={"token_key": "REFRESH#" + token_hash(new_raw), "token_type": "REFRESH", "user_id": item["user_id"], "role": item["role"], "created_at": now, "expires_at": now + days * 86400, "status": "ACTIVE"})
-    return response(200, {"accessToken": access, "tokenType": "Bearer", "expiresIn": minutes * 60, "refreshToken": new_raw})
+    access, _, _ = issue_access_token(item["user_id"], item["role"], c["jwt"], minutes)
+    # Keep the original refresh token and expiry; refreshing only creates a new access token.
+    return response(200, {"accessToken": access, "tokenType": "Bearer", "expiresIn": minutes * 60, "refreshToken": raw})
 
 
 def logout(event, data, cid):
@@ -151,6 +190,6 @@ def logout(event, data, cid):
         key = "REFRESH#" + token_hash(raw)
         item = table.get_item(Key={"token_key": key, "token_type": "REFRESH"}).get("Item")
         if item and item.get("user_id") == claims["sub"]:
-            table.update_item(Key={"token_key": key, "token_type": "REFRESH"}, UpdateExpression="SET #s=:revoked", ExpressionAttributeNames={"#s": "status"}, ExpressionAttributeValues={":revoked": "REVOKED"})
+            table.delete_item(Key={"token_key": key, "token_type": "REFRESH"})
     table.put_item(Item={"token_key": "JTI#" + claims["jti"], "token_type": "DENYLIST", "user_id": claims["sub"], "created_at": int(time.time()), "expires_at": int(claims["exp"]), "status": "REVOKED"})
     return response(200, {"message": "Logged out"})

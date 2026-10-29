@@ -17,3 +17,13 @@ def test_password_policy_examples():
     assert not valid("abcdefghij")
     assert not valid("1234567890")
     assert not valid("a" * 73 + "1")
+
+
+def test_doctor_license_number_format():
+    license_pattern = re.compile(r"[A-Z]{2}-\\d{6}")
+    assert license_pattern.fullmatch("TS-123456")
+    assert license_pattern.fullmatch("AP-000001")
+    assert not license_pattern.fullmatch("TS123456")
+    assert not license_pattern.fullmatch("TS-12345")
+    assert not license_pattern.fullmatch("TSS-123456")
+    assert not license_pattern.fullmatch("TS-12A456")
