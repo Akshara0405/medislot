@@ -18,6 +18,7 @@ on:
       - "README.md"
       - "schema/**"
       - "dashboard/**"
+      - "pytest.ini"
   workflow_dispatch:
 
 permissions:
