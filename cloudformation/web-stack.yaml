@@ -1,0 +1,128 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: MediSlot Flask doctor and patient web portal hosted on EC2. Instance is created and updated only through CloudFormation deployment.
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, prod]
+  ArtifactBucket:
+    Type: String
+  DashboardArtifactKey:
+    Type: String
+  ApiBaseUrl:
+    Type: String
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+Resources:
+  DashboardInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: DownloadDashboardArtifact
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub arn:${AWS::Partition}:s3:::${ArtifactBucket}/${DashboardArtifactKey}
+  DashboardInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref DashboardInstanceRole]
+  DashboardInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref DashboardInstanceProfile
+      SubnetId:
+        Fn::ImportValue: !Sub MediSlot-${Environment}-PublicSubnetId
+      SecurityGroupIds:
+        - Fn::ImportValue: !Sub MediSlot-${Environment}-WebSecurityGroupId
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 1
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 12
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          dnf update -y
+          dnf install -y python3 python3-pip unzip awscli
+          mkdir -p /opt/medislot
+          aws s3 cp s3://${ArtifactBucket}/${DashboardArtifactKey} /tmp/dashboard.zip --region ${AWS::Region}
+          unzip -o /tmp/dashboard.zip -d /opt/medislot
+          python3 -m venv /opt/medislot/venv
+          /opt/medislot/venv/bin/pip install --upgrade pip
+          /opt/medislot/venv/bin/pip install -r /opt/medislot/requirements.txt
+          cat > /etc/medislot-dashboard.env <<'ENVVARS'
+          API_BASE_URL=${ApiBaseUrl}
+          FLASK_SECRET_KEY={{resolve:ssm-secure:/medislot/${Environment}/web/flask-secret}}
+          ENVIRONMENT=${Environment}
+          ENVVARS
+          chmod 600 /etc/medislot-dashboard.env
+          cat > /usr/local/bin/refresh-medislot-dashboard.sh <<'REFRESH'
+          #!/bin/bash
+          set -euo pipefail
+          aws s3 cp s3://${ArtifactBucket}/${DashboardArtifactKey} /tmp/dashboard-latest.zip --region ${AWS::Region}
+          unzip -o /tmp/dashboard-latest.zip -d /opt/medislot
+          /opt/medislot/venv/bin/pip install -r /opt/medislot/requirements.txt
+          chown -R ec2-user:ec2-user /opt/medislot
+          REFRESH
+          chmod 750 /usr/local/bin/refresh-medislot-dashboard.sh
+          cat > /etc/systemd/system/medislot-dashboard.service <<'UNIT'
+          [Unit]
+          Description=MediSlot Flask dashboard
+          After=network-online.target
+          Wants=network-online.target
+          [Service]
+          User=ec2-user
+          Group=ec2-user
+          WorkingDirectory=/opt/medislot
+          EnvironmentFile=/etc/medislot-dashboard.env
+          ExecStartPre=/usr/local/bin/refresh-medislot-dashboard.sh
+          ExecStart=/opt/medislot/venv/bin/gunicorn --workers 2 --bind 0.0.0.0:80 app:app
+          Restart=always
+          RestartSec=5
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          chown -R ec2-user:ec2-user /opt/medislot
+          systemctl daemon-reload
+          systemctl enable medislot-dashboard
+          systemctl restart medislot-dashboard
+      Tags:
+        - Key: Name
+          Value: !Sub medislot-${Environment}-doctor-dashboard
+        - Key: Project
+          Value: MediSlot
+Outputs:
+  DashboardInstanceId:
+    Description: EC2 instance created by this CloudFormation stack.
+    Value: !Ref DashboardInstance
+  DashboardPublicIp:
+    Description: Public IPv4 address of the Flask dashboard.
+    Value: !GetAtt DashboardInstance.PublicIp
+  DashboardUrl:
+    Description: Doctor dashboard login URL.
+    Value: !Sub http://${DashboardInstance.PublicDnsName}/doctor/login

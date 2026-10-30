@@ -17,6 +17,7 @@ on:
       - "requirements-dev.txt"
       - "README.md"
       - "schema/**"
+      - "dashboard/**"
   workflow_dispatch:
 
 permissions:
@@ -186,6 +187,13 @@ jobs:
             unset JWT_SECRET
           fi
 
+          FLASK_SECRET_PARAMETER="/medislot/${ENVIRONMENT}/web/flask-secret"
+          if ! aws ssm get-parameter --name "$FLASK_SECRET_PARAMETER" --with-decryption --region "$AWS_REGION" >/dev/null 2>&1; then
+            FLASK_SECRET="$(python -c 'import secrets; print(secrets.token_urlsafe(64))')"
+            aws ssm put-parameter --name "$FLASK_SECRET_PARAMETER" --type SecureString --value "$FLASK_SECRET" --region "$AWS_REGION" >/dev/null
+            unset FLASK_SECRET
+          fi
+
       - name: Deploy data stack
         shell: bash
         run: |
@@ -204,7 +212,7 @@ jobs:
           AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
           BUCKET="medislot-${ENVIRONMENT}-artifacts-${AWS_ACCOUNT_ID}"
 
-          for fn in authentication authorization; do
+          for fn in authentication authorization doctor materializer; do
             tmp="$(mktemp -d)"
 
             cp -R "lambdas/${fn}/." "$tmp/"
@@ -228,6 +236,18 @@ jobs:
             rm -rf "$tmp" "$GITHUB_WORKSPACE/${fn}.zip"
           done
 
+      - name: Package and upload Flask dashboard
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+          BUCKET="medislot-${ENVIRONMENT}-artifacts-${ACCOUNT}"
+          mkdir -p /tmp/medislot-dashboard
+          cp -R dashboard/. /tmp/medislot-dashboard/
+          (cd /tmp/medislot-dashboard && zip -qr "$GITHUB_WORKSPACE/dashboard.zip" .)
+          aws s3 cp "$GITHUB_WORKSPACE/dashboard.zip" "s3://${BUCKET}/dashboard/current/dashboard.zip" --sse AES256 --region "$AWS_REGION"
+          rm -rf /tmp/medislot-dashboard "$GITHUB_WORKSPACE/dashboard.zip"
+
       - name: Deploy authentication API stack
         shell: bash
         run: |
@@ -241,6 +261,28 @@ jobs:
             "Environment=${ENVIRONMENT}" \
             "ArtifactBucket=medislot-${ENVIRONMENT}-artifacts-${ACCOUNT}" \
             "ArtifactPrefix=lambda/${GITHUB_SHA}"
+
+      - name: Deploy EC2 Flask dashboard stack
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+          API_URL="$(aws cloudformation describe-stacks --stack-name "medislot-${ENVIRONMENT}-auth" --region "$AWS_REGION" --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue | [0]" --output text)"
+          if [[ -z "$API_URL" || "$API_URL" == "None" ]]; then
+            echo "::error::ApiUrl output was not found in the authentication stack."
+            exit 1
+          fi
+          python scripts/deploy_stack.py \
+            cloudformation/web-stack.yaml \
+            "medislot-${ENVIRONMENT}-web" \
+            "Environment=${ENVIRONMENT}" \
+            "ArtifactBucket=medislot-${ENVIRONMENT}-artifacts-${ACCOUNT}" \
+            "DashboardArtifactKey=dashboard/current/dashboard.zip" \
+            "ApiBaseUrl=${API_URL}"
+
+          INSTANCE_ID="$(aws cloudformation describe-stacks --stack-name "medislot-${ENVIRONMENT}-web" --region "$AWS_REGION" --query "Stacks[0].Outputs[?OutputKey=='DashboardInstanceId'].OutputValue | [0]" --output text)"
+          aws ec2 reboot-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION"
+          aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID" --region "$AWS_REGION"
 
       - name: Print deployed API outputs
         shell: bash
