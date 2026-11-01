@@ -41,7 +41,7 @@ def home():
 @app.route('/doctor/register', methods=['GET', 'POST'])
 def signup():
     if request.method == 'GET':
-        return render_template('signup.html')
+        return render_template('signup.html', values={})
 
     photo = request.files.get('photo')
     required = ['first_name', 'last_name', 'email', 'phone', 'password', 'confirm_password',
@@ -178,4 +178,4 @@ def dashboard():
 
 @app.errorhandler(413)
 def file_too_large(_error):
-    return render_template('signup.html'), 413
+    return render_template('signup.html', values={}), 413
