@@ -72,9 +72,8 @@ Resources:
           mkdir -p /opt/medislot
           aws s3 cp s3://${ArtifactBucket}/${DashboardArtifactKey} /tmp/dashboard.zip --region ${AWS::Region}
           unzip -o /tmp/dashboard.zip -d /opt/medislot
-          python3 -m venv /opt/medislot/venv
-          /opt/medislot/venv/bin/pip install --upgrade pip
-          /opt/medislot/venv/bin/pip install -r /opt/medislot/requirements.txt
+          python3 -m venv --without-pip --system-site-packages /opt/medislot/venv
+          /opt/medislot/venv/bin/python -m pip install -r /opt/medislot/requirements.txt
           cat > /etc/medislot-dashboard.env <<'ENVVARS'
           API_BASE_URL=${ApiBaseUrl}
           FLASK_SECRET_KEY={{resolve:ssm-secure:/medislot/${Environment}/web/flask-secret}}
@@ -86,7 +85,7 @@ Resources:
           set -euo pipefail
           aws s3 cp s3://${ArtifactBucket}/${DashboardArtifactKey} /tmp/dashboard-latest.zip --region ${AWS::Region}
           unzip -o /tmp/dashboard-latest.zip -d /opt/medislot
-          /opt/medislot/venv/bin/pip install -r /opt/medislot/requirements.txt
+          /opt/medislot/venv/bin/python -m pip install -r /opt/medislot/requirements.txt
           chown -R ec2-user:ec2-user /opt/medislot
           REFRESH
           chmod 755 /usr/local/bin/refresh-medislot-dashboard.sh
