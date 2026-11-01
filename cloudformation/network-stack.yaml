@@ -92,10 +92,11 @@ Resources:
   EndpointSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: HTTPS access from Lambda to private AWS service endpoints.
+      GroupDescription: HTTPS access from Lambda and the dashboard EC2 to private AWS service endpoints.
       VpcId: !Ref MediSlotVPC
       SecurityGroupIngress:
         - {Description: HTTPS from Lambda, IpProtocol: tcp, FromPort: 443, ToPort: 443, SourceSecurityGroupId: !GetAtt LambdaSecurityGroup.GroupId}
+        - {Description: HTTPS from dashboard EC2 for SSM, IpProtocol: tcp, FromPort: 443, ToPort: 443, SourceSecurityGroupId: !GetAtt WebSecurityGroup.GroupId}
       Tags: [{Key: Name, Value: !Sub 'medislot-${Environment}-endpoint-sg'}]
   SSMInterfaceEndpoint:
     Type: AWS::EC2::VPCEndpoint
