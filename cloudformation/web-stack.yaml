@@ -89,7 +89,7 @@ Resources:
           /opt/medislot/venv/bin/pip install -r /opt/medislot/requirements.txt
           chown -R ec2-user:ec2-user /opt/medislot
           REFRESH
-          chmod 750 /usr/local/bin/refresh-medislot-dashboard.sh
+          chmod 755 /usr/local/bin/refresh-medislot-dashboard.sh
           cat > /etc/systemd/system/medislot-dashboard.service <<'UNIT'
           [Unit]
           Description=MediSlot Flask dashboard
@@ -98,6 +98,7 @@ Resources:
           [Service]
           User=ec2-user
           Group=ec2-user
+          AmbientCapabilities=CAP_NET_BIND_SERVICE
           WorkingDirectory=/opt/medislot
           EnvironmentFile=/etc/medislot-dashboard.env
           ExecStartPre=/usr/local/bin/refresh-medislot-dashboard.sh
