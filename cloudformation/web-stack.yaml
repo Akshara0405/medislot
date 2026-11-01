@@ -125,5 +125,5 @@ Outputs:
     Description: Public IPv4 address of the Flask dashboard.
     Value: !GetAtt DashboardInstance.PublicIp
   DashboardUrl:
-    Description: Doctor dashboard login URL.
-    Value: !Sub http://${DashboardInstance.PublicDnsName}/doctor/login
+    Description: MediSlot public landing page. Doctor sign-in and registration are available from this page.
+    Value: !Sub http://${DashboardInstance.PublicDnsName}/

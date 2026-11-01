@@ -287,8 +287,12 @@ Outputs:
     Value: !Ref ArtifactBucket
   DoctorPhotosBucketName:
     Value: !Ref DoctorPhotosBucket
+    Export:
+      Name: !Sub 'MediSlot-${Environment}-DoctorPhotosBucketName'
   SlotsTableName:
     Value: !Ref SlotsTable
+    Export:
+      Name: !Sub 'MediSlot-${Environment}-SlotsTableName'
   IdempotencyTableName:
     Value: !Ref IdempotencyTable
   AuthTokensTableName:
