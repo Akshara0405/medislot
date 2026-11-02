@@ -63,8 +63,10 @@ def handler(event,context):
                         ident=str(uuid.uuid4());cur.execute('INSERT INTO consultation_types(consultation_type_id,doctor_id,name,duration_min,fee_amount,capacity,is_active) VALUES(%s,%s,%s,%s,%s,%s,1)',(ident,doctor_id,name,duration,str(amount),capacity));status=201
                     else:
                         if not ident:return fail(400,'Type ID required')
-                        cur.execute('UPDATE consultation_types SET name=%s,duration_min=%s,fee_amount=%s,capacity=%s WHERE consultation_type_id=%s AND doctor_id=%s',(name,duration,str(amount),capacity,ident,doctor_id));status=200
-                        if not cur.rowcount:return fail(404,'Type not found')
+                        cur.execute('UPDATE consultation_types SET name=%s,duration_min=%s,fee_amount=%s,capacity=%s,is_active=1 WHERE consultation_type_id=%s AND doctor_id=%s',(name,duration,str(amount),capacity,ident,doctor_id));status=200
+                        if not cur.rowcount:
+                            cur.execute('SELECT 1 FROM consultation_types WHERE consultation_type_id=%s AND doctor_id=%s',(ident,doctor_id))
+                            if not cur.fetchone():return fail(404,'Type not found')
                     conn.commit();return response(status,{'consultationTypeId':ident})
                 if method=='DELETE' and ident:
                     cur.execute('UPDATE consultation_types SET is_active=0 WHERE consultation_type_id=%s AND doctor_id=%s',(ident,doctor_id));conn.commit();return response(200,{'deactivated':bool(cur.rowcount)})
