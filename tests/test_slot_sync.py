@@ -9,6 +9,7 @@ T30, T15, T60 = 'type-30', 'type-15', 'type-60'
 
 class FakeTable:
     def __init__(self): self.items = {}
+    def update_item(self, Key, ExpressionAttributeValues, **kw): self.items[Key['slot_id']]['status'] = ExpressionAttributeValues[':s']
     def query(self, IndexName, KeyConditionExpression, **kw):
         key = KeyConditionExpression._values[1]
         return {'Items': sorted((dict(i) for i in self.items.values() if i['doctor_date'] == key), key=lambda i: i['start_at'])}
@@ -34,8 +35,8 @@ class FakeCur:
     def fetchall(self): return self.rows
 
 
-def pat(day, start, end, tid, dur, cap=1):
-    return {'day_of_week': day, 'start_time': start, 'end_time': end, 'consultation_type_id': tid, 'duration_min': dur, 'capacity': cap}
+def pat(day, start, end, tid, dur, cap=1, name='STANDARD'):
+    return {'day_of_week': day, 'start_time': start, 'end_time': end, 'consultation_type_id': tid, 'duration_min': dur, 'capacity': cap, 'type_name': name}
 
 
 def test_9_to_1_is_split_by_consultation_length():
@@ -55,28 +56,60 @@ def test_window_is_30_days_and_only_matching_weekdays():
     assert {i['local_date'] for i in table.items.values()} == {d.isoformat() for d in mondays}
 
 
-def test_blackout_removes_open_slots_and_removal_restores_them():
+def test_blackout_closes_open_slots_and_removal_reopens_them():
     monday = date(2026, 11, 2)
     table = FakeTable(); pats = [pat(0, time(9), time(13), T30, 30)]
     slots.resync_slots(FakeCur(pats), DOC, table=table, today=monday)
     before = len(table.items)
     r = slots.resync_slots(FakeCur(pats, ['2026-11-09']), DOC, table=table, today=monday)
-    assert r['removed'] == 8 and len(table.items) == before - 8
-    assert not [i for i in table.items.values() if i['local_date'] == '2026-11-09']
+    day = [i for i in table.items.values() if i['local_date'] == '2026-11-09']
+    assert len(table.items) == before and r['removed'] == 0 and r['closed'] == 8
+    assert len(day) == 8 and {i['status'] for i in day} == {'CLOSED'}
+    assert {i['status'] for i in table.items.values() if i['local_date'] != '2026-11-09'} == {'OPEN'}
     r = slots.resync_slots(FakeCur(pats), DOC, table=table, today=monday)
-    assert r['created'] == 8 and len(table.items) == before
+    assert r['reopened'] == 8 and {i['status'] for i in table.items.values()} == {'OPEN'}
 
 
-def test_booked_slots_survive_blackout_and_pattern_changes():
+def test_blackout_on_a_day_never_synced_creates_closed_slots():
+    monday = date(2026, 11, 2); table = FakeTable()
+    slots.resync_slots(FakeCur([pat(0, time(9), time(11), T30, 30)], ['2026-11-09']), DOC, table=table, today=monday)
+    assert {i['status'] for i in table.items.values() if i['local_date'] == '2026-11-09'} == {'CLOSED'}
+
+
+def test_booked_slot_is_closed_not_deleted_and_keeps_its_booking():
     monday = date(2026, 11, 2)
     table = FakeTable(); pats = [pat(0, time(9), time(13), T30, 30)]
     slots.resync_slots(FakeCur(pats), DOC, table=table, today=monday)
     booked = next(i for i in table.items.values() if i['local_date'] == '2026-11-09')
     booked['booked_count'] = 1
     r = slots.resync_slots(FakeCur(pats, ['2026-11-09']), DOC, table=table, today=monday)
-    assert booked['slot_id'] in table.items and r['keptBooked'] == 1 and r['removed'] == 7
-    slots.resync_slots(FakeCur([]), DOC, table=table, today=monday)          # all availability removed
-    assert list(table.items) == [booked['slot_id']]
+    assert table.items[booked['slot_id']]['status'] == 'CLOSED' and table.items[booked['slot_id']]['booked_count'] == 1
+    assert r['removed'] == 0 and r['closed'] == 8
+    slots.resync_slots(FakeCur(pats), DOC, table=table, today=monday)       # blackout removed
+    assert table.items[booked['slot_id']]['status'] == 'FULL' and table.items[booked['slot_id']]['booked_count'] == 1
+
+
+def test_booked_slots_survive_pattern_changes():
+    monday = date(2026, 11, 2)
+    table = FakeTable(); pats = [pat(0, time(9), time(13), T30, 30)]
+    slots.resync_slots(FakeCur(pats), DOC, table=table, today=monday)
+    booked = next(i for i in table.items.values() if i['local_date'] == '2026-11-09')
+    booked['booked_count'] = 1
+    r = slots.resync_slots(FakeCur([]), DOC, table=table, today=monday)          # all availability removed
+    assert list(table.items) == [booked['slot_id']] and r['keptBooked'] == 1
+
+
+def test_capacity_is_1_for_normal_types_even_if_the_database_row_says_otherwise():
+    monday = date(2026, 11, 2); table = FakeTable()
+    bad = [pat(0, time(9), time(10), T30, 30, cap=5, name='STANDARD'), pat(0, time(10), time(10, 15), T15, 15, cap=3, name='QUICK')]
+    slots.resync_slots(FakeCur(bad), DOC, table=table, today=monday)
+    assert {i['capacity'] for i in table.items.values()} == {1}
+
+
+def test_health_camp_keeps_its_group_capacity():
+    monday = date(2026, 11, 2); table = FakeTable()
+    slots.resync_slots(FakeCur([pat(0, time(9), time(10), T60, 60, cap=4, name='HEALTH_CAMP')]), DOC, table=table, today=monday)
+    assert {i['capacity'] for i in table.items.values()} == {4}
 
 
 def test_resync_is_idempotent():
