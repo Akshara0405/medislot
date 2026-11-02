@@ -6,7 +6,7 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from common import config, dbconn, response, body
-from slots import resync_slots, WINDOW_DAYS
+from slots import resync_slots, find_booking_conflicts, WINDOW_DAYS
 
 NAMES={'QUICK':15,'STANDARD':30,'DETAILED':60,'HEALTH_CAMP':60}
 # One doctor sees one patient at a time, so every normal type is fixed at capacity 1.
@@ -112,7 +112,7 @@ def handler(event,context):
                 if method=='PUT':
                     patterns=data.get('patterns')
                     if not isinstance(patterns,list) or len(patterns)>100:return fail(400,'patterns must be a list of at most 100 entries')
-                    by_day={}
+                    by_day={}; checked=[]
                     for x in patterns:
                         if not isinstance(x,dict) or type(x.get('day_of_week')) is not int or not 0<=x['day_of_week']<=6:return fail(400,'Invalid weekday (Monday=0)')
                         try:
@@ -125,12 +125,18 @@ def handler(event,context):
                         minutes=(end.hour*60+end.minute)-(start.hour*60+start.minute)
                         if minutes<ctype['duration_min']:return fail(400,f"{x['start_time']}-{x['end_time']} is shorter than one {ctype['duration_min']}-minute consultation")
                         by_day.setdefault(x['day_of_week'],[]).append((start,end,label(ctype['name'])))
+                        checked.append({**x,'duration_min':ctype['duration_min']})
                     days=['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
                     for day_no,ranges in by_day.items():
                         ranges.sort()
                         for a,b in zip(ranges,ranges[1:]):
                             # A doctor cannot be in two consultations at once, whatever the types are.
                             if b[0]<a[1]:return fail(400,f'Overlapping availability on {days[day_no]}: {a[2]} {hhmm(a[0])}-{hhmm(a[1])} clashes with {b[2]} {hhmm(b[0])}-{hhmm(b[1])}. Change one of the times; nothing was saved.')
+                    # The save replaces the whole weekly list, but booked slots stay. New slots must not overlap them.
+                    try:conflicts=find_booking_conflicts(cur,doctor_id,checked)
+                    except Exception:
+                        logging.getLogger().exception('booking_conflict_check_failed');conflicts=[]
+                    if conflicts:return fail(409,'Cannot save: '+'; '.join(conflicts)+'. Cancel or move that booking first, or choose another time. Nothing was saved.')
                     cur.execute('DELETE FROM availability_patterns WHERE doctor_id=%s',(doctor_id,))
                     for x in patterns:cur.execute('INSERT INTO availability_patterns(pattern_id,doctor_id,consultation_type_id,day_of_week,start_time,end_time) VALUES(%s,%s,%s,%s,%s,%s)',(str(uuid.uuid4()),doctor_id,x['consultation_type_id'],x['day_of_week'],x['start_time'],x['end_time']))
                     conn.commit();return response(200,{'patternsSaved':len(patterns),**sync(cur,doctor_id)})

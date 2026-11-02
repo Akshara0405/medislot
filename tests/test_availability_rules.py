@@ -102,3 +102,9 @@ def test_health_camp_capacity_range(monkeypatch):
     for good in (2, 3, 5, 10):
         code, _, _ = call(monkeypatch, 'POST', '/doctor/me/consultation-types', type_payload('HEALTH_CAMP', good, 60))
         assert code == 201
+
+
+def test_saving_is_blocked_when_new_slots_would_overlap_a_booked_one(monkeypatch):
+    monkeypatch.setattr(lf, 'find_booking_conflicts', lambda cur, d, p: ['Monday 09 Nov 09:00-09:15 overlaps an existing booked appointment at 09:00-09:30'])
+    code, out, cur = put_patterns(monkeypatch, [pattern('quick', '09:00', '09:30')])
+    assert code == 409 and cur.saved == [] and 'Nothing was saved' in out['message'] and 'booked appointment' in out['message']

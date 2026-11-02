@@ -218,6 +218,8 @@ def slot_note(result):
         parts.append('%d slot%s marked closed' % (sync['closed'], '' if sync['closed'] == 1 else 's'))
     if sync.get('reopened'):
         parts.append('%d slot%s re-opened' % (sync['reopened'], '' if sync['reopened'] == 1 else 's'))
+    if sync.get('skippedOverlap'):
+        parts.append('%d slot%s skipped (overlap a booking)' % (sync['skippedOverlap'], '' if sync['skippedOverlap'] == 1 else 's'))
     if sync.get('keptBooked'):
         parts.append('%d booked slot%s kept' % (sync['keptBooked'], '' if sync['keptBooked'] == 1 else 's'))
     note = (' Next %d days: %s.' % (sync.get('days', 30), ', '.join(parts))) if parts else ''

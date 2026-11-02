@@ -117,3 +117,32 @@ def test_resync_is_idempotent():
     slots.resync_slots(cur, DOC, table=table, today=monday)
     r = slots.resync_slots(cur, DOC, table=table, today=monday)
     assert (r['created'], r['updated'], r['removed']) == (0, 0, 0)
+
+
+def _booked_standard_on_9_nov():
+    monday = date(2026, 11, 2); table = FakeTable()
+    std = [pat(0, time(9), time(9, 30), 'std', 30, name='STANDARD')]
+    slots.resync_slots(FakeCur(std), DOC, table=table, today=monday)
+    booked = next(i for i in table.items.values() if i['local_date'] == '2026-11-09')
+    booked['booked_count'] = 1
+    return monday, table, booked
+
+
+def test_quick_over_a_booked_standard_is_reported_as_a_conflict():
+    monday, table, booked = _booked_standard_on_9_nov()
+    quick = [{'day_of_week': 0, 'start_time': '09:00', 'end_time': '09:30', 'consultation_type_id': 'quick', 'duration_min': 15}]
+    problems = slots.find_booking_conflicts(FakeCur([]), DOC, quick, table=table, today=monday)
+    assert problems and 'Monday 09 Nov 09:00-09:15 overlaps an existing booked appointment at 09:00-09:30' in problems[0]
+    # keeping the same standard pattern is not a conflict
+    same = [{'day_of_week': 0, 'start_time': '09:00', 'end_time': '09:30', 'consultation_type_id': 'std', 'duration_min': 30}]
+    assert slots.find_booking_conflicts(FakeCur([]), DOC, same, table=table, today=monday) == []
+    # a later, non-overlapping time is fine
+    later = [{'day_of_week': 0, 'start_time': '09:30', 'end_time': '10:00', 'consultation_type_id': 'quick', 'duration_min': 15}]
+    assert slots.find_booking_conflicts(FakeCur([]), DOC, later, table=table, today=monday) == []
+
+
+def test_resync_never_creates_a_slot_on_top_of_a_kept_booking():
+    monday, table, booked = _booked_standard_on_9_nov()
+    r = slots.resync_slots(FakeCur([pat(0, time(9), time(9, 30), 'quick', 15, name='QUICK')]), DOC, table=table, today=monday)
+    day = [i for i in table.items.values() if i['local_date'] == '2026-11-09']
+    assert [i['slot_id'] for i in day] == [booked['slot_id']] and r['skippedOverlap'] == 2

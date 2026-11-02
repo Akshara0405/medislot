@@ -136,6 +136,48 @@ def _in_use(item):
     return int(item.get('booked_count', 0) or 0) > 0 or int(item.get('held_count', 0) or 0) > 0
 
 
+def _overlap(a, b):
+    """True when two slots (ISO 'Z' strings, same format so they compare as text) share any time."""
+    return a['start_at'] < b['end_at'] and b['start_at'] < a['end_at']
+
+
+def _blockers(current, wanted):
+    """Slots with a booking/hold that the new schedule no longer contains: they stay, so nothing may overlap them."""
+    return [i for sid, i in current.items() if _in_use(i) and sid not in wanted]
+
+
+def find_booking_conflicts(cur, doctor_id, patterns, days=WINDOW_DAYS, table=None, today=None):
+    """Messages for every new slot that would overlap an existing booked/held slot. Empty list = safe to save.
+
+    `patterns` is the weekly list about to be saved: dicts with day_of_week, start_time, end_time
+    (time or 'HH:MM'), consultation_type_id and duration_min.
+    """
+    table = table or boto3.resource('dynamodb').Table(os.environ['SLOTS_TABLE'])
+    tz_name = doctor_timezone(cur, doctor_id)
+    tz = ZoneInfo(tz_name)
+    first_day = today or datetime.now(tz).date()
+    problems = []
+    for offset in range(days):
+        day = first_day + timedelta(days=offset)
+        wanted = {}
+        for p in patterns:
+            if int(p['day_of_week']) == day.weekday():
+                for item in generate_slots(doctor_id, p['consultation_type_id'], day, tz_name, as_time(p['start_time']),
+                                           as_time(p['end_time']), int(p['duration_min']), 1):
+                    wanted[item['slot_id']] = item
+        blockers = _blockers({i['slot_id']: i for i in _existing(table, doctor_id, day.isoformat())}, wanted)
+        for item in wanted.values():
+            for b in blockers:
+                if _overlap(item, b):
+                    def local(x): return datetime.fromisoformat(x.replace('Z', '+00:00')).astimezone(tz).strftime('%H:%M')
+                    problems.append(f"{day.strftime('%A %d %b')} {local(item['start_at'])}-{local(item['end_at'])} overlaps an existing "
+                                    f"booked appointment at {local(b['start_at'])}-{local(b['end_at'])}")
+                    break
+        if len(problems) >= 3:
+            break
+    return problems
+
+
 def _open_status(item):
     taken = int(item.get('booked_count', 0) or 0) + int(item.get('held_count', 0) or 0)
     return FULL if taken >= int(item.get('capacity', 1) or 1) else OPEN
@@ -148,7 +190,7 @@ def resync_slots(cur, doctor_id, days=WINDOW_DAYS, table=None, today=None):
     first_day = today or datetime.now(ZoneInfo(tz_name)).date()
     plan = desired_slots(cur, doctor_id, first_day, days, tz_name)
 
-    created = updated = removed = kept_booked = closed = reopened = 0
+    created = updated = removed = kept_booked = closed = reopened = skipped = 0
     status_only = []                       # booked/held slots: change status, never replace the item
     with table.batch_writer() as batch:
         for day_iso, wanted in plan.items():
@@ -160,9 +202,13 @@ def resync_slots(cur, doctor_id, days=WINDOW_DAYS, table=None, today=None):
                     else:
                         batch.delete_item(Key={'slot_id': slot_id})
                         removed += 1
+            blockers = _blockers(current, wanted)
             for slot_id, item in wanted.items():
                 old = current.get(slot_id)
                 if old is None:
+                    if any(_overlap(item, b) for b in blockers):
+                        skipped += 1              # would double-book a patient who is still booked
+                        continue
                     batch.put_item(Item=item)
                     created += 1
                     closed += item['status'] == CLOSED
@@ -185,4 +231,4 @@ def resync_slots(cur, doctor_id, days=WINDOW_DAYS, table=None, today=None):
         table.update_item(Key={'slot_id': slot_id}, UpdateExpression='SET #s = :s',
                           ExpressionAttributeNames={'#s': 'status'}, ExpressionAttributeValues={':s': new_status})
     return {'created': created, 'updated': updated, 'removed': removed, 'closed': closed, 'reopened': reopened,
-            'keptBooked': kept_booked, 'days': days, 'startDate': first_day.isoformat()}
+            'keptBooked': kept_booked, 'skippedOverlap': skipped, 'days': days, 'startDate': first_day.isoformat()}
