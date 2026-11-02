@@ -141,6 +141,28 @@ def _overlap(a, b):
     return a['start_at'] < b['end_at'] and b['start_at'] < a['end_at']
 
 
+def _dedupe(wanted, current):
+    """Drop wanted slots that overlap a slot that must stay (booked/held) or one already accepted.
+
+    Order: earliest start first, longer slot first on a tie, so the result is the same every run.
+    Returns (kept_wanted, number_dropped). Unbooked overlapping slots left over from older saves are not in
+    kept_wanted, so the caller removes them.
+    """
+    taken = [i for i in current.values() if _in_use(i)]
+    kept = {sid: i for sid, i in wanted.items() if _in_use(current.get(sid) or {})}
+    dropped = 0
+    ordered = sorted(sorted(wanted.values(), key=lambda i: i['end_at'], reverse=True), key=lambda i: i['start_at'])
+    for item in ordered:
+        if item['slot_id'] in kept:
+            continue
+        if any(_overlap(item, t) for t in taken):
+            dropped += 1
+            continue
+        kept[item['slot_id']] = item
+        taken.append(item)
+    return kept, dropped
+
+
 def _blockers(current, wanted):
     """Slots with a booking/hold that the new schedule no longer contains: they stay, so nothing may overlap them."""
     return [i for sid, i in current.items() if _in_use(i) and sid not in wanted]
@@ -195,6 +217,8 @@ def resync_slots(cur, doctor_id, days=WINDOW_DAYS, table=None, today=None):
     with table.batch_writer() as batch:
         for day_iso, wanted in plan.items():
             current = {i['slot_id']: i for i in _existing(table, doctor_id, day_iso)}
+            wanted, dropped = _dedupe(wanted, current)
+            skipped += dropped
             for slot_id, item in current.items():
                 if slot_id not in wanted:
                     if _in_use(item):
@@ -202,13 +226,9 @@ def resync_slots(cur, doctor_id, days=WINDOW_DAYS, table=None, today=None):
                     else:
                         batch.delete_item(Key={'slot_id': slot_id})
                         removed += 1
-            blockers = _blockers(current, wanted)
             for slot_id, item in wanted.items():
                 old = current.get(slot_id)
                 if old is None:
-                    if any(_overlap(item, b) for b in blockers):
-                        skipped += 1              # would double-book a patient who is still booked
-                        continue
                     batch.put_item(Item=item)
                     created += 1
                     closed += item['status'] == CLOSED

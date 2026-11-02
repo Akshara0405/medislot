@@ -146,3 +146,26 @@ def test_resync_never_creates_a_slot_on_top_of_a_kept_booking():
     r = slots.resync_slots(FakeCur([pat(0, time(9), time(9, 30), 'quick', 15, name='QUICK')]), DOC, table=table, today=monday)
     day = [i for i in table.items.values() if i['local_date'] == '2026-11-09']
     assert [i['slot_id'] for i in day] == [booked['slot_id']] and r['skippedOverlap'] == 2
+
+
+def test_old_overlapping_patterns_never_produce_overlapping_slots():
+    monday = date(2026, 11, 2); table = FakeTable()
+    both = [pat(0, time(9), time(9, 30), 'std', 30, name='STANDARD'), pat(0, time(9), time(9, 30), 'quick', 15, name='QUICK')]
+    # simulate slots an older version already wrote for both patterns
+    for p in both:
+        for item in slots.generate_slots(DOC, p['consultation_type_id'], date(2026, 11, 9), 'Asia/Kolkata', p['start_time'], p['end_time'], p['duration_min'], 1):
+            table.items[item['slot_id']] = item
+    assert len(table.items) == 3
+    slots.resync_slots(FakeCur(both), DOC, table=table, today=monday)
+    day = sorted((i for i in table.items.values() if i['local_date'] == '2026-11-09'), key=lambda i: i['start_at'])
+    assert all(a['end_at'] <= b['start_at'] for a, b in zip(day, day[1:]))
+
+
+def test_materializer_will_not_create_slots_over_a_booked_one():
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lambdas', 'materializer'))
+    import core
+    std = list(core.generate_slots(DOC, 'std', date(2026, 11, 9), 'Asia/Kolkata', time(9), time(9, 30), 30, 1))
+    std[0]['booked_count'] = 1
+    quick = list(core.generate_slots(DOC, 'quick', date(2026, 11, 9), 'Asia/Kolkata', time(9), time(10), 15, 1))
+    create, there, skipped = core.choose_non_overlapping(quick, std)
+    assert skipped == 2 and [c['start_at'] for c in create] == ['2026-11-09T04:00:00Z', '2026-11-09T04:15:00Z']
