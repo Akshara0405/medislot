@@ -8,11 +8,15 @@ Rules
   * A consultation type's duration decides the slot size: 09:00-13:00 with a
     30-minute type gives 8 slots, with a 15-minute type 16 slots, with a 60-minute
     type 4 slots.
-  * Blackout dates get no slots.
-  * Slots that already have bookings/holds are never deleted or overwritten.
+  * Blackout dates keep their slots but every slot is marked status CLOSED, so
+    the doctor still sees them (as Closed) and nobody can book them. Removing
+    the blackout re-opens them.
+  * Capacity is 1 for every type except HEALTH_CAMP (one patient at a time).
+  * Slots that already have bookings/holds are never deleted or overwritten;
+    on a blackout day they are only switched to CLOSED (the booking stays).
   * Re-running is safe (idempotent): it only adds what is missing, removes
     unbooked slots that no longer belong, and refreshes unbooked slots whose
-    end time or capacity changed.
+    end time, capacity or status changed.
 """
 import os
 from datetime import datetime, timedelta, timezone, time as dtime
@@ -23,6 +27,15 @@ from boto3.dynamodb.conditions import Key
 
 WINDOW_DAYS = 30
 DEFAULT_TZ = 'Asia/Kolkata'
+OPEN, CLOSED, FULL = 'OPEN', 'CLOSED', 'FULL'
+CAMP_MIN_CAPACITY, CAMP_MAX_CAPACITY = 2, 10
+
+
+def effective_capacity(type_name, stored):
+    """1 for every normal consultation; a health camp keeps its configured group size."""
+    if type_name != 'HEALTH_CAMP':
+        return 1
+    return max(CAMP_MIN_CAPACITY, min(CAMP_MAX_CAPACITY, int(stored)))
 
 
 def as_time(value):
@@ -45,7 +58,7 @@ def _valid_instants(naive, tz):
     return sorted(result)
 
 
-def generate_slots(doctor_id, consultation_type_id, day, timezone_name, start, end, duration, capacity):
+def generate_slots(doctor_id, consultation_type_id, day, timezone_name, start, end, duration, capacity, status=OPEN):
     """Cut [start, end) on `day` into back-to-back slots of `duration` minutes."""
     tz = ZoneInfo(timezone_name)
     cursor = datetime.combine(day, start)
@@ -66,7 +79,7 @@ def generate_slots(doctor_id, consultation_type_id, day, timezone_name, start, e
                 'start_at': start_str, 'end_at': end_str,
                 'timezone': timezone_name, 'local_date': day.isoformat(),
                 'capacity': int(capacity), 'booked_count': 0, 'held_count': 0,
-                'version': 0, 'status': 'OPEN',
+                'version': 0, 'status': status,
             }
         cursor = end_local
 
@@ -83,7 +96,7 @@ def doctor_timezone(cur, doctor_id):
 
 def desired_slots(cur, doctor_id, first_day, days, tz_name):
     """{iso_day: {slot_id: item}} for every day of the window."""
-    cur.execute("""SELECT a.day_of_week, a.start_time, a.end_time, t.consultation_type_id, t.duration_min, t.capacity
+    cur.execute("""SELECT a.day_of_week, a.start_time, a.end_time, t.consultation_type_id, t.name AS type_name, t.duration_min, t.capacity
                    FROM availability_patterns a
                    JOIN consultation_types t ON t.consultation_type_id=a.consultation_type_id
                    WHERE a.doctor_id=%s AND t.is_active=1""", (doctor_id,))
@@ -94,15 +107,16 @@ def desired_slots(cur, doctor_id, first_day, days, tz_name):
     plan = {}
     for offset in range(days):
         day = first_day + timedelta(days=offset)
+        status = CLOSED if day.isoformat() in blocked else OPEN
         slots = {}
-        if day.isoformat() not in blocked:
-            for p in patterns:
-                if int(p['day_of_week']) != day.weekday():
-                    continue
-                for item in generate_slots(doctor_id, p['consultation_type_id'], day, tz_name,
-                                           as_time(p['start_time']), as_time(p['end_time']),
-                                           int(p['duration_min']), int(p['capacity'])):
-                    slots[item['slot_id']] = item
+        for p in patterns:
+            if int(p['day_of_week']) != day.weekday():
+                continue
+            capacity = effective_capacity(p.get('type_name'), p['capacity'])
+            for item in generate_slots(doctor_id, p['consultation_type_id'], day, tz_name,
+                                       as_time(p['start_time']), as_time(p['end_time']),
+                                       int(p['duration_min']), capacity, status):
+                slots[item['slot_id']] = item
         plan[day.isoformat()] = slots
     return plan
 
@@ -122,6 +136,11 @@ def _in_use(item):
     return int(item.get('booked_count', 0) or 0) > 0 or int(item.get('held_count', 0) or 0) > 0
 
 
+def _open_status(item):
+    taken = int(item.get('booked_count', 0) or 0) + int(item.get('held_count', 0) or 0)
+    return FULL if taken >= int(item.get('capacity', 1) or 1) else OPEN
+
+
 def resync_slots(cur, doctor_id, days=WINDOW_DAYS, table=None, today=None):
     """Bring DynamoDB in line with MySQL. Returns counts of what changed."""
     table = table or boto3.resource('dynamodb').Table(os.environ['SLOTS_TABLE'])
@@ -129,7 +148,8 @@ def resync_slots(cur, doctor_id, days=WINDOW_DAYS, table=None, today=None):
     first_day = today or datetime.now(ZoneInfo(tz_name)).date()
     plan = desired_slots(cur, doctor_id, first_day, days, tz_name)
 
-    created = updated = removed = kept_booked = 0
+    created = updated = removed = kept_booked = closed = reopened = 0
+    status_only = []                       # booked/held slots: change status, never replace the item
     with table.batch_writer() as batch:
         for day_iso, wanted in plan.items():
             current = {i['slot_id']: i for i in _existing(table, doctor_id, day_iso)}
@@ -145,8 +165,24 @@ def resync_slots(cur, doctor_id, days=WINDOW_DAYS, table=None, today=None):
                 if old is None:
                     batch.put_item(Item=item)
                     created += 1
-                elif not _in_use(old) and (old.get('end_at') != item['end_at'] or int(old.get('capacity', 0)) != item['capacity']):
+                    closed += item['status'] == CLOSED
+                    continue
+                if _in_use(old):
+                    # keep the booking; only the status can change (CLOSED on a blackout, back to OPEN/FULL after)
+                    new_status = CLOSED if item['status'] == CLOSED else _open_status(old)
+                    if old.get('status') != new_status:
+                        status_only.append((slot_id, new_status))
+                        closed += new_status == CLOSED
+                        reopened += new_status != CLOSED
+                    continue
+                if (old.get('end_at') != item['end_at'] or int(old.get('capacity', 0)) != item['capacity']
+                        or old.get('status') != item['status']):
                     batch.put_item(Item=item)
                     updated += 1
-    return {'created': created, 'updated': updated, 'removed': removed,
+                    closed += item['status'] == CLOSED and old.get('status') != CLOSED
+                    reopened += item['status'] != CLOSED and old.get('status') == CLOSED
+    for slot_id, new_status in status_only:
+        table.update_item(Key={'slot_id': slot_id}, UpdateExpression='SET #s = :s',
+                          ExpressionAttributeNames={'#s': 'status'}, ExpressionAttributeValues={':s': new_status})
+    return {'created': created, 'updated': updated, 'removed': removed, 'closed': closed, 'reopened': reopened,
             'keptBooked': kept_booked, 'days': days, 'startDate': first_day.isoformat()}

@@ -9,6 +9,13 @@ from common import config, dbconn, response, body
 from slots import resync_slots, WINDOW_DAYS
 
 NAMES={'QUICK':15,'STANDARD':30,'DETAILED':60,'HEALTH_CAMP':60}
+# One doctor sees one patient at a time, so every normal type is fixed at capacity 1.
+# Only a health camp may take a group; change these two numbers to change its allowed range.
+CAMP_MIN_CAPACITY=2
+CAMP_MAX_CAPACITY=10
+
+def label(name): return str(name).replace('_',' ').title()
+def hhmm(t): return f'{t.hour:02d}:{t.minute:02d}'
 
 def fail(code,message): return response(code,{'message':message})
 def validate_timezone(value):
@@ -78,7 +85,11 @@ def handler(event,context):
                     cur.execute('SELECT * FROM consultation_types WHERE doctor_id=%s ORDER BY name',(doctor_id,));return response(200,{'items':[{k:jsonable(v) for k,v in x.items()} for x in cur.fetchall()]})
                 if method in ('POST','PUT'):
                     name=data.get('name'); duration=data.get('duration_min'); capacity=data.get('capacity'); fee=data.get('fee_amount')
-                    if name not in NAMES or duration not in (15,30,60) or not isinstance(capacity,int) or (not (2<=capacity<=10) if name=='HEALTH_CAMP' else capacity!=1):return fail(400,'Invalid consultation type, duration or capacity')
+                    if name not in NAMES or duration not in (15,30,60):return fail(400,'Invalid consultation type or duration')
+                    if type(capacity) is not int:return fail(400,'Capacity must be a whole number')
+                    if name=='HEALTH_CAMP':
+                        if not CAMP_MIN_CAPACITY<=capacity<=CAMP_MAX_CAPACITY:return fail(400,f'Health camp capacity must be between {CAMP_MIN_CAPACITY} and {CAMP_MAX_CAPACITY}')
+                    elif capacity!=1:return fail(400,f'Capacity is fixed at 1 for {label(name)} consultations (one patient at a time); only a health camp can take more')
                     try:
                         amount=Decimal(str(fee)); assert amount>=0 and amount.is_finite()
                     except (ValueError,AssertionError,TypeError):return fail(400,'Invalid fee')
@@ -108,15 +119,18 @@ def handler(event,context):
                             start=datetime.strptime(x['start_time'],'%H:%M').time();end=datetime.strptime(x['end_time'],'%H:%M').time()
                             if start>=end:raise ValueError()
                         except (ValueError,KeyError,TypeError):return fail(400,'Invalid local time range')
-                        cur.execute('SELECT duration_min FROM consultation_types WHERE consultation_type_id=%s AND doctor_id=%s AND is_active=1',(x.get('consultation_type_id'),doctor_id))
+                        cur.execute('SELECT name,duration_min FROM consultation_types WHERE consultation_type_id=%s AND doctor_id=%s AND is_active=1',(x.get('consultation_type_id'),doctor_id))
                         ctype=cur.fetchone()
                         if not ctype:return fail(400,'Unknown or inactive consultation type')
                         minutes=(end.hour*60+end.minute)-(start.hour*60+start.minute)
                         if minutes<ctype['duration_min']:return fail(400,f"{x['start_time']}-{x['end_time']} is shorter than one {ctype['duration_min']}-minute consultation")
-                        by_day.setdefault(x['day_of_week'],[]).append((start,end))
-                    for ranges in by_day.values():
+                        by_day.setdefault(x['day_of_week'],[]).append((start,end,label(ctype['name'])))
+                    days=['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
+                    for day_no,ranges in by_day.items():
                         ranges.sort()
-                        if any(b[0]<a[1] for a,b in zip(ranges,ranges[1:])):return fail(400,'Time ranges on the same day must not overlap')
+                        for a,b in zip(ranges,ranges[1:]):
+                            # A doctor cannot be in two consultations at once, whatever the types are.
+                            if b[0]<a[1]:return fail(400,f'Overlapping availability on {days[day_no]}: {a[2]} {hhmm(a[0])}-{hhmm(a[1])} clashes with {b[2]} {hhmm(b[0])}-{hhmm(b[1])}. Change one of the times; nothing was saved.')
                     cur.execute('DELETE FROM availability_patterns WHERE doctor_id=%s',(doctor_id,))
                     for x in patterns:cur.execute('INSERT INTO availability_patterns(pattern_id,doctor_id,consultation_type_id,day_of_week,start_time,end_time) VALUES(%s,%s,%s,%s,%s,%s)',(str(uuid.uuid4()),doctor_id,x['consultation_type_id'],x['day_of_week'],x['start_time'],x['end_time']))
                     conn.commit();return response(200,{'patternsSaved':len(patterns),**sync(cur,doctor_id)})

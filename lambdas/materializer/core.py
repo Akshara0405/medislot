@@ -10,7 +10,7 @@ def valid_instants(naive,tz):
             result[utc]=utc
     return sorted(result)
 
-def generate_slots(doctor_id,consultation_type_id,day,timezone_name,start,end,duration,capacity):
+def generate_slots(doctor_id,consultation_type_id,day,timezone_name,start,end,duration,capacity,status='OPEN'):
     tz=ZoneInfo(timezone_name)
     cursor=datetime.combine(day,start); finish=datetime.combine(day,end)
     while cursor+timedelta(minutes=duration)<=finish:
@@ -22,5 +22,5 @@ def generate_slots(doctor_id,consultation_type_id,day,timezone_name,start,end,du
                 continue
             start_str=start_utc.isoformat().replace('+00:00','Z')
             end_str=end_utc.isoformat().replace('+00:00','Z')
-            yield {'slot_id':f'{doctor_id}#{consultation_type_id}#{start_str}', 'doctor_date':f'{doctor_id}#{day.isoformat()}', 'doctor_id':str(doctor_id), 'consultation_type_id':str(consultation_type_id), 'start_at':start_str,'end_at':end_str,'timezone':timezone_name,'local_date':day.isoformat(),'capacity':capacity,'booked_count':0,'held_count':0,'version':0,'status':'OPEN'}
+            yield {'slot_id':f'{doctor_id}#{consultation_type_id}#{start_str}', 'doctor_date':f'{doctor_id}#{day.isoformat()}', 'doctor_id':str(doctor_id), 'consultation_type_id':str(consultation_type_id), 'start_at':start_str,'end_at':end_str,'timezone':timezone_name,'local_date':day.isoformat(),'capacity':capacity,'booked_count':0,'held_count':0,'version':0,'status':status}
         cursor=end_local

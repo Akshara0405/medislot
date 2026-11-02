@@ -18,11 +18,11 @@
 
 <section class="dash-card panel{{ ' active' if active == 'types' else '' }}" id="panel-types">
 <h2>Consultation types</h2>
-<p class="hint">Quick = 15 min, Standard = 30 min, Detailed = 60 min, Health camp = 60 min (2–10 people). Fees are in rupees.</p>
+<p class="hint">Quick = 15 min, Standard = 30 min, Detailed = 60 min, Health camp = 60 min ({{ camp_min }}–{{ camp_max }} people). Every other type seats one patient at a time (capacity 1). Fees are in rupees.</p>
 {% if types %}<table><thead><tr><th>Type</th><th>Duration</th><th>Capacity</th><th>Fee</th><th></th></tr></thead><tbody>
 {% for t in types %}<tr>
 <td>{{ t.name.replace('_',' ')|title }}</td><td>{{ t.duration_min }} min</td>
-<td>{% if t.name == 'HEALTH_CAMP' %}<input form="save-{{ t.consultation_type_id }}" name="capacity" type="number" min="2" max="10" value="{{ t.capacity }}" style="width:80px">{% else %}1<input form="save-{{ t.consultation_type_id }}" type="hidden" name="capacity" value="1">{% endif %}</td>
+<td>{% if t.name == 'HEALTH_CAMP' %}<input form="save-{{ t.consultation_type_id }}" name="capacity" type="number" min="{{ camp_min }}" max="{{ camp_max }}" value="{{ t.capacity }}" style="width:80px">{% else %}1<input form="save-{{ t.consultation_type_id }}" type="hidden" name="capacity" value="1">{% endif %}</td>
 <td><input form="save-{{ t.consultation_type_id }}" name="fee_amount" type="number" min="0" step="0.01" value="{{ t.fee_amount }}" style="width:110px"></td>
 <td><div class="row-actions">
 <form id="save-{{ t.consultation_type_id }}" method="post"><input type="hidden" name="action" value="save_type"><input type="hidden" name="type_id" value="{{ t.consultation_type_id }}"><input type="hidden" name="name" value="{{ t.name }}"><button class="ghost">Save</button></form>
@@ -31,7 +31,7 @@
 <h3 style="margin-top:26px">Add a consultation type</h3>
 <form method="post" class="add-row"><input type="hidden" name="action" value="add_type">
 <div><label for="t-name">Type</label><select id="t-name" name="name">{% for n in type_names %}<option value="{{ n }}">{{ n.replace('_',' ')|title }}</option>{% endfor %}</select></div>
-<div><label for="t-cap">Capacity (health camp only)</label><input id="t-cap" name="capacity" type="number" min="1" max="10" value="1" style="width:110px"></div>
+<div><label for="t-cap">Capacity (health camp only, {{ camp_min }}–{{ camp_max }}; other types are always 1)</label><input id="t-cap" name="capacity" type="number" min="1" max="{{ camp_max }}" value="1" style="width:110px"></div>
 <div><label for="t-fee">Fee</label><input id="t-fee" name="fee_amount" type="number" min="0" step="0.01" value="500" style="width:120px" required></div>
 <button class="primary">Add type</button></form>
 </section>
@@ -40,7 +40,7 @@
 <h2>Weekly availability</h2>
 {% if type_options %}<p class="hint">Pick a day, a consultation type and a time range. MediSlot divides the range into slots of the consultation length (for example 9:00 AM to 1:00 PM with a 30-minute type gives 8 slots) and creates them for the next 30 days. Times are in your profile timezone.</p>
 <form method="post" id="avail-form"><input type="hidden" name="action" value="availability"><input type="hidden" name="patterns" id="avail-json" value="[]">
-<div id="avail-rows"></div>
+<div id="avail-rows"></div><p class="notice" id="avail-error" role="alert" hidden></p>
 <div class="row-actions"><button type="button" class="ghost" id="avail-add">+ Add time slot</button><button class="primary">Save availability</button></div></form>
 {% else %}<p class="empty">Add a consultation type first (Consultation types tab), then set your weekly hours here.</p>{% endif %}
 </section>
@@ -50,8 +50,8 @@
 <div class="day-nav"><a class="ghost" href="{{ url_for('dashboard', tab='schedule', date=prev_day) }}">← Previous day</a>
 <form method="get" class="row-actions inline"><input type="hidden" name="tab" value="schedule"><input type="date" name="date" value="{{ day }}"><button class="ghost">View date</button></form>
 <a class="ghost" href="{{ url_for('dashboard', tab='schedule', date=next_day) }}">Next day →</a></div>
-{% if day_blocked %}<p class="notice">This date is a blackout day, so no new slots are created for it.</p>{% endif %}
-<table><thead><tr><th>Time</th><th>Type</th><th>Capacity</th><th>Booked</th><th>Status</th></tr></thead><tbody>{% for s in schedule %}<tr><td>{{ s.start_local }} – {{ s.end_local }}</td><td>{{ s.type_label }}</td><td>{{ s.capacity }}</td><td>{{ s.booked_count }}</td><td><span class="badge{{ ' full' if s.booked_count|int >= s.capacity|int else '' }}">{{ 'Full' if s.booked_count|int >= s.capacity|int else 'Open' }}</span></td></tr>{% else %}<tr><td colspan="5" class="empty">{{ 'No slots: this is a blackout day.' if day_blocked else 'No slots on this date. Check your weekly availability for this weekday.' }}</td></tr>{% endfor %}</tbody></table>
+{% if day_blocked %}<p class="notice">This date is a blackout day: its slots are shown as Closed and cannot be booked. Existing bookings are kept.</p>{% endif %}
+<table><thead><tr><th>Time</th><th>Type</th><th>Capacity</th><th>Booked</th><th>Status</th></tr></thead><tbody>{% for s in schedule %}<tr><td>{{ s.start_local }} – {{ s.end_local }}</td><td>{{ s.type_label }}</td><td>{{ s.capacity }}</td><td>{{ s.booked_count }}</td><td>{% set closed = (s.status == 'CLOSED') %}{% set full = (not closed) and s.booked_count|int >= s.capacity|int %}<span class="badge{{ ' full' if (full or closed) else '' }}">{{ 'Closed' if closed else ('Full' if full else 'Open') }}</span></td></tr>{% else %}<tr><td colspan="5" class="empty">{{ 'No slots were set up for this blackout day.' if day_blocked else 'No slots on this date. Check your weekly availability for this weekday.' }}</td></tr>{% endfor %}</tbody></table>
 </section>
 
 <section class="dash-card panel{{ ' active' if active == 'blackouts' else '' }}" id="panel-blackouts">
@@ -76,6 +76,16 @@
     if (push) { var q = new URLSearchParams(location.search); q.set('tab', key); history.replaceState(null, '', '?' + q.toString()); }
   }
   tabs.forEach(function (t) { t.addEventListener('click', function (e) { e.preventDefault(); show(t.dataset.tab, true); }); });
+
+  var tName = document.getElementById('t-name'), tCap = document.getElementById('t-cap');
+  if (tName && tCap) {
+    var syncCap = function () {
+      var camp = tName.value === 'HEALTH_CAMP';
+      tCap.disabled = !camp;                 // a disabled input is not submitted; the server then uses 1
+      if (!camp) tCap.value = 1; else if (parseInt(tCap.value, 10) < {{ camp_min }}) tCap.value = {{ camp_min }};
+    };
+    tName.addEventListener('change', syncCap); syncCap();
+  }
 
   var data = JSON.parse(document.getElementById('dash-data').textContent);
   var rowsEl = document.getElementById('avail-rows'); if (!rowsEl) return;
@@ -108,12 +118,31 @@
   }
   (data.patterns.length ? data.patterns : []).forEach(addRow);
   document.getElementById('avail-add').addEventListener('click', function () { addRow(); });
-  document.getElementById('avail-form').addEventListener('submit', function () {
+  // Same rule as the API: a doctor cannot be in two consultations at once, whatever the types are.
+  function findOverlap(list) {
+    var typeLabel = {}; data.types.forEach(function (t) { typeLabel[t.id] = t.label.split(' · ')[0]; });
+    var byDay = {};
+    list.forEach(function (p) { (byDay[p.day_of_week] = byDay[p.day_of_week] || []).push(p); });
+    for (var d in byDay) {
+      var r = byDay[d].slice().sort(function (a, b) { return a.start_time < b.start_time ? -1 : a.start_time > b.start_time ? 1 : 0; });
+      for (var i = 1; i < r.length; i++) {
+        if (r[i].start_time < r[i - 1].end_time) {
+          return 'Overlapping availability on ' + days[d] + ': ' + typeLabel[r[i - 1].consultation_type_id] + ' ' + r[i - 1].start_time + '-' + r[i - 1].end_time +
+                 ' clashes with ' + typeLabel[r[i].consultation_type_id] + ' ' + r[i].start_time + '-' + r[i].end_time + '. Change one of the times; nothing was saved.';
+        }
+      }
+    }
+    return '';
+  }
+  document.getElementById('avail-form').addEventListener('submit', function (e) {
     var out = [];
     rowsEl.querySelectorAll('.slot-row').forEach(function (r) {
       out.push({ day_of_week: parseInt(r.querySelector('.f-day').value, 10), consultation_type_id: r.querySelector('.f-type').value,
                  start_time: r.querySelector('.f-start').value, end_time: r.querySelector('.f-end').value });
     });
+    var err = document.getElementById('avail-error'), problem = findOverlap(out);
+    err.hidden = !problem; err.textContent = problem;
+    if (problem) { e.preventDefault(); return; }
     document.getElementById('avail-json').value = JSON.stringify(out);
   });
 })();

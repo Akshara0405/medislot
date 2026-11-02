@@ -180,6 +180,7 @@ def logout():
 TABS = [('profile', 'Profile overview'), ('types', 'Consultation types'), ('availability', 'Availability'),
         ('schedule', 'Schedule'), ('blackouts', 'Blackouts')]
 TAB_KEYS = {key for key, _ in TABS}
+CAMP_MIN_CAPACITY, CAMP_MAX_CAPACITY = 2, 10   # keep in step with lambdas/doctor/lambda_function.py
 TYPE_DURATION = {'QUICK': 15, 'STANDARD': 30, 'DETAILED': 60, 'HEALTH_CAMP': 60}
 ID_PATTERN = re.compile(r'^[0-9a-fA-F-]{36}$')
 
@@ -213,6 +214,10 @@ def slot_note(result):
         parts.append('%d slot%s added' % (sync['created'], '' if sync['created'] == 1 else 's'))
     if sync.get('removed'):
         parts.append('%d open slot%s removed' % (sync['removed'], '' if sync['removed'] == 1 else 's'))
+    if sync.get('closed'):
+        parts.append('%d slot%s marked closed' % (sync['closed'], '' if sync['closed'] == 1 else 's'))
+    if sync.get('reopened'):
+        parts.append('%d slot%s re-opened' % (sync['reopened'], '' if sync['reopened'] == 1 else 's'))
     if sync.get('keptBooked'):
         parts.append('%d booked slot%s kept' % (sync['keptBooked'], '' if sync['keptBooked'] == 1 else 's'))
     note = (' Next %d days: %s.' % (sync.get('days', 30), ', '.join(parts))) if parts else ''
@@ -278,10 +283,10 @@ def handle_dashboard_post():
                 except ValueError:
                     raise ValueError('Capacity must be a whole number.')
                 if name == 'HEALTH_CAMP':
-                    if not 2 <= capacity <= 10:
-                        raise ValueError('A health camp needs a capacity between 2 and 10.')
+                    if not CAMP_MIN_CAPACITY <= capacity <= CAMP_MAX_CAPACITY:
+                        raise ValueError('A health camp needs a capacity between %d and %d.' % (CAMP_MIN_CAPACITY, CAMP_MAX_CAPACITY))
                 else:
-                    capacity = 1
+                    capacity = 1      # one patient at a time; whatever was typed is ignored
                 try:
                     fee = Decimal(request.form.get('fee_amount', '').strip())
                 except InvalidOperation:
@@ -408,6 +413,7 @@ def dashboard():
         day_blocked=day in {str(b.get('blackout_date')) for b in blackouts},
         prev_day=(day_obj - timedelta(days=1)).isoformat(), next_day=(day_obj + timedelta(days=1)).isoformat(),
         type_names=list(TYPE_DURATION),
+        camp_min=CAMP_MIN_CAPACITY, camp_max=CAMP_MAX_CAPACITY,
         hospitals=get_hospitals(),
         specializations=specialization_options(profile_data.get('specialization', '')),
         type_options=[{'id': t['consultation_type_id'], 'duration': t.get('duration_min'),
