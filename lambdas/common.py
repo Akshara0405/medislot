@@ -19,6 +19,64 @@ def config():
             "dbhost":get_param(f"/medislot/{env}/db/host"),"dbport":int(get_param(f"/medislot/{env}/db/port")),
             "dbname":get_param(f"/medislot/{env}/db/name"),"dbuser":get_param(f"/medislot/{env}/db/username"),
             "dbpass":get_param(f"/medislot/{env}/db/password",True)}
+_M3_COLUMNS = [
+    ("doctors", "timezone", "VARCHAR(64) NOT NULL DEFAULT 'Asia/Kolkata'"),
+    ("doctors", "languages", "VARCHAR(200) NULL"),
+    ("doctors", "photo_key", "VARCHAR(300) NULL"),
+]
+_M3_TABLES = [
+    """CREATE TABLE IF NOT EXISTS consultation_types (
+      consultation_type_id CHAR(36) PRIMARY KEY,
+      doctor_id BIGINT UNSIGNED NOT NULL,
+      name ENUM('QUICK','STANDARD','DETAILED','HEALTH_CAMP') NOT NULL,
+      duration_min SMALLINT NOT NULL,
+      fee_amount DECIMAL(10,2) NOT NULL,
+      capacity TINYINT NOT NULL,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      UNIQUE KEY uq_doctor_type (doctor_id, name),
+      FOREIGN KEY (doctor_id) REFERENCES doctors(user_id)
+    ) ENGINE=InnoDB""",
+    """CREATE TABLE IF NOT EXISTS availability_patterns (
+      pattern_id CHAR(36) PRIMARY KEY,
+      doctor_id BIGINT UNSIGNED NOT NULL,
+      consultation_type_id CHAR(36) NOT NULL,
+      day_of_week TINYINT NOT NULL,
+      start_time TIME NOT NULL,
+      end_time TIME NOT NULL,
+      KEY ix_doctor_weekday (doctor_id, day_of_week),
+      FOREIGN KEY (doctor_id) REFERENCES doctors(user_id),
+      FOREIGN KEY (consultation_type_id) REFERENCES consultation_types(consultation_type_id)
+    ) ENGINE=InnoDB""",
+    """CREATE TABLE IF NOT EXISTS blackout_dates (
+      blackout_id CHAR(36) PRIMARY KEY,
+      doctor_id BIGINT UNSIGNED NOT NULL,
+      blackout_date DATE NOT NULL,
+      reason VARCHAR(200),
+      UNIQUE KEY uq_doctor_blackout (doctor_id, blackout_date),
+      FOREIGN KEY (doctor_id) REFERENCES doctors(user_id)
+    ) ENGINE=InnoDB""",
+]
+_m3_ready = False
+def ensure_milestone3_schema(cur):
+    """Idempotent Milestone 3 schema (mirrors schema/milestone3.sql). Runs once per warm Lambda."""
+    global _m3_ready
+    if _m3_ready:
+        return
+    for tbl, col, ddl in _M3_COLUMNS:
+        cur.execute("""SELECT 1 FROM information_schema.COLUMNS
+                       WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND COLUMN_NAME=%s""", (tbl, col))
+        if not cur.fetchone():
+            try:
+                cur.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {ddl}")
+            except pymysql.err.OperationalError as exc:
+                if exc.args[0] != 1060:  # 1060 = duplicate column: another Lambda added it first
+                    raise
+    for statement in _M3_TABLES:
+        cur.execute(statement)
+    # Doctor sign-up needs at least one active hospital to choose from.
+    cur.execute("INSERT IGNORE INTO hospitals (name, city, address) VALUES (%s,%s,%s)",
+                ("MediSlot General Hospital", "Hyderabad", "Main Road, Hyderabad"))
+    _m3_ready = True
 def dbconn(c):
     conn=pymysql.connect(host=c["dbhost"],port=c["dbport"],user=c["dbuser"],password=c["dbpass"],
                          database=c["dbname"],connect_timeout=5,read_timeout=8,write_timeout=8,
@@ -74,6 +132,7 @@ def dbconn(c):
           CONSTRAINT fk_doctors_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
           CONSTRAINT fk_doctors_hospital FOREIGN KEY (hospital_id) REFERENCES hospitals(hospital_id)
         ) ENGINE=InnoDB""")
+        ensure_milestone3_schema(cur)
     conn.commit()
     return conn
 def table(name):

@@ -328,7 +328,7 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*/*'
-  ApiDeployment:
+  ApiDeploymentDoctorRoutes:
     Type: AWS::ApiGateway::Deployment
     DependsOn: [RegisterPatientMethod, RegisterDoctorMethod, LoginMethod, RefreshMethod, LogoutMethod, PatientMeMethod, DoctorMeMethod, DoctorMePutMethod, DoctorPhotoPostMethod, DoctorAvailabilityGetMethod, DoctorAvailabilityPutMethod, DoctorScheduleGetMethod]
     Properties:
@@ -338,7 +338,7 @@ Resources:
     Type: AWS::ApiGateway::Stage
     Properties:
       RestApiId: !Ref RestApi
-      DeploymentId: !Ref ApiDeployment
+      DeploymentId: !Ref ApiDeploymentDoctorRoutes
       StageName: !Ref Environment
       MethodSettings:
         - ResourcePath: '/*'
