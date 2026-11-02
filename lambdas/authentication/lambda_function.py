@@ -36,6 +36,8 @@ def handler(event, context):
         data = {}
 
     try:
+        if method == "GET" and path.endswith("/auth/hospitals"):
+            return list_hospitals(cid)
         if method == "POST" and path.endswith("/auth/register/patient"):
             return register(data, "patient", cid)
         if method == "POST" and path.endswith("/auth/register/doctor"):
@@ -53,6 +55,18 @@ def handler(event, context):
     except Exception:
         emit("error", "authentication_request_failed", cid, route=path)
         return response(500, {"message": "Internal server error", "correlationId": cid})
+
+
+def list_hospitals(cid):
+    """Public list used by the doctor sign-up and profile dropdowns."""
+    conn = dbconn(config())
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT hospital_id, name, city FROM hospitals WHERE is_active=TRUE ORDER BY name, city")
+            items = [{"hospital_id": int(r["hospital_id"]), "name": r["name"], "city": r["city"]} for r in cur.fetchall()]
+        return response(200, {"items": items})
+    finally:
+        conn.close()
 
 
 def register(data, role, cid):

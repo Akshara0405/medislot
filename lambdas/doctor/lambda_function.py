@@ -1,10 +1,12 @@
-import json, os, uuid, re
+import json, os, uuid, re, logging
 from datetime import date, datetime
 from decimal import Decimal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 from common import config, dbconn, response, body
+from slots import resync_slots, WINDOW_DAYS
 
 NAMES={'QUICK':15,'STANDARD':30,'DETAILED':60,'HEALTH_CAMP':60}
 
@@ -18,6 +20,24 @@ def jsonable(obj):
     if isinstance(obj,Decimal): return str(obj)
     return obj
 
+def s3_client():
+    # Regional endpoint + SigV4 so pre-signed URLs work straight from the browser.
+    return boto3.client('s3',region_name=os.environ.get('AWS_REGION'),config=Config(signature_version='s3v4',s3={'addressing_style':'virtual'}))
+
+def photo_url(key):
+    """Short-lived link the dashboard uses to show the doctor's profile photo."""
+    if not key or not os.environ.get('PHOTO_BUCKET'):return None
+    try:return s3_client().generate_presigned_url('get_object',Params={'Bucket':os.environ['PHOTO_BUCKET'],'Key':key},ExpiresIn=3600)
+    except Exception:
+        logging.getLogger().exception('photo_url_failed');return None
+
+def sync(cur,doctor_id):
+    """Rebuild the next 30 days of slots in DynamoDB. Never fails the request that triggered it."""
+    try:return {'slotSync':resync_slots(cur,doctor_id,WINDOW_DAYS)}
+    except Exception as exc:
+        logging.getLogger().exception('slot_sync_failed')
+        return {'slotSyncError':'Saved, but the slot calendar could not be updated ('+type(exc).__name__+'). Save again to retry.'}
+
 def handler(event,context):
     ctx=event.get('requestContext',{}).get('authorizer',{})
     if ctx.get('role')!='doctor' or not ctx.get('userId'): return fail(403,'Doctor role required')
@@ -29,8 +49,10 @@ def handler(event,context):
         with conn.cursor() as cur:
             if path.endswith('/doctor/me'):
                 if method=='GET':
-                    cur.execute('SELECT * FROM doctors WHERE user_id=%s',(doctor_id,)); item=cur.fetchone()
-                    return response(200,{k:jsonable(v) for k,v in item.items()}) if item else fail(404,'Profile not found')
+                    cur.execute('SELECT d.*,h.name AS hospital_name FROM doctors d LEFT JOIN hospitals h ON h.hospital_id=d.hospital_id WHERE d.user_id=%s',(doctor_id,)); item=cur.fetchone()
+                    if not item:return fail(404,'Profile not found')
+                    out={k:jsonable(v) for k,v in item.items()};out['photo_url']=photo_url(item.get('photo_key'))
+                    return response(200,out)
                 if method=='PUT':
                     fields={'first_name':'first_name','last_name':'last_name','phone':'phone','specialization':'specialization','license_number':'license_number','hospital_id':'hospital_id','qualification':'qualification','experience_years':'experience_years','timezone':'timezone','languages':'languages'}
                     updates={fields[k]:v for k,v in data.items() if k in fields}
@@ -41,12 +63,13 @@ def handler(event,context):
                         cur.execute('SELECT hospital_id FROM hospitals WHERE hospital_id=%s AND is_active=1',(updates['hospital_id'],))
                         if not cur.fetchone():return fail(400,'Hospital not found')
                     cur.execute('UPDATE doctors SET '+','.join(k+'=%s' for k in updates)+' WHERE user_id=%s',(*updates.values(),doctor_id)); conn.commit()
-                    return response(200,{'message':'Profile updated'})
+                    extra=sync(cur,doctor_id) if 'timezone' in updates else {}
+                    return response(200,{'message':'Profile updated',**extra})
             if path.endswith('/doctor/me/photo') and method=='POST':
                 mime=data.get('contentType','')
                 if mime not in ('image/jpeg','image/png','image/webp'):return fail(400,'Unsupported photo content type')
                 bucket=os.environ['PHOTO_BUCKET']; key=f'doctors/{doctor_id}/{uuid.uuid4()}'
-                url=boto3.client('s3').generate_presigned_url('put_object',Params={'Bucket':bucket,'Key':key,'ContentType':mime},ExpiresIn=300)
+                url=s3_client().generate_presigned_url('put_object',Params={'Bucket':bucket,'Key':key,'ContentType':mime},ExpiresIn=300)
                 cur.execute('UPDATE doctors SET photo_key=%s WHERE user_id=%s',(key,doctor_id));conn.commit()
                 return response(200,{'uploadUrl':url,'photoKey':key,'expiresIn':300,'contentType':mime})
             if '/consultation-types' in path:
@@ -67,26 +90,36 @@ def handler(event,context):
                         if not cur.rowcount:
                             cur.execute('SELECT 1 FROM consultation_types WHERE consultation_type_id=%s AND doctor_id=%s',(ident,doctor_id))
                             if not cur.fetchone():return fail(404,'Type not found')
-                    conn.commit();return response(status,{'consultationTypeId':ident})
+                    conn.commit();extra=sync(cur,doctor_id) if method=='PUT' else {}
+                    return response(status,{'consultationTypeId':ident,**extra})
                 if method=='DELETE' and ident:
-                    cur.execute('UPDATE consultation_types SET is_active=0 WHERE consultation_type_id=%s AND doctor_id=%s',(ident,doctor_id));conn.commit();return response(200,{'deactivated':bool(cur.rowcount)})
+                    cur.execute('UPDATE consultation_types SET is_active=0 WHERE consultation_type_id=%s AND doctor_id=%s',(ident,doctor_id));done=bool(cur.rowcount);conn.commit()
+                    return response(200,{'deactivated':done,**sync(cur,doctor_id)})
             if path.endswith('/doctor/me/availability'):
                 if method=='GET':
                     cur.execute('SELECT * FROM availability_patterns WHERE doctor_id=%s ORDER BY day_of_week,start_time',(doctor_id,));return response(200,{'items':[{k:str(v) if k in ('start_time','end_time') else jsonable(v) for k,v in x.items()} for x in cur.fetchall()]})
                 if method=='PUT':
                     patterns=data.get('patterns')
                     if not isinstance(patterns,list) or len(patterns)>100:return fail(400,'patterns must be a list of at most 100 entries')
+                    by_day={}
                     for x in patterns:
                         if not isinstance(x,dict) or type(x.get('day_of_week')) is not int or not 0<=x['day_of_week']<=6:return fail(400,'Invalid weekday (Monday=0)')
                         try:
                             start=datetime.strptime(x['start_time'],'%H:%M').time();end=datetime.strptime(x['end_time'],'%H:%M').time()
                             if start>=end:raise ValueError()
                         except (ValueError,KeyError,TypeError):return fail(400,'Invalid local time range')
-                        cur.execute('SELECT 1 FROM consultation_types WHERE consultation_type_id=%s AND doctor_id=%s AND is_active=1',(x.get('consultation_type_id'),doctor_id))
-                        if not cur.fetchone():return fail(400,'Unknown or inactive consultation type')
+                        cur.execute('SELECT duration_min FROM consultation_types WHERE consultation_type_id=%s AND doctor_id=%s AND is_active=1',(x.get('consultation_type_id'),doctor_id))
+                        ctype=cur.fetchone()
+                        if not ctype:return fail(400,'Unknown or inactive consultation type')
+                        minutes=(end.hour*60+end.minute)-(start.hour*60+start.minute)
+                        if minutes<ctype['duration_min']:return fail(400,f"{x['start_time']}-{x['end_time']} is shorter than one {ctype['duration_min']}-minute consultation")
+                        by_day.setdefault(x['day_of_week'],[]).append((start,end))
+                    for ranges in by_day.values():
+                        ranges.sort()
+                        if any(b[0]<a[1] for a,b in zip(ranges,ranges[1:])):return fail(400,'Time ranges on the same day must not overlap')
                     cur.execute('DELETE FROM availability_patterns WHERE doctor_id=%s',(doctor_id,))
                     for x in patterns:cur.execute('INSERT INTO availability_patterns(pattern_id,doctor_id,consultation_type_id,day_of_week,start_time,end_time) VALUES(%s,%s,%s,%s,%s,%s)',(str(uuid.uuid4()),doctor_id,x['consultation_type_id'],x['day_of_week'],x['start_time'],x['end_time']))
-                    conn.commit();return response(200,{'patternsSaved':len(patterns)})
+                    conn.commit();return response(200,{'patternsSaved':len(patterns),**sync(cur,doctor_id)})
             if '/blackouts' in path:
                 ident=path.split('/blackouts/',1)[-1] if '/blackouts/' in path else None
                 if method=='GET' and not ident:
@@ -94,9 +127,10 @@ def handler(event,context):
                 if method=='POST' and not ident:
                     try: date.fromisoformat(data['blackout_date'])
                     except (KeyError,ValueError,TypeError):return fail(400,'Invalid blackout date')
-                    ident=str(uuid.uuid4());cur.execute('INSERT INTO blackout_dates(blackout_id,doctor_id,blackout_date,reason) VALUES(%s,%s,%s,%s)',(ident,doctor_id,data['blackout_date'],str(data.get('reason',''))[:200]));conn.commit();return response(201,{'blackoutId':ident})
+                    ident=str(uuid.uuid4());cur.execute('INSERT INTO blackout_dates(blackout_id,doctor_id,blackout_date,reason) VALUES(%s,%s,%s,%s)',(ident,doctor_id,data['blackout_date'],str(data.get('reason',''))[:200]));conn.commit();return response(201,{'blackoutId':ident,**sync(cur,doctor_id)})
                 if method=='DELETE' and ident:
-                    cur.execute('DELETE FROM blackout_dates WHERE blackout_id=%s AND doctor_id=%s',(ident,doctor_id));conn.commit();return response(200,{'deleted':bool(cur.rowcount)})
+                    cur.execute('DELETE FROM blackout_dates WHERE blackout_id=%s AND doctor_id=%s',(ident,doctor_id));done=bool(cur.rowcount);conn.commit()
+                    return response(200,{'deleted':done,**(sync(cur,doctor_id) if done else {})})
             if path.endswith('/doctor/me/schedule') and method=='GET':
                 day=(event.get('queryStringParameters') or {}).get('date')
                 try: date.fromisoformat(day)

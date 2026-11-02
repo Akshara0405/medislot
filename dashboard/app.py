@@ -1,7 +1,9 @@
 import json
 import os
 import re
-from datetime import date
+import time
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation
 
 import requests
@@ -17,6 +19,41 @@ app.config.update(
 )
 API = os.environ['API_BASE_URL'].rstrip('/')
 ALLOWED_PHOTO_TYPES = {'image/jpeg', 'image/png', 'image/webp'}
+
+SPECIALIZATIONS = [
+    'Allergy & Immunology', 'Anaesthesiology', 'Cardiology', 'Dermatology', 'Diabetology & Endocrinology',
+    'Emergency Medicine', 'ENT (Otorhinolaryngology)', 'Gastroenterology', 'General Medicine', 'General Surgery',
+    'Gynaecology & Obstetrics', 'Nephrology', 'Neurology', 'Neurosurgery', 'Oncology', 'Ophthalmology',
+    'Orthopaedics', 'Paediatrics', 'Psychiatry', 'Pulmonology', 'Radiology', 'Rheumatology', 'Urology',
+    'Dentistry', 'Physiotherapy', 'Other',
+]
+
+_hospital_cache = {'at': 0.0, 'items': []}
+
+
+def get_hospitals():
+    """Active hospitals for the dropdowns (cached for a minute). Empty list if the API is unreachable."""
+    if time.time() - _hospital_cache['at'] < 60 and _hospital_cache['items']:
+        return _hospital_cache['items']
+    try:
+        res = requests.get(API + '/auth/hospitals', timeout=10)
+        items = res.json().get('items', []) if res.ok else []
+    except (requests.RequestException, ValueError):
+        items = []
+    if items:
+        _hospital_cache.update(at=time.time(), items=items)
+    return items
+
+
+def specialization_options(current=''):
+    """The fixed list, plus a doctor's older free-text value so it is not silently lost."""
+    current = (current or '').strip()
+    return SPECIALIZATIONS if not current or current in SPECIALIZATIONS else [current] + SPECIALIZATIONS
+
+
+def render_signup(values, status=200):
+    return render_template('signup.html', values=values, hospitals=get_hospitals(),
+                           specializations=specialization_options(values.get('specialization', ''))), status
 
 
 def api_request(method, path, *, payload=None, params=None, token=None, **kwargs):
@@ -46,7 +83,7 @@ def home():
 @app.route('/doctor/register', methods=['GET', 'POST'])
 def signup():
     if request.method == 'GET':
-        return render_template('signup.html', values={})
+        return render_signup({})
 
     photo = request.files.get('photo')
     required = ['first_name', 'last_name', 'email', 'phone', 'password', 'confirm_password',
@@ -54,21 +91,21 @@ def signup():
     missing = [field for field in required if not request.form.get(field, '').strip()]
     if missing or not photo or not photo.filename:
         flash('Complete every required field and choose a profile photo.', 'error')
-        return render_template('signup.html', values=request.form), 400
+        return render_signup(request.form, 400)
     if request.form['password'] != request.form['confirm_password']:
         flash('The passwords do not match.', 'error')
-        return render_template('signup.html', values=request.form), 400
+        return render_signup(request.form, 400)
     if photo.mimetype not in ALLOWED_PHOTO_TYPES:
         flash('Upload a JPG, PNG or WEBP profile photo.', 'error')
-        return render_template('signup.html', values=request.form), 400
+        return render_signup(request.form, 400)
     try:
         experience = int(request.form['experience_years'])
         hospital_id = int(request.form['hospital_id'])
         if not 0 <= experience <= 80 or hospital_id <= 0:
             raise ValueError()
     except ValueError:
-        flash('Enter a valid hospital ID and experience between 0 and 80 years.', 'error')
-        return render_template('signup.html', values=request.form), 400
+        flash('Choose a hospital and enter experience between 0 and 80 years.', 'error')
+        return render_signup(request.form, 400)
 
     payload = {
         'firstName': request.form['first_name'].strip(),
@@ -86,7 +123,7 @@ def signup():
         registered = requests.post(API + '/auth/register/doctor', json=payload, timeout=20)
         if registered.status_code != 201:
             flash(api_message(registered, 'Doctor registration failed. Please check your details.'), 'error')
-            return render_template('signup.html', values=request.form), registered.status_code
+            return render_signup(request.form, registered.status_code)
 
         logged_in = requests.post(API + '/auth/login', json={
             'email': payload['email'], 'password': payload['password']
@@ -112,7 +149,7 @@ def signup():
         return redirect(url_for('dashboard'))
     except requests.RequestException:
         flash('MediSlot could not reach the API. Please try again in a moment.', 'error')
-        return render_template('signup.html', values=request.form), 502
+        return render_signup(request.form, 502)
 
 
 @app.route('/doctor/login', methods=['GET', 'POST'])
@@ -164,9 +201,30 @@ def hhmm(value):
         return str(value)
 
 
+def slot_note(result):
+    """Turn the API's slot-sync summary into a short sentence for the flash message."""
+    try:
+        data = result.json()
+    except ValueError:
+        return '', None
+    sync = data.get('slotSync') or {}
+    parts = []
+    if sync.get('created'):
+        parts.append('%d slot%s added' % (sync['created'], '' if sync['created'] == 1 else 's'))
+    if sync.get('removed'):
+        parts.append('%d open slot%s removed' % (sync['removed'], '' if sync['removed'] == 1 else 's'))
+    if sync.get('keptBooked'):
+        parts.append('%d booked slot%s kept' % (sync['keptBooked'], '' if sync['keptBooked'] == 1 else 's'))
+    note = (' Next %d days: %s.' % (sync.get('days', 30), ', '.join(parts))) if parts else ''
+    return note, data.get('slotSyncError')
+
+
 def outcome(result, ok_message, fallback):
     if result is not None and result.ok:
-        flash(ok_message, 'success')
+        note, warning = slot_note(result)
+        flash(ok_message + note, 'success')
+        if warning:
+            flash(warning, 'warning')
     else:
         flash(api_message(result, fallback) if result is not None else fallback, 'error')
 
@@ -179,7 +237,23 @@ def handle_dashboard_post():
             payload = {k: request.form[k] for k in (
                 'first_name', 'last_name', 'phone', 'specialization', 'qualification', 'timezone', 'languages'
             ) if k in request.form}
+            if request.form.get('hospital_id', '').isdigit():
+                payload['hospital_id'] = int(request.form['hospital_id'])
             outcome(api_request('PUT', '/doctor/me', payload=payload), 'Profile saved.', 'Could not save your profile.')
+
+        elif action == 'photo':
+            photo = request.files.get('photo')
+            if not photo or not photo.filename or photo.mimetype not in ALLOWED_PHOTO_TYPES:
+                flash('Choose a JPG, PNG or WEBP photo.', 'error')
+            else:
+                presign = api_request('POST', '/doctor/me/photo', payload={'contentType': photo.mimetype})
+                if not presign.ok:
+                    flash(api_message(presign, 'Could not start the photo upload.'), 'error')
+                else:
+                    upload = requests.put(presign.json()['uploadUrl'], data=photo.read(),
+                                          headers={'Content-Type': photo.mimetype}, timeout=30)
+                    flash('Profile photo updated.' if upload.ok else 'The photo upload did not complete. Please try again.',
+                          'success' if upload.ok else 'error')
 
         elif action == 'availability':
             tab = 'availability'
@@ -268,6 +342,24 @@ def handle_dashboard_post():
     return redirect(url_for('dashboard', tab=tab))
 
 
+def decorate_slots(slots, type_labels, tz_name):
+    """Show slot times in the doctor's own timezone, with the consultation type name."""
+    try:
+        tz = ZoneInfo(tz_name or 'Asia/Kolkata')
+    except Exception:
+        tz = ZoneInfo('Asia/Kolkata')
+    rows = []
+    for slot in slots:
+        try:
+            start = datetime.fromisoformat(str(slot['start_at']).replace('Z', '+00:00')).astimezone(tz)
+            end = datetime.fromisoformat(str(slot['end_at']).replace('Z', '+00:00')).astimezone(tz)
+        except (KeyError, ValueError):
+            continue
+        rows.append(dict(slot, start_local=start.strftime('%I:%M %p').lstrip('0'), end_local=end.strftime('%I:%M %p').lstrip('0'),
+                         type_label=type_labels.get(slot.get('consultation_type_id'), 'Consultation')))
+    return rows
+
+
 @app.route('/doctor/dashboard', methods=['GET', 'POST'])
 def dashboard():
     if 'token' not in session or session.get('role') != 'doctor':
@@ -280,29 +372,45 @@ def dashboard():
         active = 'profile'
     day = request.args.get('date') or date.today().isoformat()
     try:
+        day_obj = date.fromisoformat(day)
+    except ValueError:
+        day_obj = date.today()
+        day = day_obj.isoformat()
+    try:
         profile = api_request('GET', '/doctor/me')
         if profile.status_code == 401:
             session.clear()
             return redirect(url_for('login'))
         availability = api_request('GET', '/doctor/me/availability')
         schedule = api_request('GET', '/doctor/me/schedule', params={'date': day})
-        types = [t for t in api_items(api_request('GET', '/doctor/me/consultation-types')) if t.get('is_active')]
+        all_types = api_items(api_request('GET', '/doctor/me/consultation-types'))
+        types = [t for t in all_types if t.get('is_active')]
         blackouts = api_items(api_request('GET', '/doctor/me/blackouts'))
     except requests.RequestException:
         flash('Unable to load your dashboard from the API.', 'error')
         profile = availability = schedule = None
-        types, blackouts = [], []
+        all_types, types, blackouts = [], [], []
 
+    active_ids = {t['consultation_type_id'] for t in types}
     patterns = [{'consultation_type_id': p.get('consultation_type_id'), 'day_of_week': p.get('day_of_week'),
                  'start_time': hhmm(p.get('start_time')), 'end_time': hhmm(p.get('end_time'))}
-                for p in (api_items(availability) if availability is not None else [])]
+                for p in (api_items(availability) if availability is not None else [])
+                if p.get('consultation_type_id') in active_ids]
+    profile_data = profile.json() if profile is not None and profile.ok else {}
+    type_labels = {t['consultation_type_id']: '%s · %s min' % (str(t.get('name', '')).replace('_', ' ').title(), t.get('duration_min'))
+                   for t in all_types}
+    slots = schedule.json().get('slots', []) if schedule is not None and schedule.ok else []
     return render_template(
         'dashboard.html',
         tabs=TABS, active=active, day=day, types=types, blackouts=blackouts, patterns=patterns,
-        profile=profile.json() if profile is not None and profile.ok else {},
-        schedule=schedule.json().get('slots', []) if schedule is not None and schedule.ok else [],
+        profile=profile_data,
+        schedule=decorate_slots(slots, type_labels, profile_data.get('timezone')),
+        day_blocked=day in {str(b.get('blackout_date')) for b in blackouts},
+        prev_day=(day_obj - timedelta(days=1)).isoformat(), next_day=(day_obj + timedelta(days=1)).isoformat(),
         type_names=list(TYPE_DURATION),
-        type_options=[{'id': t['consultation_type_id'],
+        hospitals=get_hospitals(),
+        specializations=specialization_options(profile_data.get('specialization', '')),
+        type_options=[{'id': t['consultation_type_id'], 'duration': t.get('duration_min'),
                        'label': '%s · %s min' % (str(t.get('name', '')).replace('_', ' ').title(), t.get('duration_min'))}
                       for t in types],
     )
@@ -310,4 +418,4 @@ def dashboard():
 
 @app.errorhandler(413)
 def file_too_large(_error):
-    return render_template('signup.html', values={}), 413
+    return render_signup({}, 413)

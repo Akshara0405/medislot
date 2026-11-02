@@ -56,6 +56,17 @@ _M3_TABLES = [
       FOREIGN KEY (doctor_id) REFERENCES doctors(user_id)
     ) ENGINE=InnoDB""",
 ]
+SEED_HOSPITALS = [
+    ("MediSlot General Hospital", "Hyderabad", "Main Road, Hyderabad"),
+    ("Apollo Hospitals", "Hyderabad", "Jubilee Hills, Hyderabad"),
+    ("Yashoda Hospitals", "Hyderabad", "Secunderabad, Hyderabad"),
+    ("KIMS Hospitals", "Hyderabad", "Secunderabad, Hyderabad"),
+    ("CARE Hospitals", "Hyderabad", "Banjara Hills, Hyderabad"),
+    ("Continental Hospitals", "Hyderabad", "Gachibowli, Hyderabad"),
+    ("AIG Hospitals", "Hyderabad", "Gachibowli, Hyderabad"),
+    ("Nizam's Institute of Medical Sciences", "Hyderabad", "Punjagutta, Hyderabad"),
+    ("Osmania General Hospital", "Hyderabad", "Afzalgunj, Hyderabad"),
+]
 _m3_ready = False
 def ensure_milestone3_schema(cur):
     """Idempotent Milestone 3 schema (mirrors schema/milestone3.sql). Runs once per warm Lambda."""
@@ -73,9 +84,9 @@ def ensure_milestone3_schema(cur):
                     raise
     for statement in _M3_TABLES:
         cur.execute(statement)
-    # Doctor sign-up needs at least one active hospital to choose from.
-    cur.execute("INSERT IGNORE INTO hospitals (name, city, address) VALUES (%s,%s,%s)",
-                ("MediSlot General Hospital", "Hyderabad", "Main Road, Hyderabad"))
+    # Doctor sign-up shows these in a dropdown. INSERT IGNORE keeps this safe to re-run;
+    # edit or extend the list freely (hospitals are unique on name + city).
+    cur.executemany("INSERT IGNORE INTO hospitals (name, city, address) VALUES (%s,%s,%s)", SEED_HOSPITALS)
     _m3_ready = True
 def dbconn(c):
     conn=pymysql.connect(host=c["dbhost"],port=c["dbport"],user=c["dbuser"],password=c["dbpass"],

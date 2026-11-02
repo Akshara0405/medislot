@@ -114,13 +114,18 @@ Resources:
                 Action: [kms:Decrypt]
                 Resource: '*'
               - Effect: Allow
-                Action: [dynamodb:Query]
-                Resource: !Sub
-                  - 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${SlotsTable}/index/*'
-                  - SlotsTable: !ImportValue
-                      Fn::Sub: 'MediSlot-${Environment}-SlotsTableName'
+                Action: [dynamodb:Query, dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:BatchWriteItem]
+                Resource:
+                  - !Sub
+                    - 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${SlotsTable}'
+                    - SlotsTable: !ImportValue
+                        Fn::Sub: 'MediSlot-${Environment}-SlotsTableName'
+                  - !Sub
+                    - 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${SlotsTable}/index/*'
+                    - SlotsTable: !ImportValue
+                        Fn::Sub: 'MediSlot-${Environment}-SlotsTableName'
               - Effect: Allow
-                Action: [s3:PutObject]
+                Action: [s3:PutObject, s3:GetObject]
                 Resource: !Sub
                   - 'arn:${AWS::Partition}:s3:::${PhotoBucket}/*'
                   - PhotoBucket: !ImportValue
@@ -132,8 +137,8 @@ Resources:
       Runtime: python3.12
       Handler: lambda_function.handler
       Role: !GetAtt DoctorRole.Arn
-      Timeout: 20
-      MemorySize: 256
+      Timeout: 28
+      MemorySize: 512
       Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Sub '${ArtifactPrefix}/doctor.zip'}
       VpcConfig:
         SecurityGroupIds: [!ImportValue {Fn::Sub: 'MediSlot-${Environment}-LambdaSecurityGroupId'}]
@@ -171,6 +176,9 @@ Resources:
   AuthResource:
     Type: AWS::ApiGateway::Resource
     Properties: {RestApiId: !Ref RestApi, ParentId: !GetAtt RestApi.RootResourceId, PathPart: auth}
+  AuthHospitalsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref AuthResource, PathPart: hospitals}
   RegisterResource:
     Type: AWS::ApiGateway::Resource
     Properties: {RestApiId: !Ref RestApi, ParentId: !Ref AuthResource, PathPart: register}
@@ -228,6 +236,14 @@ Resources:
       RestApiId: !Ref RestApi
       ResourceId: !Ref RegisterPatientResource
       HttpMethod: POST
+      AuthorizationType: NONE
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthenticationFunction.Arn}/invocations'}
+  HospitalsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AuthHospitalsResource
+      HttpMethod: GET
       AuthorizationType: NONE
       Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthenticationFunction.Arn}/invocations'}
   RegisterDoctorMethod:
@@ -405,7 +421,7 @@ Resources:
       SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*/*'
   ApiDeploymentDashboardTabs:
     Type: AWS::ApiGateway::Deployment
-    DependsOn: [RegisterPatientMethod, RegisterDoctorMethod, LoginMethod, RefreshMethod, LogoutMethod, PatientMeMethod, DoctorMeMethod, DoctorMePutMethod, DoctorPhotoPostMethod, DoctorAvailabilityGetMethod, DoctorAvailabilityPutMethod, DoctorScheduleGetMethod, DoctorTypesGetMethod, DoctorTypesPostMethod, DoctorTypeItemPutMethod, DoctorTypeItemDeleteMethod, DoctorBlackoutsGetMethod, DoctorBlackoutsPostMethod, DoctorBlackoutItemDeleteMethod]
+    DependsOn: [HospitalsGetMethod, RegisterPatientMethod, RegisterDoctorMethod, LoginMethod, RefreshMethod, LogoutMethod, PatientMeMethod, DoctorMeMethod, DoctorMePutMethod, DoctorPhotoPostMethod, DoctorAvailabilityGetMethod, DoctorAvailabilityPutMethod, DoctorScheduleGetMethod, DoctorTypesGetMethod, DoctorTypesPostMethod, DoctorTypeItemPutMethod, DoctorTypeItemDeleteMethod, DoctorBlackoutsGetMethod, DoctorBlackoutsPostMethod, DoctorBlackoutItemDeleteMethod]
     Properties:
       RestApiId: !Ref RestApi
       Description: !Sub 'MediSlot ${Environment} authentication, doctor profile and photo API deployment'
