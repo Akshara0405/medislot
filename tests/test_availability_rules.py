@@ -1,5 +1,6 @@
 """Rules enforced by the doctor Lambda: no overlapping patterns, fixed capacity per type."""
 import importlib.util, json, os, sys
+import pytest
 os.environ.setdefault('AWS_DEFAULT_REGION', 'ap-south-1')
 ROOT = os.path.join(os.path.dirname(__file__), '..', 'lambdas')
 sys.path.insert(0, os.path.join(ROOT, 'doctor'))
@@ -13,6 +14,12 @@ TYPES = {
     'detailed': {'name': 'DETAILED',    'duration_min': 30},   # 30 min so 09:00-09:30 is a valid length
     'camp':     {'name': 'HEALTH_CAMP', 'duration_min': 60},
 }
+
+
+@pytest.fixture(autouse=True)
+def no_dynamodb(monkeypatch):
+    """These tests have no DynamoDB; tests that care about bookings override this stub themselves."""
+    monkeypatch.setattr(lf, 'find_booking_conflicts', lambda cur, d, p: [])
 
 
 class Cur:
@@ -108,3 +115,11 @@ def test_saving_is_blocked_when_new_slots_would_overlap_a_booked_one(monkeypatch
     monkeypatch.setattr(lf, 'find_booking_conflicts', lambda cur, d, p: ['Monday 09 Nov 09:00-09:15 overlaps an existing booked appointment at 09:00-09:30'])
     code, out, cur = put_patterns(monkeypatch, [pattern('quick', '09:00', '09:30')])
     assert code == 409 and cur.saved == [] and 'Nothing was saved' in out['message'] and 'booked appointment' in out['message']
+
+
+def test_if_the_booking_check_breaks_nothing_is_saved(monkeypatch):
+    """Fail closed: a broken conflict check must never let a save through (it used to save silently)."""
+    def boom(cur, d, p): raise RuntimeError('DynamoDB unavailable')
+    monkeypatch.setattr(lf, 'find_booking_conflicts', boom)
+    code, out, cur = put_patterns(monkeypatch, [pattern('quick', '09:00', '09:30')])
+    assert code == 503 and cur.saved == [] and 'nothing was saved' in out['message'].lower()

@@ -114,7 +114,7 @@ Resources:
                 Action: [kms:Decrypt]
                 Resource: '*'
               - Effect: Allow
-                Action: [dynamodb:Query, dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:BatchWriteItem]
+                Action: [dynamodb:Query, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:BatchWriteItem]
                 Resource:
                   - !Sub
                     - 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${SlotsTable}'
@@ -152,6 +152,73 @@ Resources:
             Fn::Sub: 'MediSlot-${Environment}-DoctorPhotosBucketName'
           SLOTS_TABLE: !ImportValue
             Fn::Sub: 'MediSlot-${Environment}-SlotsTableName'
+  MaterializerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'MediSlot-${Environment}-MaterializerRole'
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]}
+      ManagedPolicyArns: [!Ref LambdaExecutionBasePolicy]
+      Policies:
+        - PolicyName: MaterializerRuntimeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ssm:GetParameter]
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/*'
+              - Effect: Allow
+                Action: [kms:Decrypt]
+                Resource: '*'
+              - Effect: Allow
+                Action: [dynamodb:Query, dynamodb:PutItem]
+                Resource:
+                  - !Sub
+                    - 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${SlotsTable}'
+                    - SlotsTable: !ImportValue
+                        Fn::Sub: 'MediSlot-${Environment}-SlotsTableName'
+                  - !Sub
+                    - 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${SlotsTable}/index/*'
+                    - SlotsTable: !ImportValue
+                        Fn::Sub: 'MediSlot-${Environment}-SlotsTableName'
+  MaterializerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'medislot-${Environment}-materializer'
+      Description: Daily top-up of the rolling 30-day slot window in DynamoDB for every doctor.
+      Runtime: python3.12
+      Handler: lambda_function.handler
+      Role: !GetAtt MaterializerRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Sub '${ArtifactPrefix}/materializer.zip'}
+      VpcConfig:
+        SecurityGroupIds: [!ImportValue {Fn::Sub: 'MediSlot-${Environment}-LambdaSecurityGroupId'}]
+        SubnetIds:
+          - Fn::ImportValue: !Sub 'MediSlot-${Environment}-PrivateSubnet1Id'
+          - Fn::ImportValue: !Sub 'MediSlot-${Environment}-PrivateSubnet2Id'
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          SLOTS_TABLE: !ImportValue
+            Fn::Sub: 'MediSlot-${Environment}-SlotsTableName'
+  MaterializerSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'medislot-${Environment}-materializer-daily'
+      Description: Runs the slot materializer every day at 00:30 IST (19:00 UTC).
+      ScheduleExpression: 'cron(0 19 * * ? *)'
+      State: ENABLED
+      Targets:
+        - Id: MaterializerFunction
+          Arn: !GetAtt MaterializerFunction.Arn
+          Input: '{}'
+  MaterializerSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MaterializerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MaterializerSchedule.Arn
   RestApi:
     Type: AWS::ApiGateway::RestApi
     Properties:
@@ -449,3 +516,4 @@ Outputs:
     Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/auth/login'
   AuthenticationFunctionName: {Value: !Ref AuthenticationFunction}
   AuthorizationFunctionName: {Value: !Ref AuthorizationFunction}
+  MaterializerFunctionName: {Value: !Ref MaterializerFunction}
