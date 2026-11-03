@@ -424,18 +424,25 @@ def dashboard():
     for slot in decorated:
         slots_by_day.setdefault(slot.get('local_date') or day, []).append(slot)
     blackout_map = {str(b.get('blackout_date')): b.get('reason') for b in blackouts}
-    schedule_days = [
-        {'date': (day_obj + timedelta(days=offset)).isoformat(),
-         'slots': slots_by_day.get((day_obj + timedelta(days=offset)).isoformat(), []),
-         'blocked': (day_obj + timedelta(days=offset)).isoformat() in blackout_map,
-         'reason': blackout_map.get((day_obj + timedelta(days=offset)).isoformat())}
-        for offset in range(30)
-    ]
+    # Only days that actually have slots (or are blackout days) are shown.
+    schedule_days = []
+    for offset in range(30):
+        d = day_obj + timedelta(days=offset)
+        iso = d.isoformat()
+        schedule_days.append({
+            'date': iso, 'weekday': d.strftime('%a'), 'daynum': d.day, 'month': d.strftime('%b'),
+            'slots': slots_by_day.get(iso, []),
+            'blocked': iso in blackout_map, 'reason': blackout_map.get(iso),
+        })
+    slot_total = sum(len(g['slots']) for g in schedule_days)
+    open_total = sum(1 for g in schedule_days for s in g['slots']
+                     if s.get('status') != 'CLOSED' and int(s.get('booked_count') or 0) < int(s.get('capacity') or 1))
+    busy_days = [g for g in schedule_days if g['slots'] or g['blocked']]
     return render_template(
         'dashboard.html',
-        tabs=TABS, active=active, day=day, types=types, blackouts=blackouts, patterns=patterns,
+        tabs=TABS, active=active, day=day, busy_days=busy_days, slot_total=slot_total, open_total=open_total, types=types, blackouts=blackouts, patterns=patterns,
         profile=profile_data,
-        schedule=decorated, schedule_days=schedule_days,
+        schedule=decorated, schedule_days=schedule_days, hidden_days=hidden_days,
         schedule_error=(schedule is not None and not schedule.ok),
         prev_day=(day_obj - timedelta(days=30)).isoformat(), next_day=(day_obj + timedelta(days=30)).isoformat(),
         type_names=list(TYPE_DURATION),

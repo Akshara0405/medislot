@@ -1,4 +1,20 @@
-{% extends 'base.html' %}{% block title %}Doctor workspace · MediSlot{% endblock %}{% block content %}
+{% extends 'base.html' %}{% block title %}Doctor workspace · MediSlot{% endblock %}{% block head %}<style>
+.sched-head{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;margin-bottom:14px}
+.sched-stats{display:flex;gap:10px}.sched-stats span{background:var(--mint);color:#1d6b5f;border-radius:30px;padding:8px 14px;font-size:13px}.sched-stats b{font:800 16px Manrope,sans-serif}
+.legend{display:flex;gap:14px;margin:6px 0 4px;font-size:12px;font-weight:700;color:var(--muted)}.lg:before{content:'';display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;background:var(--teal)}.lg.full:before{background:var(--coral)}.lg.closed:before{background:#b5c0c4}
+.daycard{display:flex;gap:18px;align-items:flex-start;padding:16px 0;border-top:1px solid var(--line)}
+.datebox{flex:0 0 74px;text-align:center;background:var(--ink);color:#fff;border-radius:18px;padding:10px 0;display:flex;flex-direction:column;line-height:1.15}.datebox strong{font:800 28px Manrope,sans-serif}.datebox small{font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--lime)}
+.daycard.blocked .datebox{background:#8a979c}.daycard.blocked .datebox small{color:#e8eef0}
+.daybody{flex:1;min-width:0}.blackout-note{background:#fff7df;color:#805d14;border-radius:12px;padding:9px 12px;font-size:13px;margin:0 0 10px}
+.slot-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+.slotpill{border-radius:16px;padding:11px 13px;display:flex;flex-direction:column;gap:2px;border:1px solid transparent}
+.slotpill .st{font:800 17px Manrope,sans-serif;letter-spacing:-.4px}.slotpill .et{font-size:11px;color:var(--muted)}.slotpill .sty{font-size:12px;font-weight:700;margin-top:4px}.slotpill .seat{font-size:11px;font-weight:700;opacity:.8}
+.slotpill.open{background:var(--mint);border-color:#bfe8d8;color:#14594f}
+.slotpill.full{background:#fff0ed;border-color:#f6cfc6;color:#a43c2d}
+.slotpill.closed{background:repeating-linear-gradient(135deg,#f1f4f5,#f1f4f5 8px,#e8edef 8px,#e8edef 16px);color:#6d7b80;border-color:#dde4e6}
+@media(max-width:600px){.daycard{flex-direction:column;gap:10px}.datebox{flex-direction:row;gap:8px;padding:8px 14px;align-items:baseline;justify-content:center}.datebox strong{font-size:20px}}
+</style>{% endblock %}
+{% block content %}
 <main class="shell dashboard">
 <div class="dash-head"><div class="dash-title"><div class="avatar sm">{% if profile.get('photo_url') %}<img src="{{ profile.get('photo_url') }}" alt="Your profile photo" onerror="this.remove()">{% endif %}<span>{{ ((profile.get('first_name') or 'D')[:1] ~ (profile.get('last_name') or '')[:1])|upper }}</span></div><div><span class="eyebrow">Your professional space</span><h1>Good day, Dr. {{ (profile.get('first_name') or 'Doctor')|title }}.</h1><p style="color:var(--muted)">Manage your profile, consultation types, availability, schedule and blackout dates.</p></div></div><a class="ghost" href="/doctor/logout">Sign out ↗</a></div>
 
@@ -46,22 +62,23 @@
 </section>
 
 <section class="dash-card panel{{ ' active' if active == 'schedule' else '' }}" id="panel-schedule">
-<h2>Schedule · Next 30 days</h2>
-<p class="hint">Showing every generated consultation slot from {{ day }} through the following 29 days. Times are displayed in your profile timezone.</p>
-<div class="day-nav"><a class="ghost" href="{{ url_for('dashboard', tab='schedule', date=prev_day) }}">← Previous 30-day window</a>
-<form method="get" class="row-actions inline"><input type="hidden" name="tab" value="schedule"><label for="schedule-start">Start date</label><input id="schedule-start" type="date" name="date" value="{{ day }}"><button class="ghost">View 30 days</button></form>
-<a class="ghost" href="{{ url_for('dashboard', tab='schedule', date=next_day) }}">Next 30-day window →</a></div>
-{% if schedule_error %}<p class="notice" role="alert">The 30-day schedule could not be loaded. Please refresh the page; check the doctor Lambda logs if the problem continues.</p>{% endif %}
-{% for group in schedule_days %}
-<div class="schedule-day">
-<h3 style="margin-top:24px">{{ group.date }}{% if group.blocked %} · Blackout{% endif %}</h3>
-{% if group.blocked %}<p class="notice">This is a blackout day. Its slots are Closed and cannot be booked. Existing bookings are kept.{% if group.reason %} Reason: {{ group.reason }}{% endif %}</p>{% endif %}
-<table><thead><tr><th>Time</th><th>Type</th><th>Capacity</th><th>Booked</th><th>Status</th></tr></thead><tbody>
-{% for s in group.slots %}<tr><td>{{ s.start_local }} – {{ s.end_local }}</td><td>{{ s.type_label }}</td><td>{{ s.capacity }}</td><td>{{ s.booked_count }}</td><td>{% set closed = (s.status == 'CLOSED') %}{% set full = (not closed) and s.booked_count|int >= s.capacity|int %}<span class="badge{{ ' full' if (full or closed) else '' }}">{{ 'Closed' if closed else ('Full' if full else 'Open') }}</span></td></tr>
-{% else %}<tr><td colspan="5" class="empty">{{ 'No slots were set up for this blackout day.' if group.blocked else 'No slots generated for this date.' }}</td></tr>{% endfor %}
-</tbody></table>
-</div>
-{% endfor %}
+<div class="sched-head"><div><h2 style="margin:0">Your upcoming slots</h2>
+<p class="hint" style="margin:6px 0 0">{{ day }} → next 30 days · times in your profile timezone</p></div>
+<div class="sched-stats"><span><b>{{ slot_total }}</b> slots</span><span><b>{{ open_total }}</b> open</span><span><b>{{ busy_days|length }}</b> days</span></div></div>
+<div class="day-nav"><a class="ghost" href="{{ url_for('dashboard', tab='schedule', date=prev_day) }}">← Earlier</a>
+<form method="get" class="row-actions inline"><input type="hidden" name="tab" value="schedule"><input id="schedule-start" type="date" name="date" value="{{ day }}" aria-label="Start date"><button class="ghost">Go</button></form>
+<a class="ghost" href="{{ url_for('dashboard', tab='schedule', date=next_day) }}">Later →</a></div>
+<div class="legend"><span class="lg open">Open</span><span class="lg full">Fully booked</span><span class="lg closed">Closed</span></div>
+{% if schedule_error %}<p class="notice" role="alert">The schedule could not be loaded. Please refresh the page; check the doctor Lambda logs if the problem continues.</p>{% endif %}
+{% for g in busy_days %}
+<div class="daycard{{ ' blocked' if g.blocked else '' }}">
+<div class="datebox"><small>{{ g.weekday }}</small><strong>{{ g.daynum }}</strong><small>{{ g.month }}</small></div>
+<div class="daybody">
+{% if g.blocked %}<p class="blackout-note">Blackout day{% if g.reason %} · {{ g.reason }}{% endif %}. Slots are closed; existing bookings are kept.</p>{% endif %}
+<div class="slot-grid">{% for s in g.slots %}{% set closed = (s.status == 'CLOSED') %}{% set full = (not closed) and s.booked_count|int >= s.capacity|int %}
+<div class="slotpill {{ 'closed' if closed else ('full' if full else 'open') }}"><span class="st">{{ s.start_local }}</span><span class="et">to {{ s.end_local }}</span><span class="sty">{{ s.type_label }}</span><span class="seat">{{ s.booked_count }}/{{ s.capacity }} booked{% if closed %} · closed{% elif full %} · full{% endif %}</span></div>{% endfor %}</div>
+</div></div>
+{% else %}<p class="empty">No slots in this 30-day window. Set your weekly hours in the Availability tab, or pick a different start date.</p>{% endfor %}
 </section>
 
 <section class="dash-card panel{{ ' active' if active == 'blackouts' else '' }}" id="panel-blackouts">
