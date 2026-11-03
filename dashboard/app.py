@@ -442,7 +442,7 @@ def dashboard():
         'dashboard.html',
         tabs=TABS, active=active, day=day, busy_days=busy_days, slot_total=slot_total, open_total=open_total, types=types, blackouts=blackouts, patterns=patterns,
         profile=profile_data,
-        schedule=decorated, schedule_days=schedule_days, hidden_days=hidden_days,
+        schedule=decorated, schedule_days=schedule_days,
         schedule_error=(schedule is not None and not schedule.ok),
         prev_day=(day_obj - timedelta(days=30)).isoformat(), next_day=(day_obj + timedelta(days=30)).isoformat(),
         type_names=list(TYPE_DURATION),
