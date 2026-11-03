@@ -4,12 +4,13 @@ import re
 import secrets
 import time
 import uuid
+import logging
 
 import bcrypt
 import jwt
 from botocore.exceptions import ClientError
 
-from common import auth_table, body, config, correlation, dbconn, emit, get_param, response, token_hash
+from common import SEED_HOSPITALS, auth_table, body, config, correlation, dbconn, emit, get_param, response, token_hash
 
 
 def handler(event, context):
@@ -52,8 +53,11 @@ def handler(event, context):
             ctx = ((event.get("requestContext") or {}).get("authorizer") or {})
             return response(200, {"userId": ctx.get("userId"), "role": ctx.get("role"), "message": "Authorization successful"})
         return response(404, {"message": "Route not found", "correlationId": cid})
-    except Exception:
-        emit("error", "authentication_request_failed", cid, route=path)
+    except Exception as exc:
+        # Keep the public response generic, but preserve the real failure in CloudWatch.
+        logging.getLogger().exception("authentication_request_failed route=%s correlationId=%s errorType=%s",
+                                      path, cid, type(exc).__name__)
+        emit("error", "authentication_request_failed", cid, route=path, errorType=type(exc).__name__)
         return response(500, {"message": "Internal server error", "correlationId": cid})
 
 
@@ -62,9 +66,21 @@ def list_hospitals(cid):
     conn = dbconn(config())
     try:
         with conn.cursor() as cur:
+            # Re-seed idempotently on this public read as well. This repairs an empty
+            # hospitals table even when this Lambda execution environment is warm.
+            cur.executemany(
+                "INSERT IGNORE INTO hospitals (name, city, address) VALUES (%s,%s,%s)",
+                SEED_HOSPITALS,
+            )
+            conn.commit()
             cur.execute("SELECT hospital_id, name, city FROM hospitals WHERE is_active=TRUE ORDER BY name, city")
             items = [{"hospital_id": int(r["hospital_id"]), "name": r["name"], "city": r["city"]} for r in cur.fetchall()]
+        emit("info", "hospital_list_loaded", cid, count=len(items))
         return response(200, {"items": items})
+    except Exception:
+        conn.rollback()
+        logging.getLogger().exception("hospital_list_query_failed correlationId=%s", cid)
+        raise
     finally:
         conn.close()
 

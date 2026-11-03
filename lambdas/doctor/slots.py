@@ -31,6 +31,27 @@ OPEN, CLOSED, FULL = 'OPEN', 'CLOSED', 'FULL'
 CAMP_MIN_CAPACITY, CAMP_MAX_CAPACITY = 2, 10
 
 
+def query_schedule_window(table, doctor_id, first_day, days=WINDOW_DAYS):
+    """Read every slot for a doctor across a bounded date window, including pagination."""
+    if not 1 <= int(days) <= WINDOW_DAYS:
+        raise ValueError('days must be between 1 and 30')
+    items = []
+    for offset in range(int(days)):
+        day = (first_day + timedelta(days=offset)).isoformat()
+        query = {
+            'IndexName': 'GSI_DoctorDate',
+            'KeyConditionExpression': Key('doctor_date').eq(f'{doctor_id}#{day}'),
+        }
+        while True:
+            result = table.query(**query)
+            items.extend(result.get('Items', []))
+            last_key = result.get('LastEvaluatedKey')
+            if not last_key:
+                break
+            query['ExclusiveStartKey'] = last_key
+    return sorted(items, key=lambda item: (item.get('local_date', ''), item.get('start_at', '')))
+
+
 def effective_capacity(type_name, stored):
     """1 for every normal consultation; a health camp keeps its configured group size."""
     if type_name != 'HEALTH_CAMP':
@@ -136,26 +157,20 @@ def _in_use(item):
     return int(item.get('booked_count', 0) or 0) > 0 or int(item.get('held_count', 0) or 0) > 0
 
 
-def _blocks_overlap(item):
-    # CLOSED slots still represent occupied schedule time. Do not reuse them for
-    # another consultation type just because they are not currently bookable.
-    return _in_use(item) or str(item.get('status', '')).upper() == CLOSED
-
-
 def _overlap(a, b):
     """True when two slots (ISO 'Z' strings, same format so they compare as text) share any time."""
     return a['start_at'] < b['end_at'] and b['start_at'] < a['end_at']
 
 
 def _dedupe(wanted, current):
-    """Drop wanted slots that overlap a booked, held, CLOSED, or already accepted slot.
+    """Drop wanted slots that overlap a slot that must stay (booked/held) or one already accepted.
 
     Order: earliest start first, longer slot first on a tie, so the result is the same every run.
     Returns (kept_wanted, number_dropped). Unbooked overlapping slots left over from older saves are not in
     kept_wanted, so the caller removes them.
     """
-    taken = [i for i in current.values() if _blocks_overlap(i)]
-    kept = {sid: i for sid, i in wanted.items() if _blocks_overlap(current.get(sid) or {})}
+    taken = [i for i in current.values() if _in_use(i)]
+    kept = {sid: i for sid, i in wanted.items() if _in_use(current.get(sid) or {})}
     dropped = 0
     ordered = sorted(sorted(wanted.values(), key=lambda i: i['end_at'], reverse=True), key=lambda i: i['start_at'])
     for item in ordered:
@@ -170,12 +185,12 @@ def _dedupe(wanted, current):
 
 
 def _blockers(current, wanted):
-    """Booked, held, or CLOSED slots omitted from the new schedule; they still reserve the doctor's time."""
-    return [i for sid, i in current.items() if _blocks_overlap(i) and sid not in wanted]
+    """Slots with a booking/hold that the new schedule no longer contains: they stay, so nothing may overlap them."""
+    return [i for sid, i in current.items() if _in_use(i) and sid not in wanted]
 
 
 def find_booking_conflicts(cur, doctor_id, patterns, days=WINDOW_DAYS, table=None, today=None):
-    """Messages for every new slot that would overlap an existing booked, held, or CLOSED slot. Empty list = safe to save.
+    """Messages for every new slot that would overlap an existing booked/held slot. Empty list = safe to save.
 
     `patterns` is the weekly list about to be saved: dicts with day_of_week, start_time, end_time
     (time or 'HH:MM'), consultation_type_id and duration_min.
@@ -193,15 +208,13 @@ def find_booking_conflicts(cur, doctor_id, patterns, days=WINDOW_DAYS, table=Non
                 for item in generate_slots(doctor_id, p['consultation_type_id'], day, tz_name, as_time(p['start_time']),
                                            as_time(p['end_time']), int(p['duration_min']), 1):
                     wanted[item['slot_id']] = item
-        # Existing CLOSED slots are schedule occupancy too. A new consultation
-        # type must not be placed on top of them, even when booked_count is zero.
         blockers = _blockers({i['slot_id']: i for i in _existing(table, doctor_id, day.isoformat())}, wanted)
         for item in wanted.values():
             for b in blockers:
                 if _overlap(item, b):
                     def local(x): return datetime.fromisoformat(x.replace('Z', '+00:00')).astimezone(tz).strftime('%H:%M')
                     problems.append(f"{day.strftime('%A %d %b')} {local(item['start_at'])}-{local(item['end_at'])} overlaps an existing "
-                                    f"consultation slot at {local(b['start_at'])}-{local(b['end_at'])}")
+                                    f"booked appointment at {local(b['start_at'])}-{local(b['end_at'])}")
                     break
         if len(problems) >= 3:
             break

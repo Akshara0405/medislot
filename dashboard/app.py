@@ -2,6 +2,7 @@ import json
 import os
 import re
 import time
+import logging
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation
@@ -30,19 +31,30 @@ SPECIALIZATIONS = [
 
 _hospital_cache = {'at': 0.0, 'items': []}
 
-
 def get_hospitals():
-    """Active hospitals for the dropdowns (cached for a minute). Empty list if the API is unreachable."""
-    if time.time() - _hospital_cache['at'] < 60 and _hospital_cache['items']:
+    """Load active hospitals; cache successful and empty responses briefly."""
+    if time.time() - _hospital_cache['at'] < 30:
         return _hospital_cache['items']
     try:
-        res = requests.get(API + '/auth/hospitals', timeout=10)
-        items = res.json().get('items', []) if res.ok else []
-    except (requests.RequestException, ValueError):
-        items = []
-    if items:
-        _hospital_cache.update(at=time.time(), items=items)
-    return items
+        res = requests.get(API + '/auth/hospitals', timeout=15)
+        if not res.ok:
+            logging.getLogger(__name__).error('Hospital API returned HTTP %s: %s', res.status_code, res.text[:500])
+            return []
+        payload = res.json()
+        # Accept both decoded API Gateway proxy JSON and a stringified body.
+        if isinstance(payload, dict) and isinstance(payload.get('body'), str):
+            payload = json.loads(payload['body'])
+        items = payload.get('items', []) if isinstance(payload, dict) else []
+        if not isinstance(items, list):
+            raise ValueError('Hospital API response did not contain an items list')
+        valid = [h for h in items if isinstance(h, dict) and h.get('hospital_id') and h.get('name')]
+        _hospital_cache.update(at=time.time(), items=valid)
+        if not valid:
+            logging.getLogger(__name__).warning('Hospital API returned no active hospitals')
+        return valid
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        logging.getLogger(__name__).exception('Could not load hospitals: %s', type(exc).__name__)
+        return []
 
 
 def specialization_options(current=''):
@@ -389,7 +401,7 @@ def dashboard():
             session.clear()
             return redirect(url_for('login'))
         availability = api_request('GET', '/doctor/me/availability')
-        schedule = api_request('GET', '/doctor/me/schedule', params={'date': day})
+        schedule = api_request('GET', '/doctor/me/schedule', params={'start_date': day, 'days': 30})
         all_types = api_items(api_request('GET', '/doctor/me/consultation-types'))
         types = [t for t in all_types if t.get('is_active')]
         blackouts = api_items(api_request('GET', '/doctor/me/blackouts'))
@@ -407,13 +419,25 @@ def dashboard():
     type_labels = {t['consultation_type_id']: '%s · %s min' % (str(t.get('name', '')).replace('_', ' ').title(), t.get('duration_min'))
                    for t in all_types}
     slots = schedule.json().get('slots', []) if schedule is not None and schedule.ok else []
+    decorated = decorate_slots(slots, type_labels, profile_data.get('timezone'))
+    slots_by_day = {}
+    for slot in decorated:
+        slots_by_day.setdefault(slot.get('local_date') or day, []).append(slot)
+    blackout_map = {str(b.get('blackout_date')): b.get('reason') for b in blackouts}
+    schedule_days = [
+        {'date': (day_obj + timedelta(days=offset)).isoformat(),
+         'slots': slots_by_day.get((day_obj + timedelta(days=offset)).isoformat(), []),
+         'blocked': (day_obj + timedelta(days=offset)).isoformat() in blackout_map,
+         'reason': blackout_map.get((day_obj + timedelta(days=offset)).isoformat())}
+        for offset in range(30)
+    ]
     return render_template(
         'dashboard.html',
         tabs=TABS, active=active, day=day, types=types, blackouts=blackouts, patterns=patterns,
         profile=profile_data,
-        schedule=decorate_slots(slots, type_labels, profile_data.get('timezone')),
-        day_blocked=day in {str(b.get('blackout_date')) for b in blackouts},
-        prev_day=(day_obj - timedelta(days=1)).isoformat(), next_day=(day_obj + timedelta(days=1)).isoformat(),
+        schedule=decorated, schedule_days=schedule_days,
+        schedule_error=(schedule is not None and not schedule.ok),
+        prev_day=(day_obj - timedelta(days=30)).isoformat(), next_day=(day_obj + timedelta(days=30)).isoformat(),
         type_names=list(TYPE_DURATION),
         camp_min=CAMP_MIN_CAPACITY, camp_max=CAMP_MAX_CAPACITY,
         hospitals=get_hospitals(),

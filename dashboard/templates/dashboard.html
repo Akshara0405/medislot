@@ -148,3 +148,163 @@
 })();
 </script>
 {% endblock %}
+{% extends 'base.html' %}{% block title %}Doctor workspace · MediSlot{% endblock %}{% block content %}
+<main class="shell dashboard">
+<div class="dash-head"><div class="dash-title"><div class="avatar sm">{% if profile.get('photo_url') %}<img src="{{ profile.get('photo_url') }}" alt="Your profile photo" onerror="this.remove()">{% endif %}<span>{{ ((profile.get('first_name') or 'D')[:1] ~ (profile.get('last_name') or '')[:1])|upper }}</span></div><div><span class="eyebrow">Your professional space</span><h1>Good day, Dr. {{ (profile.get('first_name') or 'Doctor')|title }}.</h1><p style="color:var(--muted)">Manage your profile, consultation types, availability, schedule and blackout dates.</p></div></div><a class="ghost" href="/doctor/logout">Sign out ↗</a></div>
+
+<nav class="tabs" role="tablist" aria-label="Dashboard sections">{% for key, label in tabs %}<a class="tab{{ ' active' if key == active else '' }}" role="tab" data-tab="{{ key }}" href="{{ url_for('dashboard', tab=key) }}" aria-selected="{{ 'true' if key == active else 'false' }}">{{ label }}</a>{% endfor %}</nav>
+
+<section class="dash-card panel{{ ' active' if active == 'profile' else '' }}" id="panel-profile">
+<h2>Profile overview</h2>
+<div class="chips">{% for v in [profile.get('specialization'), profile.get('qualification'), (profile.get('experience_years')|string ~ ' yrs experience') if profile.get('experience_years') is not none else None, ('License ' ~ profile.get('license_number')) if profile.get('license_number') else None, profile.get('timezone'), profile.get('hospital_name')] %}{% if v %}<span class="chip">{{ v }}</span>{% endif %}{% endfor %}</div>
+<div class="profile-head"><div class="avatar">{% if profile.get('photo_url') %}<img src="{{ profile.get('photo_url') }}" alt="Your profile photo" onerror="this.remove()">{% endif %}<span>{{ ((profile.get('first_name') or 'D')[:1] ~ (profile.get('last_name') or '')[:1])|upper }}</span></div>
+<form method="post" enctype="multipart/form-data" class="photo-form"><input type="hidden" name="action" value="photo"><input type="file" name="photo" accept="image/jpeg,image/png,image/webp" required><button class="ghost">{{ 'Change photo' if profile.get('photo_url') else 'Upload photo' }}</button></form></div>
+<form method="post"><input type="hidden" name="action" value="profile">
+<div class="fields">{% for k in ['first_name','last_name','phone','qualification','timezone','languages'] %}<div><label for="p-{{ k }}">{{ k.replace('_',' ')|title }}</label><input id="p-{{ k }}" name="{{ k }}" value="{{ profile.get(k) or '' }}"></div>{% endfor %}
+<div><label for="p-specialization">Specialisation</label><select id="p-specialization" name="specialization">{% for sp in specializations %}<option value="{{ sp }}" {{ 'selected' if profile.get('specialization') == sp else '' }}>{{ sp }}</option>{% endfor %}</select></div>
+<div><label for="p-hospital">Hospital</label><select id="p-hospital" name="hospital_id">{% for h in hospitals %}<option value="{{ h.hospital_id }}" {{ 'selected' if profile.get('hospital_id')|string == h.hospital_id|string else '' }}>{{ h.name }}{{ ' · ' ~ h.city if h.city else '' }}</option>{% endfor %}</select></div></div>
+<button class="primary">Save profile</button></form>
+</section>
+
+<section class="dash-card panel{{ ' active' if active == 'types' else '' }}" id="panel-types">
+<h2>Consultation types</h2>
+<p class="hint">Quick = 15 min, Standard = 30 min, Detailed = 60 min, Health camp = 60 min ({{ camp_min }}–{{ camp_max }} people). Every other type seats one patient at a time (capacity 1). Fees are in rupees.</p>
+{% if types %}<table><thead><tr><th>Type</th><th>Duration</th><th>Capacity</th><th>Fee</th><th></th></tr></thead><tbody>
+{% for t in types %}<tr>
+<td>{{ t.name.replace('_',' ')|title }}</td><td>{{ t.duration_min }} min</td>
+<td>{% if t.name == 'HEALTH_CAMP' %}<input form="save-{{ t.consultation_type_id }}" name="capacity" type="number" min="{{ camp_min }}" max="{{ camp_max }}" value="{{ t.capacity }}" style="width:80px">{% else %}1<input form="save-{{ t.consultation_type_id }}" type="hidden" name="capacity" value="1">{% endif %}</td>
+<td><input form="save-{{ t.consultation_type_id }}" name="fee_amount" type="number" min="0" step="0.01" value="{{ t.fee_amount }}" style="width:110px"></td>
+<td><div class="row-actions">
+<form id="save-{{ t.consultation_type_id }}" method="post"><input type="hidden" name="action" value="save_type"><input type="hidden" name="type_id" value="{{ t.consultation_type_id }}"><input type="hidden" name="name" value="{{ t.name }}"><button class="ghost">Save</button></form>
+<form method="post" onsubmit="return confirm('Remove this consultation type?')"><input type="hidden" name="action" value="delete_type"><input type="hidden" name="type_id" value="{{ t.consultation_type_id }}"><button class="danger">Remove</button></form>
+</div></td></tr>{% endfor %}</tbody></table>{% else %}<p class="empty">No consultation types yet. Add one below, then use it in your availability.</p>{% endif %}
+<h3 style="margin-top:26px">Add a consultation type</h3>
+<form method="post" class="add-row"><input type="hidden" name="action" value="add_type">
+<div><label for="t-name">Type</label><select id="t-name" name="name">{% for n in type_names %}<option value="{{ n }}">{{ n.replace('_',' ')|title }}</option>{% endfor %}</select></div>
+<div><label for="t-cap">Capacity (health camp only, {{ camp_min }}–{{ camp_max }}; other types are always 1)</label><input id="t-cap" name="capacity" type="number" min="1" max="{{ camp_max }}" value="1" style="width:110px"></div>
+<div><label for="t-fee">Fee</label><input id="t-fee" name="fee_amount" type="number" min="0" step="0.01" value="500" style="width:120px" required></div>
+<button class="primary">Add type</button></form>
+</section>
+
+<section class="dash-card panel{{ ' active' if active == 'availability' else '' }}" id="panel-availability">
+<h2>Weekly availability</h2>
+{% if type_options %}<p class="hint">Pick a day, a consultation type and a time range. MediSlot divides the range into slots of the consultation length (for example 9:00 AM to 1:00 PM with a 30-minute type gives 8 slots) and creates them for the next 30 days. Times are in your profile timezone.</p>
+<form method="post" id="avail-form"><input type="hidden" name="action" value="availability"><input type="hidden" name="patterns" id="avail-json" value="[]">
+<div id="avail-rows"></div><p class="notice" id="avail-error" role="alert" hidden></p>
+<div class="row-actions"><button type="button" class="ghost" id="avail-add">+ Add time slot</button><button class="primary">Save availability</button></div></form>
+{% else %}<p class="empty">Add a consultation type first (Consultation types tab), then set your weekly hours here.</p>{% endif %}
+</section>
+
+<section class="dash-card panel{{ ' active' if active == 'schedule' else '' }}" id="panel-schedule">
+<h2>Schedule · Next 30 days</h2>
+<p class="hint">Showing every generated consultation slot from {{ day }} through the following 29 days. Times are displayed in your profile timezone.</p>
+<div class="day-nav"><a class="ghost" href="{{ url_for('dashboard', tab='schedule', date=prev_day) }}">← Previous 30-day window</a>
+<form method="get" class="row-actions inline"><input type="hidden" name="tab" value="schedule"><label for="schedule-start">Start date</label><input id="schedule-start" type="date" name="date" value="{{ day }}"><button class="ghost">View 30 days</button></form>
+<a class="ghost" href="{{ url_for('dashboard', tab='schedule', date=next_day) }}">Next 30-day window →</a></div>
+{% if schedule_error %}<p class="notice" role="alert">The 30-day schedule could not be loaded. Please refresh the page; check the doctor Lambda logs if the problem continues.</p>{% endif %}
+{% for group in schedule_days %}
+<div class="schedule-day">
+<h3 style="margin-top:24px">{{ group.date }}{% if group.blocked %} · Blackout{% endif %}</h3>
+{% if group.blocked %}<p class="notice">This is a blackout day. Its slots are Closed and cannot be booked. Existing bookings are kept.{% if group.reason %} Reason: {{ group.reason }}{% endif %}</p>{% endif %}
+<table><thead><tr><th>Time</th><th>Type</th><th>Capacity</th><th>Booked</th><th>Status</th></tr></thead><tbody>
+{% for s in group.slots %}<tr><td>{{ s.start_local }} – {{ s.end_local }}</td><td>{{ s.type_label }}</td><td>{{ s.capacity }}</td><td>{{ s.booked_count }}</td><td>{% set closed = (s.status == 'CLOSED') %}{% set full = (not closed) and s.booked_count|int >= s.capacity|int %}<span class="badge{{ ' full' if (full or closed) else '' }}">{{ 'Closed' if closed else ('Full' if full else 'Open') }}</span></td></tr>
+{% else %}<tr><td colspan="5" class="empty">{{ 'No slots were set up for this blackout day.' if group.blocked else 'No slots generated for this date.' }}</td></tr>{% endfor %}
+</tbody></table>
+</div>
+{% endfor %}
+</section>
+
+<section class="dash-card panel{{ ' active' if active == 'blackouts' else '' }}" id="panel-blackouts">
+<h2>Blackout dates</h2>
+<p class="hint">Days you are unavailable, such as leave or holidays.</p>
+{% if blackouts %}<table><thead><tr><th>Date</th><th>Reason</th><th></th></tr></thead><tbody>{% for b in blackouts %}<tr><td>{{ b.blackout_date }}</td><td>{{ b.reason or '—' }}</td><td><form method="post" onsubmit="return confirm('Remove this blackout date?')"><input type="hidden" name="action" value="delete_blackout"><input type="hidden" name="blackout_id" value="{{ b.blackout_id }}"><button class="danger">Remove</button></form></td></tr>{% endfor %}</tbody></table>{% else %}<p class="empty">No blackout dates set.</p>{% endif %}
+<h3 style="margin-top:26px">Add a blackout date</h3>
+<form method="post" class="add-row"><input type="hidden" name="action" value="add_blackout">
+<div><label for="b-date">Date</label><input id="b-date" name="blackout_date" type="date" required></div>
+<div><label for="b-reason">Reason (optional)</label><input id="b-reason" name="reason" maxlength="200" style="width:280px"></div>
+<button class="primary">Add blackout</button></form>
+</section>
+</main>
+
+<script id="dash-data" type="application/json">{{ {'patterns': patterns, 'types': type_options}|tojson }}</script>
+<script>
+(function () {
+  var tabs = document.querySelectorAll('.tab'), panels = document.querySelectorAll('.panel');
+  function show(key, push) {
+    tabs.forEach(function (t) { var on = t.dataset.tab === key; t.classList.toggle('active', on); t.setAttribute('aria-selected', on); });
+    panels.forEach(function (p) { p.classList.toggle('active', p.id === 'panel-' + key); });
+    if (push) { var q = new URLSearchParams(location.search); q.set('tab', key); history.replaceState(null, '', '?' + q.toString()); }
+  }
+  tabs.forEach(function (t) { t.addEventListener('click', function (e) { e.preventDefault(); show(t.dataset.tab, true); }); });
+
+  var tName = document.getElementById('t-name'), tCap = document.getElementById('t-cap');
+  if (tName && tCap) {
+    var syncCap = function () {
+      var camp = tName.value === 'HEALTH_CAMP';
+      tCap.disabled = !camp;                 // a disabled input is not submitted; the server then uses 1
+      if (!camp) tCap.value = 1; else if (parseInt(tCap.value, 10) < {{ camp_min }}) tCap.value = {{ camp_min }};
+    };
+    tName.addEventListener('change', syncCap); syncCap();
+  }
+
+  var data = JSON.parse(document.getElementById('dash-data').textContent);
+  var rowsEl = document.getElementById('avail-rows'); if (!rowsEl) return;
+  var days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+  function opt(v, l, sel) { var o = document.createElement('option'); o.value = v; o.textContent = l; if (sel) o.selected = true; return o; }
+  function addRow(p) {
+    p = p || {};
+    var row = document.createElement('div'); row.className = 'slot-row inline';
+    var day = document.createElement('select'); day.className = 'f-day';
+    days.forEach(function (d, i) { day.appendChild(opt(i, d, i === p.day_of_week)); });
+    var type = document.createElement('select'); type.className = 'f-type';
+    data.types.forEach(function (t) { type.appendChild(opt(t.id, t.label, t.id === p.consultation_type_id)); });
+    var start = document.createElement('input'); start.type = 'time'; start.className = 'f-start'; start.value = p.start_time || '09:00'; start.required = true;
+    var end = document.createElement('input'); end.type = 'time'; end.className = 'f-end'; end.value = p.end_time || '13:00'; end.required = true;
+    var preview = document.createElement('span'); preview.className = 'slot-preview';
+    var rm = document.createElement('button'); rm.type = 'button'; rm.className = 'danger'; rm.textContent = 'Remove';
+    rm.addEventListener('click', function () { row.remove(); });
+    [day, type, start, end, preview, rm].forEach(function (el) { row.appendChild(el); });
+    function refresh() {
+      var t = data.types.find(function (x) { return x.id === type.value; });
+      var a = start.value.split(':'), b = end.value.split(':');
+      if (!t || a.length < 2 || b.length < 2) { preview.textContent = ''; return; }
+      var minutes = (parseInt(b[0], 10) * 60 + parseInt(b[1], 10)) - (parseInt(a[0], 10) * 60 + parseInt(a[1], 10));
+      var n = Math.floor(minutes / t.duration);
+      preview.className = 'slot-preview' + (n < 1 ? ' bad' : '');
+      preview.textContent = n < 1 ? 'Too short for ' + t.duration + ' min' : n + ' slot' + (n === 1 ? '' : 's') + ' × ' + t.duration + ' min';
+    }
+    [type, start, end].forEach(function (el) { el.addEventListener('change', refresh); el.addEventListener('input', refresh); });
+    rowsEl.appendChild(row); refresh();
+  }
+  (data.patterns.length ? data.patterns : []).forEach(addRow);
+  document.getElementById('avail-add').addEventListener('click', function () { addRow(); });
+  // Same rule as the API: a doctor cannot be in two consultations at once, whatever the types are.
+  function findOverlap(list) {
+    var typeLabel = {}; data.types.forEach(function (t) { typeLabel[t.id] = t.label.split(' · ')[0]; });
+    var byDay = {};
+    list.forEach(function (p) { (byDay[p.day_of_week] = byDay[p.day_of_week] || []).push(p); });
+    for (var d in byDay) {
+      var r = byDay[d].slice().sort(function (a, b) { return a.start_time < b.start_time ? -1 : a.start_time > b.start_time ? 1 : 0; });
+      for (var i = 1; i < r.length; i++) {
+        if (r[i].start_time < r[i - 1].end_time) {
+          return 'Overlapping availability on ' + days[d] + ': ' + typeLabel[r[i - 1].consultation_type_id] + ' ' + r[i - 1].start_time + '-' + r[i - 1].end_time +
+                 ' clashes with ' + typeLabel[r[i].consultation_type_id] + ' ' + r[i].start_time + '-' + r[i].end_time + '. Change one of the times; nothing was saved.';
+        }
+      }
+    }
+    return '';
+  }
+  document.getElementById('avail-form').addEventListener('submit', function (e) {
+    var out = [];
+    rowsEl.querySelectorAll('.slot-row').forEach(function (r) {
+      out.push({ day_of_week: parseInt(r.querySelector('.f-day').value, 10), consultation_type_id: r.querySelector('.f-type').value,
+                 start_time: r.querySelector('.f-start').value, end_time: r.querySelector('.f-end').value });
+    });
+    var err = document.getElementById('avail-error'), problem = findOverlap(out);
+    err.hidden = !problem; err.textContent = problem;
+    if (problem) { e.preventDefault(); return; }
+    document.getElementById('avail-json').value = JSON.stringify(out);
+  });
+})();
+</script>
+{% endblock %}

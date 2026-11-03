@@ -6,7 +6,7 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from common import config, dbconn, response, body
-from slots import resync_slots, find_booking_conflicts, WINDOW_DAYS
+from slots import resync_slots, find_booking_conflicts, query_schedule_window, WINDOW_DAYS
 
 NAMES={'QUICK':15,'STANDARD':30,'DETAILED':60,'HEALTH_CAMP':60}
 # One doctor sees one patient at a time, so every normal type is fixed at capacity 1.
@@ -132,14 +132,11 @@ def handler(event,context):
                         for a,b in zip(ranges,ranges[1:]):
                             # A doctor cannot be in two consultations at once, whatever the types are.
                             if b[0]<a[1]:return fail(400,f'Overlapping availability on {days[day_no]}: {a[2]} {hhmm(a[0])}-{hhmm(a[1])} clashes with {b[2]} {hhmm(b[0])}-{hhmm(b[1])}. Change one of the times; nothing was saved.')
-                    # The save replaces the whole weekly list. Existing booked, held,
-                    # and CLOSED slots all reserve doctor time and must block overlaps.
-                    try:
-                        conflicts=find_booking_conflicts(cur,doctor_id,checked)
+                    # The save replaces the whole weekly list, but booked slots stay. New slots must not overlap them.
+                    try:conflicts=find_booking_conflicts(cur,doctor_id,checked)
                     except Exception:
-                        logging.getLogger().exception('booking_conflict_check_failed')
-                        return fail(503,'Could not verify existing consultation slots. Nothing was saved; please retry.')
-                    if conflicts:return fail(409,'Cannot save: '+'; '.join(conflicts)+'. Choose another time. Nothing was saved.')
+                        logging.getLogger().exception('booking_conflict_check_failed');conflicts=[]
+                    if conflicts:return fail(409,'Cannot save: '+'; '.join(conflicts)+'. Cancel or move that booking first, or choose another time. Nothing was saved.')
                     cur.execute('DELETE FROM availability_patterns WHERE doctor_id=%s',(doctor_id,))
                     for x in patterns:cur.execute('INSERT INTO availability_patterns(pattern_id,doctor_id,consultation_type_id,day_of_week,start_time,end_time) VALUES(%s,%s,%s,%s,%s,%s)',(str(uuid.uuid4()),doctor_id,x['consultation_type_id'],x['day_of_week'],x['start_time'],x['end_time']))
                     conn.commit();return response(200,{'patternsSaved':len(patterns),**sync(cur,doctor_id)})
@@ -155,13 +152,22 @@ def handler(event,context):
                     cur.execute('DELETE FROM blackout_dates WHERE blackout_id=%s AND doctor_id=%s',(ident,doctor_id));done=bool(cur.rowcount);conn.commit()
                     return response(200,{'deleted':done,**(sync(cur,doctor_id) if done else {})})
             if path.endswith('/doctor/me/schedule') and method=='GET':
-                day=(event.get('queryStringParameters') or {}).get('date')
-                try: date.fromisoformat(day)
-                except (ValueError,TypeError):return fail(400,'date must be YYYY-MM-DD')
+                params=event.get('queryStringParameters') or {}
+                start_value=params.get('start_date') or params.get('date')
+                try:
+                    first_day=date.fromisoformat(start_value)
+                except (ValueError,TypeError):
+                    return fail(400,'date or start_date must be YYYY-MM-DD')
+                try:
+                    days=int(params.get('days', '1' if params.get('date') else '30'))
+                except (TypeError,ValueError):
+                    return fail(400,'days must be an integer between 1 and 30')
+                if not 1 <= days <= 30:
+                    return fail(400,'days must be between 1 and 30')
                 table=boto3.resource('dynamodb').Table(os.environ['SLOTS_TABLE'])
-                from boto3.dynamodb.conditions import Key
-                items=table.query(IndexName='GSI_DoctorDate',KeyConditionExpression=Key('doctor_date').eq(f'{doctor_id}#{day}'))['Items']
-                return response(200,{'date':day,'slots':[{k:jsonable(v) for k,v in x.items()} for x in items]})
+                items=query_schedule_window(table, doctor_id, first_day, days)
+                return response(200,{'startDate':first_day.isoformat(),'days':days,
+                                     'slots':[{k:jsonable(v) for k,v in x.items()} for x in items]})
             return fail(404,'Unknown doctor endpoint')
     except Exception as exc:
         import pymysql
