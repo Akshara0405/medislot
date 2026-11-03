@@ -502,7 +502,7 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*/*'
-  ApiDeploymentDashboardTabs:
+  ApiDeploymentSlotBlocks:
     Type: AWS::ApiGateway::Deployment
     DependsOn: [DoctorSlotBlocksPostMethod, HospitalsGetMethod, RegisterPatientMethod, RegisterDoctorMethod, LoginMethod, RefreshMethod, LogoutMethod, PatientMeMethod, DoctorMeMethod, DoctorMePutMethod, DoctorPhotoPostMethod, DoctorAvailabilityGetMethod, DoctorAvailabilityPutMethod, DoctorScheduleGetMethod, DoctorTypesGetMethod, DoctorTypesPostMethod, DoctorTypeItemPutMethod, DoctorTypeItemDeleteMethod, DoctorBlackoutsGetMethod, DoctorBlackoutsPostMethod, DoctorBlackoutItemDeleteMethod]
     Properties:
@@ -512,7 +512,7 @@ Resources:
     Type: AWS::ApiGateway::Stage
     Properties:
       RestApiId: !Ref RestApi
-      DeploymentId: !Ref ApiDeploymentDashboardTabs
+      DeploymentId: !Ref ApiDeploymentSlotBlocks
       StageName: !Ref Environment
       MethodSettings:
         - ResourcePath: '/*'
