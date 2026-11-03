@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: MediSlot authentication API with one Authentication Lambda and one Authorization Lambda.
+Description: MediSlot API, doctor scheduling and rolling slot materializer Lambdas.
 Parameters:
   Environment:
     Type: String
@@ -114,7 +114,7 @@ Resources:
                 Action: [kms:Decrypt]
                 Resource: '*'
               - Effect: Allow
-                Action: [dynamodb:Query, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:BatchWriteItem]
+                Action: [dynamodb:Query, dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:BatchWriteItem]
                 Resource:
                   - !Sub
                     - 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${SlotsTable}'
@@ -156,7 +156,12 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub 'MediSlot-${Environment}-MaterializerRole'
-      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
       ManagedPolicyArns: [!Ref LambdaExecutionBasePolicy]
       Policies:
         - PolicyName: MaterializerRuntimeAccess
@@ -183,8 +188,7 @@ Resources:
   MaterializerFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub 'medislot-${Environment}-materializer'
-      Description: Daily top-up of the rolling 30-day slot window in DynamoDB for every doctor.
+      FunctionName: !Sub 'medislot-${Environment}-slot-materializer'
       Runtime: python3.12
       Handler: lambda_function.handler
       Role: !GetAtt MaterializerRole.Arn
@@ -204,14 +208,14 @@ Resources:
   MaterializerSchedule:
     Type: AWS::Events::Rule
     Properties:
-      Name: !Sub 'medislot-${Environment}-materializer-daily'
-      Description: Runs the slot materializer every day at 00:30 IST (19:00 UTC).
-      ScheduleExpression: 'cron(0 19 * * ? *)'
+      Name: !Sub 'medislot-${Environment}-slot-materializer-daily'
+      Description: Refresh the rolling 30-day consultation slot window daily.
+      ScheduleExpression: rate(1 day)
       State: ENABLED
       Targets:
-        - Id: MaterializerFunction
+        - Id: SlotMaterializerTarget
           Arn: !GetAtt MaterializerFunction.Arn
-          Input: '{}'
+          Input: '{"days":30}'
   MaterializerSchedulePermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -516,4 +520,5 @@ Outputs:
     Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/auth/login'
   AuthenticationFunctionName: {Value: !Ref AuthenticationFunction}
   AuthorizationFunctionName: {Value: !Ref AuthorizationFunction}
+  DoctorFunctionName: {Value: !Ref DoctorFunction}
   MaterializerFunctionName: {Value: !Ref MaterializerFunction}

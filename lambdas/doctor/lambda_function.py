@@ -132,13 +132,14 @@ def handler(event,context):
                         for a,b in zip(ranges,ranges[1:]):
                             # A doctor cannot be in two consultations at once, whatever the types are.
                             if b[0]<a[1]:return fail(400,f'Overlapping availability on {days[day_no]}: {a[2]} {hhmm(a[0])}-{hhmm(a[1])} clashes with {b[2]} {hhmm(b[0])}-{hhmm(b[1])}. Change one of the times; nothing was saved.')
-                    # The save replaces the whole weekly list, but booked slots stay. New slots must not overlap them.
-                    # Fail closed: if the booking check itself breaks we cannot promise a booked slot is safe, so save nothing.
-                    try:conflicts=find_booking_conflicts(cur,doctor_id,checked)
+                    # The save replaces the whole weekly list. Existing booked, held,
+                    # and CLOSED slots all reserve doctor time and must block overlaps.
+                    try:
+                        conflicts=find_booking_conflicts(cur,doctor_id,checked)
                     except Exception:
                         logging.getLogger().exception('booking_conflict_check_failed')
-                        return fail(503,'Could not verify your existing bookings, so nothing was saved. Please try again in a moment.')
-                    if conflicts:return fail(409,'Cannot save: '+'; '.join(conflicts)+'. Cancel or move that booking first, or choose another time. Nothing was saved.')
+                        return fail(503,'Could not verify existing consultation slots. Nothing was saved; please retry.')
+                    if conflicts:return fail(409,'Cannot save: '+'; '.join(conflicts)+'. Choose another time. Nothing was saved.')
                     cur.execute('DELETE FROM availability_patterns WHERE doctor_id=%s',(doctor_id,))
                     for x in patterns:cur.execute('INSERT INTO availability_patterns(pattern_id,doctor_id,consultation_type_id,day_of_week,start_time,end_time) VALUES(%s,%s,%s,%s,%s,%s)',(str(uuid.uuid4()),doctor_id,x['consultation_type_id'],x['day_of_week'],x['start_time'],x['end_time']))
                     conn.commit();return response(200,{'patternsSaved':len(patterns),**sync(cur,doctor_id)})

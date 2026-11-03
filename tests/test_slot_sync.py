@@ -132,7 +132,7 @@ def test_quick_over_a_booked_standard_is_reported_as_a_conflict():
     monday, table, booked = _booked_standard_on_9_nov()
     quick = [{'day_of_week': 0, 'start_time': '09:00', 'end_time': '09:30', 'consultation_type_id': 'quick', 'duration_min': 15}]
     problems = slots.find_booking_conflicts(FakeCur([]), DOC, quick, table=table, today=monday)
-    assert problems and 'Monday 09 Nov 09:00-09:15 overlaps an existing booked appointment at 09:00-09:30' in problems[0]
+    assert problems and 'Monday 09 Nov 09:00-09:15 overlaps an existing consultation slot at 09:00-09:30' in problems[0]
     # keeping the same standard pattern is not a conflict
     same = [{'day_of_week': 0, 'start_time': '09:00', 'end_time': '09:30', 'consultation_type_id': 'std', 'duration_min': 30}]
     assert slots.find_booking_conflicts(FakeCur([]), DOC, same, table=table, today=monday) == []
@@ -169,3 +169,16 @@ def test_materializer_will_not_create_slots_over_a_booked_one():
     quick = list(core.generate_slots(DOC, 'quick', date(2026, 11, 9), 'Asia/Kolkata', time(9), time(10), 15, 1))
     create, there, skipped = core.choose_non_overlapping(quick, std)
     assert skipped == 2 and [c['start_at'] for c in create] == ['2026-11-09T04:00:00Z', '2026-11-09T04:15:00Z']
+
+
+def test_quick_over_closed_standard_slot_is_reported_as_conflict_even_without_booking():
+    monday = date(2026, 11, 2); table = FakeTable()
+    standard = [pat(0, time(9), time(9, 30), 'std-closed', 30, name='STANDARD')]
+    slots.resync_slots(FakeCur(standard), DOC, table=table, today=monday)
+    standard_slot = next(i for i in table.items.values() if i['local_date'] == '2026-11-09')
+    standard_slot['status'] = 'CLOSED'
+    standard_slot['booked_count'] = 0
+    quick = [{'day_of_week': 0, 'start_time': '09:00', 'end_time': '09:30',
+              'consultation_type_id': 'quick', 'duration_min': 15}]
+    problems = slots.find_booking_conflicts(FakeCur([]), DOC, quick, table=table, today=monday)
+    assert problems and 'existing consultation slot at 09:00-09:30' in problems[0]
