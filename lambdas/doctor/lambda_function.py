@@ -133,9 +133,12 @@ def handler(event,context):
                             # A doctor cannot be in two consultations at once, whatever the types are.
                             if b[0]<a[1]:return fail(400,f'Overlapping availability on {days[day_no]}: {a[2]} {hhmm(a[0])}-{hhmm(a[1])} clashes with {b[2]} {hhmm(b[0])}-{hhmm(b[1])}. Change one of the times; nothing was saved.')
                     # The save replaces the whole weekly list, but booked slots stay. New slots must not overlap them.
-                    try:conflicts=find_booking_conflicts(cur,doctor_id,checked)
+                    try:
+                        conflicts=find_booking_conflicts(cur,doctor_id,checked)
                     except Exception:
-                        logging.getLogger().exception('booking_conflict_check_failed');conflicts=[]
+                        logging.getLogger().exception('booking_conflict_check_failed')
+                        # Fail closed: without a successful booking check, availability must not be saved.
+                        return fail(503,'Unable to verify existing bookings right now. Please retry later. Nothing was saved.')
                     if conflicts:return fail(409,'Cannot save: '+'; '.join(conflicts)+'. Cancel or move that booking first, or choose another time. Nothing was saved.')
                     cur.execute('DELETE FROM availability_patterns WHERE doctor_id=%s',(doctor_id,))
                     for x in patterns:cur.execute('INSERT INTO availability_patterns(pattern_id,doctor_id,consultation_type_id,day_of_week,start_time,end_time) VALUES(%s,%s,%s,%s,%s,%s)',(str(uuid.uuid4()),doctor_id,x['consultation_type_id'],x['day_of_week'],x['start_time'],x['end_time']))
