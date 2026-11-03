@@ -11,6 +11,8 @@ Rules
   * Blackout dates keep their slots but every slot is marked status CLOSED, so
     the doctor still sees them (as Closed) and nobody can book them. Removing
     the blackout re-opens them.
+  * A single slot can also be closed by hand: its DynamoDB item carries manual_block=True and stays CLOSED
+    (booking untouched) until the doctor re-opens it.
   * Capacity is 1 for every type except HEALTH_CAMP (one patient at a time).
   * Slots that already have bookings/holds are never deleted or overwritten;
     on a blackout day they are only switched to CLOSED (the booking stays).
@@ -249,6 +251,8 @@ def resync_slots(cur, doctor_id, days=WINDOW_DAYS, table=None, today=None):
                         removed += 1
             for slot_id, item in wanted.items():
                 old = current.get(slot_id)
+                if old is not None and old.get('manual_block'):
+                    item['status'], item['manual_block'] = CLOSED, True      # doctor closed this one slot by hand
                 if old is None:
                     batch.put_item(Item=item)
                     created += 1

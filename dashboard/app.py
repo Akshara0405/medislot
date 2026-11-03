@@ -338,6 +338,19 @@ def handle_dashboard_post():
                 outcome(api_request('DELETE', '/doctor/me/consultation-types/' + type_id),
                         'Consultation type removed.', 'Could not remove the consultation type.')
 
+        elif action == 'toggle_slot':
+            tab = 'schedule'
+            slot_id = request.form.get('slot_id', '')
+            if slot_id and len(slot_id) <= 190 and '#' in slot_id:
+                blocked = request.form.get('blocked') == '1'
+                result = api_request('POST', '/doctor/me/slot-blocks', payload={'slot_id': slot_id, 'blocked': blocked})
+                if result is not None and result.ok and blocked and result.json().get('hasBooking'):
+                    flash('Slot closed. It already has a booking, which stays in place.', 'success')
+                else:
+                    outcome(result, 'Slot closed.' if blocked else 'Slot re-opened.', 'Could not update the slot.')
+            else:
+                flash('Invalid slot.', 'error')
+
         elif action == 'add_blackout':
             tab = 'blackouts'
             day = request.form.get('blackout_date', '')

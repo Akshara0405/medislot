@@ -202,3 +202,36 @@ def test_schedule_window_rejects_more_than_30_days():
     import pytest
     with pytest.raises(ValueError):
         slots.query_schedule_window(FakeScheduleTable([]), DOC, date(2026, 11, 3), 31)
+
+
+def test_single_slot_can_be_closed_and_reopened_without_touching_the_rest_of_the_day():
+    monday = date(2026, 11, 2)
+    pats = [pat(0, time(9), time(11), T30, 30)]
+    table = FakeTable()
+    slots.resync_slots(FakeCur(pats), DOC, table=table, today=monday)
+    nine = f'{DOC}#{T30}#2026-11-02T03:30:00Z'                       # 09:00-09:30 IST
+    assert table.items[nine]['status'] == 'OPEN'
+    table.items[nine]['manual_block'] = True                          # what the slot-blocks route sets
+    slots.resync_slots(FakeCur(pats), DOC, table=table, today=monday)
+    day = [i for i in table.items.values() if i['local_date'] == '2026-11-02']
+    assert table.items[nine]['status'] == 'CLOSED' and table.items[nine]['manual_block'] is True
+    assert sorted(i['status'] for i in day) == ['CLOSED', 'OPEN', 'OPEN', 'OPEN']
+    slots.resync_slots(FakeCur(pats), DOC, table=table, today=monday)  # still closed after another sync
+    assert table.items[nine]['status'] == 'CLOSED'
+    del table.items[nine]['manual_block']                             # route removes the flag on re-open
+    slots.resync_slots(FakeCur(pats), DOC, table=table, today=monday)
+    assert table.items[nine]['status'] == 'OPEN'
+
+
+def test_manually_closed_booked_slot_keeps_its_booking():
+    monday = date(2026, 11, 2)
+    pats = [pat(0, time(9), time(11), T30, 30)]
+    table = FakeTable()
+    slots.resync_slots(FakeCur(pats), DOC, table=table, today=monday)
+    nine = f'{DOC}#{T30}#2026-11-02T03:30:00Z'
+    table.items[nine].update(booked_count=1, status='FULL', manual_block=True)
+    slots.resync_slots(FakeCur(pats), DOC, table=table, today=monday)
+    assert table.items[nine]['status'] == 'CLOSED' and table.items[nine]['booked_count'] == 1
+    del table.items[nine]['manual_block']
+    slots.resync_slots(FakeCur(pats), DOC, table=table, today=monday)
+    assert table.items[nine]['status'] == 'FULL' and table.items[nine]['booked_count'] == 1

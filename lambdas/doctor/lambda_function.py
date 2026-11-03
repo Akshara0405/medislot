@@ -154,6 +154,16 @@ def handler(event,context):
                 if method=='DELETE' and ident:
                     cur.execute('DELETE FROM blackout_dates WHERE blackout_id=%s AND doctor_id=%s',(ident,doctor_id));done=bool(cur.rowcount);conn.commit()
                     return response(200,{'deleted':done,**(sync(cur,doctor_id) if done else {})})
+            if path.endswith('/doctor/me/slot-blocks') and method=='POST':
+                # Close (blocked=true) or re-open (blocked=false) ONE slot. A booking on it is never cancelled.
+                slot_id=data.get('slot_id'); blocked=data.get('blocked',True)
+                if not isinstance(slot_id,str) or not slot_id.startswith(f'{doctor_id}#') or len(slot_id)>190 or type(blocked) is not bool:return fail(400,'Invalid slot')
+                table=boto3.resource('dynamodb').Table(os.environ['SLOTS_TABLE'])
+                slot=table.get_item(Key={'slot_id':slot_id}).get('Item')
+                if not slot or str(slot.get('doctor_id'))!=str(doctor_id):return fail(404,'Slot not found')
+                if blocked:table.update_item(Key={'slot_id':slot_id},UpdateExpression='SET manual_block = :t',ExpressionAttributeValues={':t':True})
+                else:table.update_item(Key={'slot_id':slot_id},UpdateExpression='REMOVE manual_block')
+                return response(200,{'slotId':slot_id,'blocked':blocked,'hasBooking':int(slot.get('booked_count',0) or 0)>0,**sync(cur,doctor_id)})
             if path.endswith('/doctor/me/schedule') and method=='GET':
                 params=event.get('queryStringParameters') or {}
                 start_value=params.get('start_date') or params.get('date')

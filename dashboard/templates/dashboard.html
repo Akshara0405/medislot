@@ -9,6 +9,7 @@
 .slot-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
 .slotpill{border-radius:16px;padding:11px 13px;display:flex;flex-direction:column;gap:2px;border:1px solid transparent}
 .slotpill .st{font:800 17px Manrope,sans-serif;letter-spacing:-.4px}.slotpill .et{font-size:11px;color:var(--muted)}.slotpill .sty{font-size:12px;font-weight:700;margin-top:4px}.slotpill .seat{font-size:11px;font-weight:700;opacity:.8}
+.slot-act{margin:8px 0 0}.slot-btn{all:unset;cursor:pointer;font-size:11px;font-weight:800;padding:5px 10px;border-radius:20px;background:rgba(255,255,255,.7);border:1px solid currentColor}.slot-btn:hover{background:#fff}
 .slotpill.open{background:var(--mint);border-color:#bfe8d8;color:#14594f}
 .slotpill.full{background:#fff0ed;border-color:#f6cfc6;color:#a43c2d}
 .slotpill.closed{background:repeating-linear-gradient(135deg,#f1f4f5,#f1f4f5 8px,#e8edef 8px,#e8edef 16px);color:#6d7b80;border-color:#dde4e6}
@@ -76,7 +77,8 @@
 <div class="daybody">
 {% if g.blocked %}<p class="blackout-note">Blackout day{% if g.reason %} · {{ g.reason }}{% endif %}. Slots are closed; existing bookings are kept.</p>{% endif %}
 <div class="slot-grid">{% for s in g.slots %}{% set closed = (s.status == 'CLOSED') %}{% set full = (not closed) and s.booked_count|int >= s.capacity|int %}
-<div class="slotpill {{ 'closed' if closed else ('full' if full else 'open') }}"><span class="st">{{ s.start_local }}</span><span class="et">to {{ s.end_local }}</span><span class="sty">{{ s.type_label }}</span><span class="seat">{{ s.booked_count }}/{{ s.capacity }} booked{% if closed %} · closed{% elif full %} · full{% endif %}</span></div>{% endfor %}</div>
+<div class="slotpill {{ 'closed' if closed else ('full' if full else 'open') }}"><span class="st">{{ s.start_local }}</span><span class="et">to {{ s.end_local }}</span><span class="sty">{{ s.type_label }}</span><span class="seat">{{ s.booked_count }}/{{ s.capacity }} booked{% if closed %} · closed{% elif full %} · full{% endif %}</span>
+<form method="post" class="slot-act"><input type="hidden" name="action" value="toggle_slot"><input type="hidden" name="slot_id" value="{{ s.slot_id }}"><input type="hidden" name="blocked" value="{{ '0' if closed else '1' }}"><button type="submit" class="slot-btn" onclick="return confirm('{{ 'Re-open this slot?' if closed else ('Close this slot? Its existing booking will stay.' if s.booked_count|int > 0 else 'Close this slot so patients cannot book it?') }}')">{{ 'Re-open' if closed else 'Close slot' }}</button></form></div>{% endfor %}</div>
 </div></div>
 {% else %}<p class="empty">No slots in this 30-day window. Set your weekly hours in the Availability tab, or pick a different start date.</p>{% endfor %}
 </section>
