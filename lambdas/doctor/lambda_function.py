@@ -161,6 +161,11 @@ def handler(event,context):
                 table=boto3.resource('dynamodb').Table(os.environ['SLOTS_TABLE'])
                 slot=table.get_item(Key={'slot_id':slot_id}).get('Item')
                 if not slot or str(slot.get('doctor_id'))!=str(doctor_id):return fail(404,'Slot not found')
+                cur.execute('SELECT 1 FROM blackout_dates WHERE doctor_id=%s AND blackout_date=%s',(doctor_id,slot.get('local_date')))
+                if cur.fetchone():return fail(409,f"{slot.get('local_date')} is a blackout day, so every slot that day stays closed. Remove the blackout date first (Blackouts tab), then open or close single slots.")
+                if not blocked and slot.get('local_date'):
+                    cur.execute('SELECT 1 FROM blackout_dates WHERE doctor_id=%s AND blackout_date=%s',(doctor_id,slot['local_date']))
+                    if cur.fetchone():return fail(409,f"{slot['local_date']} is a blackout day, so this slot cannot be re-opened. Remove the blackout date first (Blackouts tab).")
                 if blocked:table.update_item(Key={'slot_id':slot_id},UpdateExpression='SET manual_block = :t',ExpressionAttributeValues={':t':True})
                 else:table.update_item(Key={'slot_id':slot_id},UpdateExpression='REMOVE manual_block')
                 return response(200,{'slotId':slot_id,'blocked':blocked,'hasBooking':int(slot.get('booked_count',0) or 0)>0,**sync(cur,doctor_id)})
