@@ -1,0 +1,9 @@
+$kind: http-request
+description: ""
+url: https://3e8vm2fqga.execute-api.ap-south-1.amazonaws.com/dev/patient/me
+method: GET
+auth:
+  type: bearer
+  credentials:
+    token: "{{json_web_token_153i}}"
+order: 5000

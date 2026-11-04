@@ -1,0 +1,536 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: MediSlot API, doctor scheduling and rolling slot materializer Lambdas.
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, prod]
+  ArtifactBucket: {Type: String}
+  ArtifactPrefix: {Type: String}
+Resources:
+  LambdaExecutionBasePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub 'MediSlot-${Environment}-LambdaBasePolicy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: [logs:CreateLogGroup]
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/medislot-${Environment}-*'
+          - Effect: Allow
+            Action: [logs:CreateLogStream, logs:PutLogEvents]
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/medislot-${Environment}-*:*'
+          - Effect: Allow
+            Action: [ec2:CreateNetworkInterface, ec2:DescribeNetworkInterfaces, ec2:DeleteNetworkInterface, ec2:AssignPrivateIpAddresses, ec2:UnassignPrivateIpAddresses]
+            Resource: '*'
+  AuthenticationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'MediSlot-${Environment}-AuthenticationRole'
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]}
+      ManagedPolicyArns: [!Ref LambdaExecutionBasePolicy]
+      Policies:
+        - PolicyName: AuthenticationRuntimeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ssm:GetParameter]
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/*'
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem]
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-AuthTokens'
+              - Effect: Allow
+                Action: [kms:Decrypt]
+                Resource: '*'
+  AuthorizationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'MediSlot-${Environment}-AuthorizationRole'
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]}
+      ManagedPolicyArns: [!Ref LambdaExecutionBasePolicy]
+      Policies:
+        - PolicyName: AuthorizationRuntimeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ssm:GetParameter]
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/auth/jwt-secret'
+              - Effect: Allow
+                Action: [dynamodb:GetItem]
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-AuthTokens'
+              - Effect: Allow
+                Action: [kms:Decrypt]
+                Resource: '*'
+  AuthenticationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'medislot-${Environment}-authentication'
+      Runtime: python3.12
+      Handler: lambda_function.handler
+      Role: !GetAtt AuthenticationRole.Arn
+      Timeout: 20
+      MemorySize: 256
+      Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Sub '${ArtifactPrefix}/authentication.zip'}
+      VpcConfig:
+        SecurityGroupIds: [!ImportValue {Fn::Sub: 'MediSlot-${Environment}-LambdaSecurityGroupId'}]
+        SubnetIds:
+          - Fn::ImportValue: !Sub 'MediSlot-${Environment}-PrivateSubnet1Id'
+          - Fn::ImportValue: !Sub 'MediSlot-${Environment}-PrivateSubnet2Id'
+      Environment: {Variables: {ENVIRONMENT: !Ref Environment}}
+  AuthorizationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'medislot-${Environment}-authorization'
+      Runtime: python3.12
+      Handler: lambda_function.handler
+      Role: !GetAtt AuthorizationRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Sub '${ArtifactPrefix}/authorization.zip'}
+      VpcConfig:
+        SecurityGroupIds: [!ImportValue {Fn::Sub: 'MediSlot-${Environment}-LambdaSecurityGroupId'}]
+        SubnetIds:
+          - Fn::ImportValue: !Sub 'MediSlot-${Environment}-PrivateSubnet1Id'
+          - Fn::ImportValue: !Sub 'MediSlot-${Environment}-PrivateSubnet2Id'
+      Environment: {Variables: {ENVIRONMENT: !Ref Environment}}
+  DoctorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'MediSlot-${Environment}-DoctorRole'
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]}
+      ManagedPolicyArns: [!Ref LambdaExecutionBasePolicy]
+      Policies:
+        - PolicyName: DoctorRuntimeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ssm:GetParameter]
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/*'
+              - Effect: Allow
+                Action: [kms:Decrypt]
+                Resource: '*'
+              - Effect: Allow
+                Action: [dynamodb:Query, dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:BatchWriteItem]
+                Resource:
+                  - !Sub
+                    - 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${SlotsTable}'
+                    - SlotsTable: !ImportValue
+                        Fn::Sub: 'MediSlot-${Environment}-SlotsTableName'
+                  - !Sub
+                    - 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${SlotsTable}/index/*'
+                    - SlotsTable: !ImportValue
+                        Fn::Sub: 'MediSlot-${Environment}-SlotsTableName'
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject]
+                Resource: !Sub
+                  - 'arn:${AWS::Partition}:s3:::${PhotoBucket}/*'
+                  - PhotoBucket: !ImportValue
+                      Fn::Sub: 'MediSlot-${Environment}-DoctorPhotosBucketName'
+  DoctorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'medislot-${Environment}-doctor'
+      Runtime: python3.12
+      Handler: lambda_function.handler
+      Role: !GetAtt DoctorRole.Arn
+      Timeout: 28
+      MemorySize: 512
+      Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Sub '${ArtifactPrefix}/doctor.zip'}
+      VpcConfig:
+        SecurityGroupIds: [!ImportValue {Fn::Sub: 'MediSlot-${Environment}-LambdaSecurityGroupId'}]
+        SubnetIds:
+          - Fn::ImportValue: !Sub 'MediSlot-${Environment}-PrivateSubnet1Id'
+          - Fn::ImportValue: !Sub 'MediSlot-${Environment}-PrivateSubnet2Id'
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PHOTO_BUCKET: !ImportValue
+            Fn::Sub: 'MediSlot-${Environment}-DoctorPhotosBucketName'
+          SLOTS_TABLE: !ImportValue
+            Fn::Sub: 'MediSlot-${Environment}-SlotsTableName'
+  MaterializerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'MediSlot-${Environment}-MaterializerRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns: [!Ref LambdaExecutionBasePolicy]
+      Policies:
+        - PolicyName: MaterializerRuntimeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ssm:GetParameter]
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/*'
+              - Effect: Allow
+                Action: [kms:Decrypt]
+                Resource: '*'
+              - Effect: Allow
+                Action: [dynamodb:Query, dynamodb:PutItem]
+                Resource:
+                  - !Sub
+                    - 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${SlotsTable}'
+                    - SlotsTable: !ImportValue
+                        Fn::Sub: 'MediSlot-${Environment}-SlotsTableName'
+                  - !Sub
+                    - 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${SlotsTable}/index/*'
+                    - SlotsTable: !ImportValue
+                        Fn::Sub: 'MediSlot-${Environment}-SlotsTableName'
+  MaterializerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'medislot-${Environment}-slot-materializer'
+      Runtime: python3.12
+      Handler: lambda_function.handler
+      Role: !GetAtt MaterializerRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Sub '${ArtifactPrefix}/materializer.zip'}
+      VpcConfig:
+        SecurityGroupIds: [!ImportValue {Fn::Sub: 'MediSlot-${Environment}-LambdaSecurityGroupId'}]
+        SubnetIds:
+          - Fn::ImportValue: !Sub 'MediSlot-${Environment}-PrivateSubnet1Id'
+          - Fn::ImportValue: !Sub 'MediSlot-${Environment}-PrivateSubnet2Id'
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          SLOTS_TABLE: !ImportValue
+            Fn::Sub: 'MediSlot-${Environment}-SlotsTableName'
+  MaterializerSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'medislot-${Environment}-slot-materializer-daily'
+      Description: Refresh the rolling 30-day consultation slot window daily.
+      ScheduleExpression: rate(1 day)
+      State: ENABLED
+      Targets:
+        - Id: SlotMaterializerTarget
+          Arn: !GetAtt MaterializerFunction.Arn
+          Input: '{"days":30}'
+  MaterializerSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MaterializerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MaterializerSchedule.Arn
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub 'medislot-${Environment}-api'
+      EndpointConfiguration: {Types: [REGIONAL]}
+  ApiAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: !Sub 'medislot-${Environment}-jwt-authorizer'
+      RestApiId: !Ref RestApi
+      Type: TOKEN
+      IdentitySource: method.request.header.Authorization
+      AuthorizerResultTtlInSeconds: 0
+      AuthorizerUri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizationFunction.Arn}/invocations'
+  AuthorizationInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AuthorizationFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/authorizers/${ApiAuthorizer}'
+  AuthResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !GetAtt RestApi.RootResourceId, PathPart: auth}
+  AuthHospitalsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref AuthResource, PathPart: hospitals}
+  RegisterResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref AuthResource, PathPart: register}
+  RegisterPatientResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref RegisterResource, PathPart: patient}
+  RegisterDoctorResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref RegisterResource, PathPart: doctor}
+  LoginResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref AuthResource, PathPart: login}
+  RefreshResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref AuthResource, PathPart: refresh}
+  LogoutResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref AuthResource, PathPart: logout}
+  PatientResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !GetAtt RestApi.RootResourceId, PathPart: patient}
+  DoctorResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !GetAtt RestApi.RootResourceId, PathPart: doctor}
+  PatientMeResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref PatientResource, PathPart: me}
+  DoctorMeResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref DoctorResource, PathPart: me}
+  DoctorPhotoResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref DoctorMeResource, PathPart: photo}
+  DoctorAvailabilityResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref DoctorMeResource, PathPart: availability}
+  DoctorScheduleResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref DoctorMeResource, PathPart: schedule}
+  DoctorTypesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref DoctorMeResource, PathPart: 'consultation-types'}
+  DoctorTypeItemResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref DoctorTypesResource, PathPart: '{typeId}'}
+  DoctorBlackoutsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref DoctorMeResource, PathPart: 'blackouts'}
+  DoctorBlackoutItemResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref DoctorBlackoutsResource, PathPart: '{blackoutId}'}
+  DoctorSlotBlocksResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref DoctorMeResource, PathPart: 'slot-blocks'}
+  RegisterPatientMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref RegisterPatientResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthenticationFunction.Arn}/invocations'}
+  HospitalsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AuthHospitalsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthenticationFunction.Arn}/invocations'}
+  RegisterDoctorMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref RegisterDoctorResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthenticationFunction.Arn}/invocations'}
+  LoginMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref LoginResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthenticationFunction.Arn}/invocations'}
+  RefreshMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref RefreshResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthenticationFunction.Arn}/invocations'}
+  LogoutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref LogoutResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthenticationFunction.Arn}/invocations'}
+  PatientMeMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PatientMeResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthenticationFunction.Arn}/invocations'}
+  DoctorMeMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorMeResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorFunction.Arn}/invocations'}
+  DoctorMePutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorMeResource
+      HttpMethod: PUT
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorFunction.Arn}/invocations'}
+  DoctorPhotoPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorPhotoResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorFunction.Arn}/invocations'}
+  DoctorAvailabilityGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorAvailabilityResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorFunction.Arn}/invocations'}
+  DoctorAvailabilityPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorAvailabilityResource
+      HttpMethod: PUT
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorFunction.Arn}/invocations'}
+  DoctorScheduleGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorScheduleResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorFunction.Arn}/invocations'}
+  DoctorTypesGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorTypesResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorFunction.Arn}/invocations'}
+  DoctorTypesPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorTypesResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorFunction.Arn}/invocations'}
+  DoctorTypeItemPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorTypeItemResource
+      HttpMethod: PUT
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorFunction.Arn}/invocations'}
+  DoctorTypeItemDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorTypeItemResource
+      HttpMethod: DELETE
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorFunction.Arn}/invocations'}
+  DoctorBlackoutsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorBlackoutsResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorFunction.Arn}/invocations'}
+  DoctorBlackoutsPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorBlackoutsResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorFunction.Arn}/invocations'}
+  DoctorBlackoutItemDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorBlackoutItemResource
+      HttpMethod: DELETE
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorFunction.Arn}/invocations'}
+  DoctorSlotBlocksPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorSlotBlocksResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorFunction.Arn}/invocations'}
+  DoctorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DoctorFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*/*'
+  AuthenticationInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AuthenticationFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*/*'
+  ApiDeploymentSlotBlocks:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [DoctorSlotBlocksPostMethod, HospitalsGetMethod, RegisterPatientMethod, RegisterDoctorMethod, LoginMethod, RefreshMethod, LogoutMethod, PatientMeMethod, DoctorMeMethod, DoctorMePutMethod, DoctorPhotoPostMethod, DoctorAvailabilityGetMethod, DoctorAvailabilityPutMethod, DoctorScheduleGetMethod, DoctorTypesGetMethod, DoctorTypesPostMethod, DoctorTypeItemPutMethod, DoctorTypeItemDeleteMethod, DoctorBlackoutsGetMethod, DoctorBlackoutsPostMethod, DoctorBlackoutItemDeleteMethod]
+    Properties:
+      RestApiId: !Ref RestApi
+      Description: !Sub 'MediSlot ${Environment} authentication, doctor profile and photo API deployment'
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeploymentSlotBlocks
+      StageName: !Ref Environment
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          MetricsEnabled: true
+          LoggingLevel: INFO
+          DataTraceEnabled: false
+Outputs:
+  ApiUrl:
+    Description: Base URL for the deployed REST API.
+    Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+  RegisterPatientUrl:
+    Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/auth/register/patient'
+  RegisterDoctorUrl:
+    Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/auth/register/doctor'
+  LoginUrl:
+    Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/auth/login'
+  AuthenticationFunctionName: {Value: !Ref AuthenticationFunction}
+  AuthorizationFunctionName: {Value: !Ref AuthorizationFunction}
+  DoctorFunctionName: {Value: !Ref DoctorFunction}
+  MaterializerFunctionName: {Value: !Ref MaterializerFunction}

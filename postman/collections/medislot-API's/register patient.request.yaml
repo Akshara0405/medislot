@@ -1,0 +1,16 @@
+$kind: http-request
+description: ""
+url: https://3e8vm2fqga.execute-api.ap-south-1.amazonaws.com/dev/auth/register/patient
+method: POST
+body:
+  type: json
+  content: "{\r
+
+    \  \"fullName\": \"Arjun Kumar\",\r
+
+    \  \"email\": \"arjun.patient.20261026@example.com\",\r
+
+    \  \"password\": \"PatientSecure123\"\r
+
+    }"
+order: 1000
