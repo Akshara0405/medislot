@@ -127,7 +127,7 @@ def handler(event,context):
                         if minutes<ctype['duration_min']:return fail(400,f"{x['start_time']}-{x['end_time']} is shorter than one {ctype['duration_min']}-minute consultation")
                         # The same pattern twice is a duplicate, not just an overlap.
                         key=(x['day_of_week'],x['consultation_type_id'],start,end)
-                        if key in seen:return fail(409,f"Pattern already exists: {label(ctype['name'])} {hhmm(start)}-{hhmm(end)} on {WEEKDAYS[x['day_of_week']]}. Remove the duplicate row; nothing was saved.")
+                        if key in seen:return fail(409,f"Pattern already exists: {label(ctype['name'])} {hhmm(start)}-{hhmm(end)} on {WEEKDAYS[x['day_of_week']]}. Remove the duplicate row. Nothing was saved.")
                         seen.add(key)
                         # A pattern only produces whole slots: 09:00-09:34 with a 15-minute type really ends at 09:30,
                         # so a 09:30-10:00 pattern may follow it. Compare the slots, not the raw end time.
@@ -139,7 +139,7 @@ def handler(event,context):
                         a=ranges[0]
                         for b in ranges[1:]:
                             # A doctor cannot be in two consultations at once, whatever the types are.
-                            if b[0]<a[1]:return fail(400,f'Overlapping availability on {WEEKDAYS[day_no]}: {a[2]} {hhmm(a[0])}-{hhmm(a[1])} clashes with {b[2]} {hhmm(b[0])}-{hhmm(b[1])}. Change one of the times; nothing was saved.')
+                            if b[0]<a[1]:return fail(400,f'Overlapping availability on {WEEKDAYS[day_no]}: {a[2]} {hhmm(a[0])}-{hhmm(a[1])} clashes with {b[2]} {hhmm(b[0])}-{hhmm(b[1])}. Change one of the times. Nothing was saved.')
                             if b[1]>a[1]:a=b
                     # The save replaces the whole weekly list, but booked slots stay. New slots must not overlap them.
                     try:
