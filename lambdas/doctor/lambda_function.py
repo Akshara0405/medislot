@@ -14,6 +14,7 @@ NAMES={'QUICK':15,'STANDARD':30,'DETAILED':60,'HEALTH_CAMP':60}
 CAMP_MIN_CAPACITY=2
 CAMP_MAX_CAPACITY=10
 
+WEEKDAYS=['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
 def label(name): return str(name).replace('_',' ').title()
 def hhmm(t): return f'{t.hour:02d}:{t.minute:02d}'
 
@@ -112,7 +113,7 @@ def handler(event,context):
                 if method=='PUT':
                     patterns=data.get('patterns')
                     if not isinstance(patterns,list) or len(patterns)>100:return fail(400,'patterns must be a list of at most 100 entries')
-                    by_day={}; checked=[]
+                    by_day={}; checked=[]; seen=set()
                     for x in patterns:
                         if not isinstance(x,dict) or type(x.get('day_of_week')) is not int or not 0<=x['day_of_week']<=6:return fail(400,'Invalid weekday (Monday=0)')
                         try:
@@ -124,14 +125,22 @@ def handler(event,context):
                         if not ctype:return fail(400,'Unknown or inactive consultation type')
                         minutes=(end.hour*60+end.minute)-(start.hour*60+start.minute)
                         if minutes<ctype['duration_min']:return fail(400,f"{x['start_time']}-{x['end_time']} is shorter than one {ctype['duration_min']}-minute consultation")
-                        by_day.setdefault(x['day_of_week'],[]).append((start,end,label(ctype['name'])))
+                        # The same pattern twice is a duplicate, not just an overlap.
+                        key=(x['day_of_week'],x['consultation_type_id'],start,end)
+                        if key in seen:return fail(409,f"Pattern already exists: {label(ctype['name'])} {hhmm(start)}-{hhmm(end)} on {WEEKDAYS[x['day_of_week']]}. Remove the duplicate row; nothing was saved.")
+                        seen.add(key)
+                        # A pattern only produces whole slots: 09:00-09:34 with a 15-minute type really ends at 09:30,
+                        # so a 09:30-10:00 pattern may follow it. Compare the slots, not the raw end time.
+                        last=(start.hour*60+start.minute)+(minutes//ctype['duration_min'])*ctype['duration_min']
+                        by_day.setdefault(x['day_of_week'],[]).append((start,datetime.strptime(f'{last//60:02d}:{last%60:02d}','%H:%M').time(),label(ctype['name'])))
                         checked.append({**x,'duration_min':ctype['duration_min']})
-                    days=['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
                     for day_no,ranges in by_day.items():
                         ranges.sort()
-                        for a,b in zip(ranges,ranges[1:]):
+                        a=ranges[0]
+                        for b in ranges[1:]:
                             # A doctor cannot be in two consultations at once, whatever the types are.
-                            if b[0]<a[1]:return fail(400,f'Overlapping availability on {days[day_no]}: {a[2]} {hhmm(a[0])}-{hhmm(a[1])} clashes with {b[2]} {hhmm(b[0])}-{hhmm(b[1])}. Change one of the times; nothing was saved.')
+                            if b[0]<a[1]:return fail(400,f'Overlapping availability on {WEEKDAYS[day_no]}: {a[2]} {hhmm(a[0])}-{hhmm(a[1])} clashes with {b[2]} {hhmm(b[0])}-{hhmm(b[1])}. Change one of the times; nothing was saved.')
+                            if b[1]>a[1]:a=b
                     # The save replaces the whole weekly list, but booked slots stay. New slots must not overlap them.
                     try:
                         conflicts=find_booking_conflicts(cur,doctor_id,checked)
@@ -189,6 +198,6 @@ def handler(event,context):
             return fail(404,'Unknown doctor endpoint')
     except Exception as exc:
         import pymysql
-        if isinstance(exc,pymysql.IntegrityError):return fail(409,'Duplicate or conflicting record')
+        if isinstance(exc,pymysql.IntegrityError):return fail(409,'Pattern already exists. Nothing was saved.' if path.endswith('/doctor/me/availability') else 'Duplicate or conflicting record')
         raise
     finally:conn.close()

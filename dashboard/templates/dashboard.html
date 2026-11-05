@@ -147,18 +147,36 @@
   }
   (data.patterns.length ? data.patterns : []).forEach(addRow);
   document.getElementById('avail-add').addEventListener('click', function () { addRow(); });
-  // Same rule as the API: a doctor cannot be in two consultations at once, whatever the types are.
+  // Same rules as the API: no duplicate rows, and no two rows may overlap once cut into whole slots.
+  function toMin(t) { var a = t.split(':'); return parseInt(a[0], 10) * 60 + parseInt(a[1], 10); }
+  function hhmm(m) { return ('0' + Math.floor(m / 60)).slice(-2) + ':' + ('0' + (m % 60)).slice(-2); }
+  function lastSlotEnd(p) {   // 09:00-09:34 with a 15-minute type really ends at 09:30
+    var t = data.types.find(function (x) { return x.id === p.consultation_type_id; });
+    var s = toMin(p.start_time), e = toMin(p.end_time);
+    return t && t.duration ? s + Math.floor((e - s) / t.duration) * t.duration : e;
+  }
   function findOverlap(list) {
-    var typeLabel = {}; data.types.forEach(function (t) { typeLabel[t.id] = t.label.split(' · ')[0]; });
+    var typeLabel = {}; data.types.forEach(function (t) { typeLabel[t.id] = t.label.split(' \u00b7 ')[0]; });
+    var seen = {};
+    for (var k = 0; k < list.length; k++) {
+      var q = list[k], key = [q.day_of_week, q.consultation_type_id, q.start_time, q.end_time].join('|');
+      if (seen[key]) {
+        return 'Pattern already exists: ' + typeLabel[q.consultation_type_id] + ' ' + q.start_time + '-' + q.end_time + ' on ' + days[q.day_of_week] + '. Remove the duplicate row; nothing was saved.';
+      }
+      seen[key] = true;
+    }
     var byDay = {};
     list.forEach(function (p) { (byDay[p.day_of_week] = byDay[p.day_of_week] || []).push(p); });
     for (var d in byDay) {
-      var r = byDay[d].slice().sort(function (a, b) { return a.start_time < b.start_time ? -1 : a.start_time > b.start_time ? 1 : 0; });
+      var r = byDay[d].slice().sort(function (a, b) { return toMin(a.start_time) - toMin(b.start_time); });
+      var prev = r[0], prevEnd = lastSlotEnd(prev);
       for (var i = 1; i < r.length; i++) {
-        if (r[i].start_time < r[i - 1].end_time) {
-          return 'Overlapping availability on ' + days[d] + ': ' + typeLabel[r[i - 1].consultation_type_id] + ' ' + r[i - 1].start_time + '-' + r[i - 1].end_time +
-                 ' clashes with ' + typeLabel[r[i].consultation_type_id] + ' ' + r[i].start_time + '-' + r[i].end_time + '. Change one of the times; nothing was saved.';
+        if (toMin(r[i].start_time) < prevEnd) {
+          return 'Overlapping availability on ' + days[d] + ': ' + typeLabel[prev.consultation_type_id] + ' ' + prev.start_time + '-' + hhmm(prevEnd) +
+                 ' clashes with ' + typeLabel[r[i].consultation_type_id] + ' ' + r[i].start_time + '-' + hhmm(lastSlotEnd(r[i])) + '. Change one of the times; nothing was saved.';
         }
+        var e = lastSlotEnd(r[i]);
+        if (e > prevEnd) { prev = r[i]; prevEnd = e; }
       }
     }
     return '';

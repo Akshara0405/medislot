@@ -17,6 +17,8 @@ app.config.update(
     SESSION_COOKIE_SECURE=os.environ.get('COOKIE_SECURE', 'false').lower() == 'true',
     SESSION_COOKIE_SAMESITE='Lax',
     MAX_CONTENT_LENGTH=5 * 1024 * 1024,
+    # The API refresh token lives 7 days, so the dashboard session may too (a plain session cookie dies with the browser).
+    PERMANENT_SESSION_LIFETIME=timedelta(days=7),
 )
 API = os.environ['API_BASE_URL'].rstrip('/')
 ALLOWED_PHOTO_TYPES = {'image/jpeg', 'image/png', 'image/webp'}
@@ -68,13 +70,53 @@ def render_signup(values, status=200):
                            specializations=specialization_options(values.get('specialization', ''))), status
 
 
+def store_login(data):
+    """Keep the access token, its expiry and the refresh token so the session can renew itself."""
+    session['token'] = data['accessToken']
+    if data.get('refreshToken'):
+        session['refresh_token'] = data['refreshToken']
+    session['token_exp'] = time.time() + int(data.get('expiresIn') or 900)
+    session['role'] = 'doctor'
+    session.permanent = True
+
+
+def refresh_access_token():
+    """Swap the refresh token for a new access token. False means the doctor must sign in again."""
+    refresh_token = session.get('refresh_token')
+    if not refresh_token:
+        return False
+    try:
+        renewed = requests.post(API + '/auth/refresh', json={'refreshToken': refresh_token}, timeout=20)
+        if not renewed.ok:
+            return False
+        data = renewed.json()
+        session['token'] = data['accessToken']
+        session['token_exp'] = time.time() + int(data.get('expiresIn') or 900)
+        session.permanent = True
+        return True
+    except (requests.RequestException, ValueError, KeyError):
+        return False
+
+
 def api_request(method, path, *, payload=None, params=None, token=None, **kwargs):
-    headers = kwargs.pop('headers', {})
-    access_token = token or session.get('token')
-    if access_token:
-        headers['Authorization'] = 'Bearer ' + access_token
-    return requests.request(method, API + path, headers=headers, json=payload,
-                            params=params, timeout=20, **kwargs)
+    extra_headers = kwargs.pop('headers', {})
+
+    def send():
+        headers = dict(extra_headers)
+        access_token = token or session.get('token')
+        if access_token:
+            headers['Authorization'] = 'Bearer ' + access_token
+        return requests.request(method, API + path, headers=headers, json=payload,
+                                params=params, timeout=20, **kwargs)
+
+    own_session = token is None
+    # Renew a minute before the 15-minute access token runs out, instead of failing and logging the doctor out.
+    if own_session and session.get('refresh_token') and time.time() > session.get('token_exp', 0) - 60:
+        refresh_access_token()
+    result = send()
+    if own_session and result.status_code == 401 and refresh_access_token():
+        result = send()
+    return result
 
 
 def api_message(response, fallback):
@@ -144,7 +186,8 @@ def signup():
             flash('Your account was created. Please sign in to finish setting up your profile photo.', 'success')
             return redirect(url_for('login'))
 
-        token = logged_in.json()['accessToken']
+        login_data = logged_in.json()
+        token = login_data['accessToken']
         presign = api_request('POST', '/doctor/me/photo', payload={'contentType': photo.mimetype}, token=token)
         if not presign.ok:
             flash('Your account was created, but photo upload could not be started. Sign in and try again after the doctor photo API is deployed. ' + api_message(presign, ''), 'warning')
@@ -155,8 +198,7 @@ def signup():
             flash('Your account was created, but the photo upload did not complete. Sign in and upload it again.', 'warning')
             return redirect(url_for('login'))
 
-        session['token'] = token
-        session['role'] = 'doctor'
+        store_login(login_data)
         flash('Welcome to MediSlot. Your doctor profile has been created.', 'success')
         return redirect(url_for('dashboard'))
     except requests.RequestException:
@@ -174,8 +216,7 @@ def login():
             }, timeout=20)
             if response.ok and response.json().get('role') == 'doctor':
                 session.clear()
-                session['token'] = response.json()['accessToken']
-                session['role'] = 'doctor'
+                store_login(response.json())
                 return redirect(url_for('dashboard'))
             flash('We could not sign you in as a doctor. Check your details and try again.', 'error')
         except requests.RequestException:
@@ -244,6 +285,10 @@ def outcome(result, ok_message, fallback):
         flash(ok_message + note, 'success')
         if warning:
             flash(warning, 'warning')
+    elif result is not None and result.status_code == 401:
+        # Access and refresh tokens are both gone: say so, then the dashboard sends the doctor to the login page.
+        session.clear()
+        flash('Your session has expired. Please sign in again.', 'warning')
     else:
         flash(api_message(result, fallback) if result is not None else fallback, 'error')
 
@@ -412,6 +457,7 @@ def dashboard():
         profile = api_request('GET', '/doctor/me')
         if profile.status_code == 401:
             session.clear()
+            flash('Your session has expired. Please sign in again.', 'warning')
             return redirect(url_for('login'))
         availability = api_request('GET', '/doctor/me/availability')
         schedule = api_request('GET', '/doctor/me/schedule', params={'start_date': day, 'days': 30})

@@ -88,6 +88,27 @@ def test_same_type_overlap_is_rejected_too(monkeypatch):
     assert code == 400
 
 
+def test_pattern_end_only_counts_whole_slots(monkeypatch):
+    # 09:00-09:34 with a 15-minute type makes 09:00 and 09:15 slots and ends at 09:30, so 09:30-10:00 may follow.
+    code, out, cur = put_patterns(monkeypatch, [pattern('quick', '09:00', '09:34'), pattern('detailed', '09:30', '10:00')])
+    assert code == 200 and len(cur.saved) == 2, out
+    # ...but a start inside the last whole slot still clashes.
+    code, out, _ = put_patterns(monkeypatch, [pattern('quick', '09:00', '09:34'), pattern('detailed', '09:25', '09:55')])
+    assert code == 400 and 'overlap' in out['message'].lower() and '09:30' in out['message']
+
+
+def test_exact_duplicate_pattern_says_it_already_exists(monkeypatch):
+    code, out, cur = put_patterns(monkeypatch, [pattern('quick', '09:00', '09:30'), pattern('quick', '09:00', '09:30')])
+    assert code == 409 and cur.saved == []
+    assert 'already exists' in out['message'].lower() and 'Monday' in out['message'] and 'Nothing was saved' in out['message']
+
+
+def test_long_range_hides_a_later_overlap_no_more(monkeypatch):
+    # 09:00-12:00 swallows both later rows, not just the one next to it.
+    code, _, _ = put_patterns(monkeypatch, [pattern('quick', '09:00', '12:00'), pattern('quick', '09:15', '09:30'), pattern('detailed', '10:00', '10:30')])
+    assert code == 400
+
+
 def type_payload(name, capacity, duration=15):
     return {'name': name, 'duration_min': duration, 'capacity': capacity, 'fee_amount': '500'}
 
