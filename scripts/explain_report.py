@@ -35,7 +35,7 @@ def main(path):
     problems = (body.get('missingIndexes') or []) + (body.get('missingColumns') or [])
     if problems:
         for item in problems:
-            print(f'::error::Missing in RDS: {item}. Recreate the table so it picks up the definition in lambdas/common.py.')
+            print(f'::error::Missing in RDS: {item}. ensure_milestone4_schema() in lambdas/common.py should have added it - check the Lambda logs for schema_upgraded / errors.')
         return 1
     print('\nAll Milestone 4 indexes and columns are present.')
     return 0

@@ -88,6 +88,50 @@ def ensure_milestone3_schema(cur):
     # edit or extend the list freely (hospitals are unique on name + city).
     cur.executemany("INSERT IGNORE INTO hospitals (name, city, address) VALUES (%s,%s,%s)", SEED_HOSPITALS)
     _m3_ready = True
+# Milestone 4: patient profile fields + doctor search indexes (why each index exists: docs/M4_SEARCH_INDEXES.md).
+# New tables already get these from the CREATE TABLE statements below; this upgrades tables created earlier.
+_M4_COLUMNS = [
+    ("patients", "city", "VARCHAR(100) NULL AFTER address"),
+    ("patients", "blood_group", "VARCHAR(3) NULL AFTER city"),
+    ("patients", "emergency_contact_name", "VARCHAR(150) NULL AFTER blood_group"),
+    ("patients", "emergency_contact_phone", "VARCHAR(25) NULL AFTER emergency_contact_name"),
+    ("patients", "profile_version", "INT UNSIGNED NOT NULL DEFAULT 1 AFTER emergency_contact_phone"),
+    ("patients", "updated_at", "DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) AFTER created_at"),
+]
+_M4_INDEXES = [
+    ("doctors", "ix_doctors_name", "last_name, first_name"),
+    ("doctors", "ix_doctors_first_name", "first_name"),
+    ("doctors", "ix_doctors_spec_name", "specialization, last_name, first_name"),
+    ("doctors", "ix_doctors_hospital_name", "hospital_id, last_name, first_name"),
+    ("hospitals", "ix_hospitals_city", "city, is_active"),
+]
+_m4_ready = False
+def ensure_milestone4_schema(cur):
+    """Idempotent Milestone 4 upgrade. Runs once per warm Lambda; safe if several Lambdas race."""
+    global _m4_ready
+    if _m4_ready:
+        return
+    for tbl, col, ddl in _M4_COLUMNS:
+        cur.execute("""SELECT 1 FROM information_schema.COLUMNS
+                       WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND COLUMN_NAME=%s""", (tbl, col))
+        if not cur.fetchone():
+            try:
+                cur.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {ddl}")
+                emit("info", "schema_upgraded", table=tbl, column=col)
+            except pymysql.err.MySQLError as exc:
+                if exc.args[0] != 1060:  # 1060 = duplicate column: another Lambda added it first
+                    raise
+    for tbl, name, cols in _M4_INDEXES:
+        cur.execute("""SELECT 1 FROM information_schema.STATISTICS
+                       WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND INDEX_NAME=%s LIMIT 1""", (tbl, name))
+        if not cur.fetchone():
+            try:
+                cur.execute(f"CREATE INDEX {name} ON {tbl} ({cols})")
+                emit("info", "schema_upgraded", table=tbl, index=name)
+            except pymysql.err.MySQLError as exc:
+                if exc.args[0] != 1061:  # 1061 = duplicate key name: another Lambda created it first
+                    raise
+    _m4_ready = True
 def dbconn(c):
     conn=pymysql.connect(host=c["dbhost"],port=c["dbport"],user=c["dbuser"],password=c["dbpass"],
                          database=c["dbname"],connect_timeout=5,read_timeout=8,write_timeout=8,
@@ -157,6 +201,7 @@ def dbconn(c):
           CONSTRAINT fk_doctors_hospital FOREIGN KEY (hospital_id) REFERENCES hospitals(hospital_id)
         ) ENGINE=InnoDB""")
         ensure_milestone3_schema(cur)
+        ensure_milestone4_schema(cur)
     conn.commit()
     return conn
 def table(name):

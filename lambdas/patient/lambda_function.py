@@ -54,7 +54,7 @@ GENDERS = {'female': 'Female', 'male': 'Male', 'non-binary': 'Non-binary', 'othe
 BLOOD_GROUPS = ('A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-')
 DELETE_CONFIRMATION = 'DELETE'
 
-# Columns Milestone 4 adds to `patients` (defined in the CREATE TABLE in common.py).
+# Columns Milestone 4 adds to `patients` (added automatically by ensure_milestone4_schema in common.py).
 M4_PATIENT_COLUMNS = ('city', 'blood_group', 'emergency_contact_name', 'emergency_contact_phone',
                       'profile_version', 'updated_at')
 # Index name -> exact column list. explain-search reports any that are missing or different.
@@ -226,7 +226,7 @@ def handler(event, context):
         if exc.args and exc.args[0] == 1054:      # unknown column: Milestone 4 SQL not applied yet
             log.exception('patient_schema_out_of_date correlationId=%s', cid)
             return reply(503, {'message': 'The database has not been upgraded for Milestone 4 yet. '
-                                          'Recreate the patients table from lambdas/common.py, then retry.', 'correlationId': cid}, cid)
+                                          'The automatic upgrade did not finish; check the Lambda logs, then retry.', 'correlationId': cid}, cid)
         raise_internal(exc, cid, method, resource)
         return reply(500, {'message': 'Internal server error', 'correlationId': cid}, cid)
     except Exception as exc:

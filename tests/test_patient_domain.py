@@ -298,3 +298,29 @@ def test_delete_needs_confirmation_then_revokes_tokens(monkeypatch):
 def test_unknown_route_and_wrong_method(monkeypatch):
     assert run(monkeypatch, 'GET', '/patient/elsewhere')[0] == 404
     assert run(monkeypatch, 'PATCH', '/patient/me')[0] == 405
+
+
+# ----------------------------------------------------------------- automatic schema upgrade
+
+def test_milestone4_upgrade_adds_only_what_is_missing(monkeypatch):
+    import common
+
+    class UpgradeCur:
+        def __init__(self): self.ran, self.last = [], None
+        def execute(self, sql, args=()):
+            s = ' '.join(sql.split())
+            self.ran.append(s)
+            # Pretend patients.city and doctors.ix_doctors_name already exist.
+            self.last = {'1': 1} if args in (('patients', 'city'), ('doctors', 'ix_doctors_name')) else None
+        def fetchone(self): return self.last
+
+    monkeypatch.setattr(common, '_m4_ready', False)
+    monkeypatch.setattr(common, 'emit', lambda *a, **k: None)
+    cur = UpgradeCur()
+    common.ensure_milestone4_schema(cur)
+    alters = [s for s in cur.ran if s.startswith(('ALTER', 'CREATE INDEX'))]
+    assert len(alters) == 5 + 4
+    assert not any('ADD COLUMN city ' in s for s in alters) and not any('ix_doctors_name ON' in s for s in alters)
+    assert 'CREATE INDEX ix_doctors_spec_name ON doctors (specialization, last_name, first_name)' in alters
+    common.ensure_milestone4_schema(cur)               # second call in the same warm Lambda does nothing
+    assert len([s for s in cur.ran if s.startswith(('ALTER', 'CREATE INDEX'))]) == 9
