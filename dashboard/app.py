@@ -80,6 +80,15 @@ def store_login(data):
     session.permanent = True
 
 
+def end_signup_login(data):
+    """Revoke the short-lived tokens used during sign-up to upload the photo. Best effort: never blocks sign-up."""
+    try:
+        requests.post(API + '/auth/logout', json={'refreshToken': data.get('refreshToken')},
+                      headers={'Authorization': 'Bearer ' + data['accessToken']}, timeout=10)
+    except (requests.RequestException, KeyError, TypeError):
+        pass
+
+
 def refresh_access_token():
     """Swap the refresh token for a new access token. False means the doctor must sign in again."""
     refresh_token = session.get('refresh_token')
@@ -179,28 +188,36 @@ def signup():
             flash(api_message(registered, 'Doctor registration failed. Please check your details.'), 'error')
             return render_signup(request.form, registered.status_code)
 
+        # Sign in for a moment ONLY to upload the photo (that API needs a doctor token).
+        # These tokens are never stored in the browser session: the doctor signs in themselves next.
         logged_in = requests.post(API + '/auth/login', json={
             'email': payload['email'], 'password': payload['password']
         }, timeout=20)
         if not logged_in.ok or logged_in.json().get('role') != 'doctor':
             flash('Your account was created. Please sign in to finish setting up your profile photo.', 'success')
-            return redirect(url_for('login'))
+            return redirect(url_for('login', email=payload['email']))
 
         login_data = logged_in.json()
         token = login_data['accessToken']
-        presign = api_request('POST', '/doctor/me/photo', payload={'contentType': photo.mimetype}, token=token)
-        if not presign.ok:
-            flash('Your account was created, but photo upload could not be started. Sign in and try again after the doctor photo API is deployed. ' + api_message(presign, ''), 'warning')
-            return redirect(url_for('login'))
-        upload = requests.put(presign.json()['uploadUrl'], data=photo.read(),
-                              headers={'Content-Type': photo.mimetype}, timeout=30)
-        if not upload.ok:
-            flash('Your account was created, but the photo upload did not complete. Sign in and upload it again.', 'warning')
-            return redirect(url_for('login'))
+        try:
+            presign = api_request('POST', '/doctor/me/photo', payload={'contentType': photo.mimetype}, token=token)
+            if not presign.ok:
+                flash('Your account was created, but photo upload could not be started. Sign in and upload your photo '
+                      'from your profile. ' + api_message(presign, ''), 'warning')
+                return redirect(url_for('login', email=payload['email']))
+            upload = requests.put(presign.json()['uploadUrl'], data=photo.read(),
+                                  headers={'Content-Type': photo.mimetype}, timeout=30)
+            if not upload.ok:
+                flash('Your account was created, but the photo upload did not complete. Sign in and upload it again '
+                      'from your profile.', 'warning')
+                return redirect(url_for('login', email=payload['email']))
+        finally:
+            end_signup_login(login_data)
 
-        store_login(login_data)
-        flash('Welcome to MediSlot. Your doctor profile has been created.', 'success')
-        return redirect(url_for('dashboard'))
+        # Do NOT sign the new doctor in: send them to the login page with their email filled in.
+        session.pop('token', None); session.pop('refresh_token', None); session.pop('token_exp', None); session.pop('role', None)
+        flash('Your doctor account has been created. Please sign in to continue.', 'success')
+        return redirect(url_for('login', email=payload['email']))
     except requests.RequestException:
         flash('MediSlot could not reach the API. Please try again in a moment.', 'error')
         return render_signup(request.form, 502)
@@ -221,7 +238,9 @@ def login():
             flash('We could not sign you in as a doctor. Check your details and try again.', 'error')
         except requests.RequestException:
             flash('MediSlot could not reach the API. Please try again.', 'error')
-    return render_template('login.html')
+    # After sign-up the email arrives as ?email=..., so the doctor only types the password.
+    email = request.form.get('email') or request.args.get('email', '')
+    return render_template('login.html', email=email.strip()[:254])
 
 
 @app.route('/doctor/logout')

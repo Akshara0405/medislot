@@ -4,3 +4,5 @@ bcrypt==4.2.1
 PyMySQL==1.1.1
 boto3==1.35.99
 PyYAML==6.0.2
+Flask>=3.0,<4
+requests>=2.31,<3
