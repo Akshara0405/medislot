@@ -7,8 +7,8 @@
 <div class="field"><label for="last_name">LAST NAME *</label><input id="last_name" name="last_name" value="{{values.get('last_name','')}}" autocomplete="family-name" maxlength="75" required></div>
 <div class="field"><label for="email">EMAIL ADDRESS *</label><input id="email" name="email" type="email" value="{{values.get('email','')}}" autocomplete="email" required></div>
 <div class="field"><label for="phone">PHONE NUMBER *</label><input id="phone" name="phone" type="tel" value="{{values.get('phone','')}}" maxlength="25" autocomplete="tel" required></div>
-<div class="field"><label for="password">PASSWORD *</label><input id="password" name="password" type="password" minlength="8" autocomplete="new-password" required><span class="hint">At least 8 characters, including a letter and a number.</span></div>
-<div class="field"><label for="confirm_password">CONFIRM PASSWORD *</label><input id="confirm_password" name="confirm_password" type="password" minlength="8" autocomplete="new-password" required></div>
+<div class="field"><label for="password">PASSWORD *</label><input id="password" name="password" type="password" minlength="10" autocomplete="new-password" required><span class="hint">At least 10 characters, including a letter and a number.</span></div>
+<div class="field"><label for="confirm_password">CONFIRM PASSWORD *</label><input id="confirm_password" name="confirm_password" type="password" minlength="10" autocomplete="new-password" required></div>
 <div class="field"><label for="specialization">SPECIALISATION *</label><select id="specialization" name="specialization" required><option value="" disabled {{ '' if values.get('specialization') else 'selected' }}>Select your specialisation</option>{% for sp in specializations %}<option value="{{ sp }}" {{ 'selected' if values.get('specialization') == sp else '' }}>{{ sp }}</option>{% endfor %}</select></div>
 <div class="field"><label for="qualification">QUALIFICATION *</label><input id="qualification" name="qualification" value="{{values.get('qualification','')}}" placeholder="e.g. MBBS, MD" maxlength="150" required></div>
 <div class="field"><label for="license_number">MEDICAL LICENCE NUMBER *</label><input id="license_number" name="license_number" value="{{values.get('license_number','')}}" placeholder="TN-123456" pattern="[A-Za-z]{2}-[0-9]{6}" title="Format: two-letter state code, hyphen, six digits" required><span class="hint">Format: XX-123456</span></div>
@@ -20,5 +20,9 @@
 <script>
 const photo=document.getElementById('photo'),preview=document.getElementById('photo-preview'),form=document.getElementById('signup-form');
 photo.addEventListener('change',()=>{const file=photo.files[0];if(!file){preview.textContent='＋';return;}if(file.size>5*1024*1024){photo.value='';preview.textContent='＋';alert('Please choose an image smaller than 5 MB.');return;}const url=URL.createObjectURL(file);preview.innerHTML='';const img=document.createElement('img');img.src=url;preview.appendChild(img);});
-form.addEventListener('submit',e=>{const a=document.getElementById('password'),b=document.getElementById('confirm_password');if(a.value!==b.value){e.preventDefault();b.setCustomValidity('Passwords do not match.');b.reportValidity();}else{b.setCustomValidity('');document.getElementById('submit-btn').textContent='Creating your profile…';document.getElementById('submit-btn').disabled=true;}});
+const pw=document.getElementById('password'),pw2=document.getElementById('confirm_password'),btn=document.getElementById('submit-btn');
+// Re-check on every keystroke, so the "do not match" error clears as soon as both fields are equal.
+function checkMatch(){pw2.setCustomValidity(pw2.value&&pw.value!==pw2.value?'Passwords do not match.':'');}
+pw.addEventListener('input',checkMatch);pw2.addEventListener('input',checkMatch);
+form.addEventListener('submit',e=>{checkMatch();if(!form.checkValidity()){e.preventDefault();form.reportValidity();return;}btn.textContent='Creating your profile…';btn.disabled=true;});
 </script>{% endblock %}
