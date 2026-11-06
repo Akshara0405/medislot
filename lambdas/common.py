@@ -116,7 +116,8 @@ def dbconn(c):
           city VARCHAR(100) NULL,
           is_active BOOLEAN NOT NULL DEFAULT TRUE,
           created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-          UNIQUE KEY uq_hospitals_name_city (name, city)
+          UNIQUE KEY uq_hospitals_name_city (name, city),
+          KEY ix_hospitals_city (city, is_active)
         ) ENGINE=InnoDB""")
         cur.execute("""CREATE TABLE IF NOT EXISTS patients (
           user_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
@@ -126,7 +127,13 @@ def dbconn(c):
           date_of_birth DATE NULL,
           gender VARCHAR(30) NULL,
           address VARCHAR(500) NULL,
+          city VARCHAR(100) NULL,
+          blood_group VARCHAR(3) NULL,
+          emergency_contact_name VARCHAR(150) NULL,
+          emergency_contact_phone VARCHAR(25) NULL,
+          profile_version INT UNSIGNED NOT NULL DEFAULT 1,
           created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+          updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
           CONSTRAINT fk_patients_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
         ) ENGINE=InnoDB""")
         cur.execute("""CREATE TABLE IF NOT EXISTS doctors (
@@ -140,6 +147,12 @@ def dbconn(c):
           qualification VARCHAR(150) NOT NULL,
           experience_years SMALLINT UNSIGNED NOT NULL DEFAULT 0,
           created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+          -- Milestone 4 search indexes (see docs/M4_SEARCH_INDEXES.md). InnoDB appends the primary key
+          -- (user_id) to every secondary index, so each one already ends in the keyset tie-breaker.
+          KEY ix_doctors_name (last_name, first_name),
+          KEY ix_doctors_first_name (first_name),
+          KEY ix_doctors_spec_name (specialization, last_name, first_name),
+          KEY ix_doctors_hospital_name (hospital_id, last_name, first_name),
           CONSTRAINT fk_doctors_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
           CONSTRAINT fk_doctors_hospital FOREIGN KEY (hospital_id) REFERENCES hospitals(hospital_id)
         ) ENGINE=InnoDB""")

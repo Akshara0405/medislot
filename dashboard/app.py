@@ -70,13 +70,13 @@ def render_signup(values, status=200):
                            specializations=specialization_options(values.get('specialization', ''))), status
 
 
-def store_login(data):
+def store_login(data, role='doctor'):
     """Keep the access token, its expiry and the refresh token so the session can renew itself."""
     session['token'] = data['accessToken']
     if data.get('refreshToken'):
         session['refresh_token'] = data['refreshToken']
     session['token_exp'] = time.time() + int(data.get('expiresIn') or 900)
-    session['role'] = 'doctor'
+    session['role'] = role
     session.permanent = True
 
 
@@ -139,6 +139,8 @@ def api_message(response, fallback):
 def home():
     if session.get('token') and session.get('role') == 'doctor':
         return redirect(url_for('dashboard'))
+    if session.get('token') and session.get('role') == 'patient':
+        return redirect(url_for('patient_dashboard'))
     return render_template('home.html')
 
 
@@ -531,6 +533,342 @@ def dashboard():
                        'label': '%s · %s min' % (str(t.get('name', '')).replace('_', ' ').title(), t.get('duration_min'))}
                       for t in types],
     )
+
+
+# =====================================================================================================
+# Patient portal (Milestone 4): register, sign in, find doctors, browse slots, manage own profile.
+# Every call goes through API Gateway; the dashboard never talks to RDS or DynamoDB itself.
+# =====================================================================================================
+GENDER_OPTIONS = ['Female', 'Male', 'Non-binary', 'Other', 'Prefer not to say']
+BLOOD_GROUP_OPTIONS = ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-']
+PATIENT_TABS = [('find', 'Find a doctor'), ('profile', 'My profile')]
+PHONE_PATTERN = re.compile(r'^\+?[0-9][0-9 \-]{5,22}$')
+PATIENT_PROFILE_FORM = {          # form field -> API field
+    'first_name': 'firstName', 'last_name': 'lastName', 'phone': 'phone', 'date_of_birth': 'dateOfBirth',
+    'gender': 'gender', 'city': 'city', 'address': 'address', 'blood_group': 'bloodGroup',
+    'emergency_contact_name': 'emergencyContactName', 'emergency_contact_phone': 'emergencyContactPhone',
+}
+SLOT_WINDOW_DAYS = 30
+_filter_cache = {'at': 0.0, 'data': None}
+
+
+def is_patient():
+    return bool(session.get('token')) and session.get('role') == 'patient'
+
+
+def public_get(path, params=None):
+    """Unauthenticated GET for the public discovery endpoints."""
+    return requests.get(API + path, params={k: v for k, v in (params or {}).items() if v not in (None, '')},
+                        timeout=20)
+
+
+def search_options():
+    """Dropdown values for the search form (specialisations, cities, hospitals), cached for a minute."""
+    if _filter_cache['data'] is not None and time.time() - _filter_cache['at'] < 60:
+        return _filter_cache['data']
+    empty = {'specializations': [], 'cities': [], 'hospitals': []}
+    try:
+        res = public_get('/doctors/filters')
+        data = res.json() if res.ok else None
+    except (requests.RequestException, ValueError):
+        data = None
+    if not isinstance(data, dict):
+        return empty
+    _filter_cache.update(at=time.time(), data=data)
+    return data
+
+
+def phone_ok(value):
+    digits = re.sub(r'\D', '', value or '')
+    return bool(PHONE_PATTERN.match((value or '').strip())) and 7 <= len(digits) <= 15
+
+
+def dob_problem(value):
+    try:
+        born = date.fromisoformat(value)
+    except (TypeError, ValueError):
+        return 'Enter your date of birth.'
+    if born > date.today():
+        return 'Date of birth cannot be in the future.'
+    if date.today().year - born.year > 120:
+        return 'Check your date of birth.'
+    return None
+
+
+def end_temporary_login(data):
+    """Revoke tokens obtained only for a background step (sign-up profile fields, wrong-portal sign-in)."""
+    end_signup_login(data)
+
+
+@app.route('/patient/register', methods=['GET', 'POST'])
+@app.route('/patient/signup', methods=['GET', 'POST'])
+def patient_register():
+    if request.method == 'GET':
+        return render_template('patient_register.html', values={}, genders=GENDER_OPTIONS,
+                               blood_groups=BLOOD_GROUP_OPTIONS, cities=search_options().get('cities', []))
+    form = {k: (v or '').strip() for k, v in request.form.items()}
+    form['password'], form['confirm_password'] = request.form.get('password', ''), request.form.get('confirm_password', '')
+
+    def again(message, status=400):
+        flash(message, 'error')
+        return render_template('patient_register.html', values=form, genders=GENDER_OPTIONS,
+                               blood_groups=BLOOD_GROUP_OPTIONS, cities=search_options().get('cities', [])), status
+
+    required = ['first_name', 'last_name', 'email', 'phone', 'password', 'confirm_password', 'date_of_birth',
+                'gender', 'city']
+    missing = [f.replace('_', ' ') for f in required if not form.get(f)]
+    if missing:
+        return again('Please fill in: ' + ', '.join(missing) + '.')
+    if form['password'] != form['confirm_password']:
+        return again('The passwords do not match.')
+    if not phone_ok(form['phone']):
+        return again('Enter a phone number with 7 to 15 digits.')
+    if form.get('emergency_contact_phone') and not phone_ok(form['emergency_contact_phone']):
+        return again('Enter an emergency contact phone number with 7 to 15 digits.')
+    problem = dob_problem(form['date_of_birth'])
+    if problem:
+        return again(problem)
+    if form['gender'] not in GENDER_OPTIONS:
+        return again('Choose a gender option from the list.')
+    if form.get('blood_group') and form['blood_group'] not in BLOOD_GROUP_OPTIONS:
+        return again('Choose a blood group from the list.')
+
+    email = form['email'].lower()
+    try:
+        created = requests.post(API + '/auth/register/patient', json={
+            'email': email, 'password': form['password'], 'firstName': form['first_name'],
+            'lastName': form['last_name'], 'phone': form['phone'], 'dateOfBirth': form['date_of_birth'],
+            'gender': form['gender'], 'address': form.get('address', ''),
+        }, timeout=20)
+        if created.status_code == 409:
+            return again('An account already exists for these details. Try signing in instead.', 409)
+        if created.status_code != 201:
+            return again(api_message(created, 'Registration failed. Please check your details.'), created.status_code)
+
+        # Milestone 4 profile fields (city, blood group, emergency contact) are saved with PUT /patient/me,
+        # using a short-lived sign-in that is revoked straight away. The patient then signs in themselves.
+        extra = {api: form.get(field) or None for field, api in PATIENT_PROFILE_FORM.items()
+                 if field in ('city', 'blood_group', 'emergency_contact_name', 'emergency_contact_phone')}
+        logged_in = requests.post(API + '/auth/login', json={'email': email, 'password': form['password']}, timeout=20)
+        if logged_in.ok and logged_in.json().get('role') == 'patient':
+            data = logged_in.json()
+            try:
+                saved = api_request('PUT', '/patient/me', payload={k: v for k, v in extra.items() if v},
+                                    token=data['accessToken'])
+                if not saved.ok:
+                    flash('Your account was created, but some profile details were not saved: '
+                          + api_message(saved, 'please add them under My profile.'), 'warning')
+            finally:
+                end_temporary_login(data)
+        else:
+            flash('Your account was created. Add your city under My profile after signing in.', 'warning')
+    except requests.RequestException:
+        return again('MediSlot could not reach the API. Please try again in a moment.', 502)
+    session.clear()
+    flash('Your patient account is ready. Please sign in.', 'success')
+    return redirect(url_for('patient_login', email=email))
+
+
+@app.route('/patient/login', methods=['GET', 'POST'])
+def patient_login():
+    if request.method == 'GET' and is_patient():
+        return redirect(url_for('patient_dashboard'))
+    if request.method == 'POST':
+        try:
+            res = requests.post(API + '/auth/login', json={'email': request.form.get('email', '').strip(),
+                                                           'password': request.form.get('password', '')}, timeout=20)
+            data = res.json() if res.ok else {}
+            if res.ok and data.get('role') == 'patient':
+                session.clear()
+                store_login(data, 'patient')
+                return redirect(url_for('patient_dashboard'))
+            if res.ok and data.get('role') == 'doctor':
+                end_temporary_login(data)
+                flash('That is a doctor account. Please use doctor sign in.', 'warning')
+            else:
+                flash('We could not sign you in. Check your email and password.', 'error')
+        except (requests.RequestException, ValueError):
+            flash('MediSlot could not reach the API. Please try again.', 'error')
+    email = request.form.get('email') or request.args.get('email', '')
+    return render_template('patient_login.html', email=email.strip()[:254])
+
+
+@app.route('/patient/logout')
+def patient_logout():
+    if session.get('token'):
+        try:
+            requests.post(API + '/auth/logout', json={'refreshToken': session.get('refresh_token')},
+                          headers={'Authorization': 'Bearer ' + session['token']}, timeout=10)
+        except requests.RequestException:
+            pass
+    session.clear()
+    flash('You have signed out.', 'success')
+    return redirect(url_for('home'))
+
+
+def search_state():
+    """Read the search form from the query string. On the very first visit the patient's own city is used."""
+    args = request.args
+    first_visit = 'searched' not in args
+    return {
+        'name': args.get('name', '').strip()[:75],
+        'specialization': args.get('specialization', '').strip()[:120],
+        'hospital_id': args.get('hospital_id', '').strip() if args.get('hospital_id', '').isdigit() else '',
+        'city': args.get('city', '').strip()[:100],
+        'cursor': args.get('cursor', '').strip()[:600],
+        'trail': [t for t in args.get('trail', '').split(',') if t][:50],
+        'first_visit': first_visit,
+    }
+
+
+def page_links(state, next_cursor):
+    base = {k: state[k] for k in ('name', 'specialization', 'hospital_id', 'city') if state[k]}
+    base.update(tab='find', searched='1')
+    nxt = prev = None
+    if next_cursor:
+        nxt = url_for('patient_dashboard', **base, cursor=next_cursor,
+                      trail=','.join(state['trail'] + [state['cursor'] or '-']))
+    if state['trail']:
+        back = state['trail'][-1]
+        prev = url_for('patient_dashboard', **base, **({'cursor': back} if back != '-' else {}),
+                       trail=','.join(state['trail'][:-1]))
+    return prev, nxt
+
+
+@app.route('/patient/dashboard', methods=['GET', 'POST'])
+def patient_dashboard():
+    if not is_patient():
+        return redirect(url_for('patient_login'))
+    if request.method == 'POST':
+        return handle_patient_post()
+    tab = request.args.get('tab', 'find')
+    if tab not in {k for k, _ in PATIENT_TABS}:
+        tab = 'find'
+    profile, results, search_error = {}, None, None
+    state = search_state()
+    try:
+        me = api_request('GET', '/patient/me')
+        if me.status_code in (401, 403):
+            session.clear()
+            flash('Your session has expired. Please sign in again.', 'warning')
+            return redirect(url_for('patient_login'))
+        if me.ok:
+            profile = me.json()
+        else:
+            flash(api_message(me, 'Your profile could not be loaded.'), 'warning')
+        if state['first_visit'] and profile.get('city'):
+            state['city'] = profile['city']
+        params = {'name': state['name'], 'specialization': state['specialization'],
+                  'hospitalId': state['hospital_id'], 'city': state['city'], 'cursor': state['cursor'], 'limit': 8}
+        res = public_get('/doctors', params)
+        if res.ok:
+            results = res.json()
+        else:
+            search_error = api_message(res, 'Search is unavailable right now.')
+    except requests.RequestException:
+        search_error = 'MediSlot could not reach the API. Please try again.'
+    prev_link, next_link = page_links(state, (results or {}).get('page', {}).get('nextCursor'))
+    return render_template('patient_dashboard.html', tabs=PATIENT_TABS, active=tab, profile=profile, state=state,
+                           results=results, search_error=search_error, options=search_options(),
+                           prev_link=prev_link, next_link=next_link, page_no=len(state['trail']) + 1,
+                           genders=GENDER_OPTIONS, blood_groups=BLOOD_GROUP_OPTIONS)
+
+
+def handle_patient_post():
+    action = request.form.get('action', '')
+    try:
+        if action == 'profile':
+            payload = {api: request.form.get(field, '').strip() for field, api in PATIENT_PROFILE_FORM.items()
+                       if field in request.form}
+            if request.form.get('version', '').isdigit():
+                payload['version'] = int(request.form['version'])
+            result = api_request('PUT', '/patient/me', payload=payload)
+            if result.ok:
+                flash('Profile saved.', 'success')
+            elif result.status_code == 412:
+                flash('Your profile was changed in another tab or device. The latest version is shown below; '
+                      'make your change again and save.', 'warning')
+            elif result.status_code == 401:
+                session.clear()
+                flash('Your session has expired. Please sign in again.', 'warning')
+                return redirect(url_for('patient_login'))
+            else:
+                flash(api_message(result, 'Could not save your profile.'), 'error')
+            return redirect(url_for('patient_dashboard', tab='profile'))
+        if action == 'delete_account':
+            if request.form.get('confirm', '').strip() != 'DELETE':
+                flash('Type DELETE in capitals to confirm account deletion.', 'error')
+                return redirect(url_for('patient_dashboard', tab='profile'))
+            result = api_request('DELETE', '/patient/me',
+                                 payload={'confirm': 'DELETE', 'refreshToken': session.get('refresh_token')})
+            if result.ok:
+                session.clear()
+                flash('Your account has been deleted. We are sorry to see you go.', 'success')
+                return redirect(url_for('home'))
+            flash(api_message(result, 'Could not delete your account.'), 'error')
+            return redirect(url_for('patient_dashboard', tab='profile'))
+    except requests.RequestException:
+        flash('MediSlot could not reach the API. Please try again.', 'error')
+    return redirect(url_for('patient_dashboard'))
+
+
+def twelve_hour(hhmm_value):
+    try:
+        return datetime.strptime(hhmm_value, '%H:%M').strftime('%I:%M %p').lstrip('0')
+    except (TypeError, ValueError):
+        return hhmm_value
+
+
+@app.get('/patient/doctors/<int:doctor_id>')
+def patient_doctor(doctor_id):
+    if not is_patient():
+        return redirect(url_for('patient_login'))
+    try:
+        res = public_get(f'/doctors/{doctor_id}')
+        if res.status_code == 404:
+            flash('That doctor is no longer available.', 'warning')
+            return redirect(url_for('patient_dashboard'))
+        if not res.ok:
+            flash(api_message(res, 'Could not load the doctor profile.'), 'error')
+            return redirect(url_for('patient_dashboard'))
+        doctor = res.json()
+        try:
+            tz = ZoneInfo(doctor.get('timezone') or 'Asia/Kolkata')
+        except Exception:
+            tz = ZoneInfo('Asia/Kolkata')
+        today = datetime.now(tz).date()
+        try:
+            start = date.fromisoformat(request.args.get('from', ''))
+        except ValueError:
+            start = today
+        start = min(max(start, today), today + timedelta(days=SLOT_WINDOW_DAYS - 1))
+        end = min(start + timedelta(days=6), today + timedelta(days=SLOT_WINDOW_DAYS - 1))
+        type_id = request.args.get('type', '')
+        if type_id and type_id not in {t['consultationTypeId'] for t in doctor.get('consultationTypes', [])}:
+            type_id = ''
+        only_free = request.args.get('free') == '1'
+        slots_res = public_get(f'/doctors/{doctor_id}/slots', {
+            'from': start.isoformat(), 'to': end.isoformat(), 'consultationTypeId': type_id,
+            'includeFull': 'false' if only_free else 'true'})
+        slots = slots_res.json() if slots_res.ok else None
+        slot_error = None if slots_res.ok else api_message(slots_res, 'Slots could not be loaded.')
+    except requests.RequestException:
+        flash('MediSlot could not reach the API. Please try again.', 'error')
+        return redirect(url_for('patient_dashboard'))
+    for day in (slots or {}).get('days', []):
+        day['label'] = date.fromisoformat(day['date']).strftime('%a %d %b')
+        for slot in day['slots']:
+            slot['start12'], slot['end12'] = twelve_hour(slot['localStart']), twelve_hour(slot['localEnd'])
+    nav = {'type': type_id or None, 'free': '1' if only_free else None}
+    prev_week = (url_for('patient_doctor', doctor_id=doctor_id, **{k: v for k, v in nav.items() if v},
+                         **{'from': max(today, start - timedelta(days=7)).isoformat()}) if start > today else None)
+    last_day = today + timedelta(days=SLOT_WINDOW_DAYS - 1)
+    next_week = (url_for('patient_doctor', doctor_id=doctor_id, **{k: v for k, v in nav.items() if v},
+                         **{'from': (start + timedelta(days=7)).isoformat()}) if end < last_day else None)
+    return render_template('patient_doctor.html', doctor=doctor, slots=slots, slot_error=slot_error,
+                           start=start, end=end, type_id=type_id, only_free=only_free,
+                           prev_week=prev_week, next_week=next_week,
+                           next_open_time=twelve_hour((doctor.get('nextOpenSlot') or {}).get('localStart')))
 
 
 @app.errorhandler(413)

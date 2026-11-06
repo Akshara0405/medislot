@@ -1,0 +1,28 @@
+{% extends 'base.html' %}{% block title %}Create patient account · MediSlot{% endblock %}{% block content %}
+<main class="shell auth-wrap"><aside class="auth-aside" style="background:linear-gradient(160deg,#102b3a,#16465a)"><div><span class="aside-pill">Patient registration</span><h2>One profile.<br>Every doctor you need.</h2><p>Tell us a little about yourself once. Your city sets the default for doctor search, and your emergency contact is ready for when you book.</p></div><div><p style="color:#d7f36b;font-weight:800">✦ Only you can read your profile.</p><p>Fields marked * are required.</p></div></aside>
+<section class="auth-panel"><span class="eyebrow warm"><span class="dot"></span> Join MediSlot</span><h1>Create your account</h1><p class="auth-sub">It takes about a minute.</p>
+<form method="post" id="patient-form" novalidate>
+<div class="form-grid">
+<div class="field"><label for="first_name">FIRST NAME *</label><input id="first_name" name="first_name" value="{{ values.get('first_name','') }}" autocomplete="given-name" maxlength="75" required></div>
+<div class="field"><label for="last_name">LAST NAME *</label><input id="last_name" name="last_name" value="{{ values.get('last_name','') }}" autocomplete="family-name" maxlength="75" required></div>
+<div class="field"><label for="email">EMAIL ADDRESS *</label><input id="email" name="email" type="email" value="{{ values.get('email','') }}" autocomplete="email" maxlength="254" required></div>
+<div class="field"><label for="phone">PHONE NUMBER *</label><input id="phone" name="phone" type="tel" value="{{ values.get('phone','') }}" autocomplete="tel" maxlength="25" pattern="\+?[0-9][0-9 \-]{5,22}" title="7 to 15 digits" required></div>
+<div class="field"><label for="date_of_birth">DATE OF BIRTH *</label><input id="date_of_birth" name="date_of_birth" type="date" value="{{ values.get('date_of_birth','') }}" required></div>
+<div class="field"><label for="gender">GENDER *</label><select id="gender" name="gender" required><option value="" disabled {{ '' if values.get('gender') else 'selected' }}>Select</option>{% for g in genders %}<option {{ 'selected' if values.get('gender') == g else '' }}>{{ g }}</option>{% endfor %}</select></div>
+<div class="field"><label for="city">CITY *</label><input id="city" name="city" list="city-list" value="{{ values.get('city','') }}" maxlength="100" autocomplete="address-level2" required><datalist id="city-list">{% for c in cities %}<option value="{{ c }}">{% endfor %}</datalist><span class="hint">Doctor search starts in your city.</span></div>
+<div class="field"><label for="blood_group">BLOOD GROUP</label><select id="blood_group" name="blood_group"><option value="">Not sure / skip</option>{% for b in blood_groups %}<option {{ 'selected' if values.get('blood_group') == b else '' }}>{{ b }}</option>{% endfor %}</select></div>
+<div class="field full"><label for="address">ADDRESS</label><input id="address" name="address" value="{{ values.get('address','') }}" maxlength="500" autocomplete="street-address"></div>
+<div class="field"><label for="emergency_contact_name">EMERGENCY CONTACT NAME</label><input id="emergency_contact_name" name="emergency_contact_name" value="{{ values.get('emergency_contact_name','') }}" maxlength="150"></div>
+<div class="field"><label for="emergency_contact_phone">EMERGENCY CONTACT PHONE</label><input id="emergency_contact_phone" name="emergency_contact_phone" type="tel" value="{{ values.get('emergency_contact_phone','') }}" maxlength="25" pattern="\+?[0-9][0-9 \-]{5,22}" title="7 to 15 digits"></div>
+<div class="field"><label for="password">PASSWORD *</label><input id="password" name="password" type="password" minlength="10" autocomplete="new-password" required><span class="hint">At least 10 characters, including a letter and a number.</span></div>
+<div class="field"><label for="confirm_password">CONFIRM PASSWORD *</label><input id="confirm_password" name="confirm_password" type="password" minlength="10" autocomplete="new-password" required></div>
+</div><button class="primary form-submit" type="submit" id="submit-btn">Create my patient account&nbsp; ↗</button></form>
+<div class="switch-auth">Already registered? <a href="/patient/login">Sign in</a></div><div class="switch-auth"><a href="/">← Back to home</a></div></section></main>
+{% include '_patient_styles.html' %}
+<script>
+const f=document.getElementById('patient-form'),pw=document.getElementById('password'),pw2=document.getElementById('confirm_password'),dob=document.getElementById('date_of_birth'),btn=document.getElementById('submit-btn');
+dob.max=new Date().toISOString().slice(0,10);
+function check(){pw2.setCustomValidity(pw2.value&&pw.value!==pw2.value?'Passwords do not match.':'');pw.setCustomValidity(pw.value&&!(/[A-Za-z]/.test(pw.value)&&/\d/.test(pw.value))?'Include at least one letter and one number.':'');}
+pw.addEventListener('input',check);pw2.addEventListener('input',check);
+f.addEventListener('submit',e=>{check();if(!f.checkValidity()){e.preventDefault();f.reportValidity();return;}btn.textContent='Creating your account…';btn.disabled=true;});
+</script>{% endblock %}

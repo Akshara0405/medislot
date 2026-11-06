@@ -1,0 +1,71 @@
+{% extends 'base.html' %}{% block title %}Find a doctor · MediSlot{% endblock %}{% block head %}{% include '_patient_styles.html' %}{% endblock %}
+{% block content %}
+{% set done = 4 - (profile.get('missingFields') or [])|length %}
+<main class="shell dashboard" style="padding-top:0">
+<div class="pt-hero"><div><span class="eyebrow warm"><span class="dot"></span> Patient space</span><h1>Hello, {{ (profile.get('firstName') or 'there')|title }}.</h1><p>Find a doctor, check their fees and see live free seats for the next 30 days.</p></div>
+{% if profile %}<a class="meter" href="{{ url_for('patient_dashboard', tab='profile') }}"><b>Profile {{ (done * 25) }}% complete</b><small>{% if profile.get('profileComplete') %}Ready for booking{% else %}Add: {{ (profile.get('missingFields') or [])|join(', ')|replace('dateOfBirth','date of birth')|replace('emergencyContactPhone','emergency contact') }}{% endif %}</small><div class="meter-bar"><i style="width:{{ done * 25 }}%"></i></div></a>{% endif %}</div>
+
+<nav class="tabs" role="tablist" aria-label="Patient sections">{% for key, label in tabs %}<a class="tab{{ ' active' if key == active else '' }}" role="tab" href="{{ url_for('patient_dashboard', tab=key) }}" aria-selected="{{ 'true' if key == active else 'false' }}">{{ label }}</a>{% endfor %}</nav>
+
+{% if active == 'find' %}
+<form class="filter-card" method="get" action="{{ url_for('patient_dashboard') }}" role="search">
+<input type="hidden" name="tab" value="find"><input type="hidden" name="searched" value="1">
+<div class="filter-grid">
+<div><label for="f-name">Doctor name</label><input id="f-name" name="name" value="{{ state.name }}" placeholder="e.g. Rao or Dr Asha" maxlength="75"></div>
+<div><label for="f-spec">Specialisation</label><select id="f-spec" name="specialization"><option value="">Any</option>{% for sp in options.get('specializations', []) %}<option {{ 'selected' if state.specialization == sp else '' }}>{{ sp }}</option>{% endfor %}{% if state.specialization and state.specialization not in options.get('specializations', []) %}<option selected>{{ state.specialization }}</option>{% endif %}</select></div>
+<div><label for="f-hosp">Hospital</label><select id="f-hosp" name="hospital_id"><option value="">Any</option>{% for h in options.get('hospitals', []) %}<option value="{{ h.hospitalId }}" {{ 'selected' if state.hospital_id == h.hospitalId|string else '' }}>{{ h.name }}{{ ' · ' ~ h.city if h.city else '' }}</option>{% endfor %}</select></div>
+<div><label for="f-city">City</label><select id="f-city" name="city"><option value="">Any</option>{% for c in options.get('cities', []) %}<option {{ 'selected' if state.city|lower == c|lower else '' }}>{{ c }}</option>{% endfor %}{% if state.city and state.city|lower not in options.get('cities', [])|map('lower')|list %}<option selected>{{ state.city }}</option>{% endif %}</select></div>
+<div class="go"><button class="btn-lime" type="submit">Search ↗</button></div>
+</div>
+{% set chips = [('name', state.name), ('specialization', state.specialization), ('hospital_id', state.hospital_id), ('city', state.city)] %}
+{% if state.name or state.specialization or state.hospital_id or state.city %}<div class="active-filters">{% for key, value in chips if value %}{% set rest = {} %}{% for k2, v2 in chips if k2 != key and v2 %}{% set _ = rest.update({k2: v2}) %}{% endfor %}<a href="{{ url_for('patient_dashboard', tab='find', searched='1', **rest) }}" title="Remove this filter">{{ 'Hospital #' ~ value if key == 'hospital_id' else value }} ✕</a>{% endfor %}<a href="{{ url_for('patient_dashboard', tab='find', searched='1') }}">Clear all</a></div>{% endif %}
+{% if state.first_visit and state.city %}<div class="active-filters" style="margin-top:8px;color:#b6c9c8">Showing doctors in your city first.</div>{% endif %}
+</form>
+
+{% if search_error %}<div class="alert error">{{ search_error }}</div>
+{% elif results %}
+<div class="result-meta"><span><b style="color:var(--ink)">{{ results.totalMatches }}</b> doctor{{ '' if results.totalMatches == 1 else 's' }} found · page {{ page_no }}</span><span>Sorted by surname</span></div>
+{% if results['items'] %}
+<div class="doc-grid">{% for d in results['items'] %}
+<article class="doc-card"><div class="doc-top"><div class="avatar sm">{% if d.photoUrl %}<img src="{{ d.photoUrl }}" alt="" onerror="this.remove()">{% endif %}<span>{{ (d.firstName[:1] ~ d.lastName[:1])|upper }}</span></div><div><h3>{{ d.name }}</h3><p>{{ d.specialization }} · {{ d.qualification }}</p></div></div>
+<div class="doc-facts"><span class="fact">🏥 {{ d.hospital.name }}</span>{% if d.hospital.city %}<span class="fact">📍 {{ d.hospital.city }}</span>{% endif %}<span class="fact">{{ d.experienceYears }} yrs</span>{% if d.acceptingBookings %}<span class="fact fee">from ₹{{ d.feeFrom }}</span>{% else %}<span class="fact off">Not taking bookings yet</span>{% endif %}</div>
+{% if d.consultationTypes %}<div class="doc-facts">{% for t in d.consultationTypes %}<span class="chip">{{ t }}</span>{% endfor %}</div>{% endif %}
+<a class="primary" href="{{ url_for('patient_doctor', doctor_id=d.doctorId) }}">Profile &amp; free slots ↗</a></article>
+{% endfor %}</div>
+<div class="pager"><a class="ghost{{ '' if prev_link else ' disabled' }}" href="{{ prev_link or '#' }}">← Previous</a><span style="color:var(--muted);font-size:13px">Showing {{ results.page.returned }} of {{ results.totalMatches }}</span><a class="ghost{{ '' if next_link else ' disabled' }}" href="{{ next_link or '#' }}">Next →</a></div>
+{% else %}
+<div class="empty-state"><h3>No doctors match all of these filters.</h3><p>Try removing one filter, or search by surname only.</p>{% if state.city %}<p><a class="ghost" href="{{ url_for('patient_dashboard', tab='find', searched='1', name=state.name, specialization=state.specialization) }}">Search every city</a></p>{% endif %}</div>
+{% endif %}
+{% endif %}
+
+{% else %}
+<section class="dash-card">
+<h2 style="margin-top:0">My profile</h2>
+{% if profile %}
+<p style="color:var(--muted);margin-top:-6px">Signed in as <b style="color:var(--ink)">{{ profile.get('email') }}</b> · patient #{{ profile.get('patientId') }} · version {{ profile.get('version') }}</p>
+<form method="post"><input type="hidden" name="action" value="profile"><input type="hidden" name="version" value="{{ profile.get('version') }}">
+<div class="profile-grid">
+<div><label for="pf-first">First name <span class="req">*</span></label><input id="pf-first" name="first_name" value="{{ profile.get('firstName') or '' }}" maxlength="75" required></div>
+<div><label for="pf-last">Last name <span class="req">*</span></label><input id="pf-last" name="last_name" value="{{ profile.get('lastName') or '' }}" maxlength="75" required></div>
+<div><label for="pf-email">Email</label><input id="pf-email" value="{{ profile.get('email') or '' }}" class="readonly" readonly title="Email is your sign-in and cannot be changed here"></div>
+<div><label for="pf-phone">Phone <span class="req">*</span></label><input id="pf-phone" name="phone" type="tel" value="{{ profile.get('phone') or '' }}" maxlength="25" required></div>
+<div><label for="pf-dob">Date of birth</label><input id="pf-dob" name="date_of_birth" type="date" value="{{ profile.get('dateOfBirth') or '' }}"></div>
+<div><label for="pf-gender">Gender</label><select id="pf-gender" name="gender"><option value="">Not set</option>{% for g in genders %}<option {{ 'selected' if profile.get('gender') == g else '' }}>{{ g }}</option>{% endfor %}</select></div>
+<div><label for="pf-city">City</label><input id="pf-city" name="city" value="{{ profile.get('city') or '' }}" maxlength="100"></div>
+<div><label for="pf-blood">Blood group</label><select id="pf-blood" name="blood_group"><option value="">Not set</option>{% for b in blood_groups %}<option {{ 'selected' if profile.get('bloodGroup') == b else '' }}>{{ b }}</option>{% endfor %}</select></div>
+<div style="grid-column:1/-1"><label for="pf-address">Address</label><input id="pf-address" name="address" value="{{ profile.get('address') or '' }}" maxlength="500"></div>
+<div><label for="pf-ecn">Emergency contact name</label><input id="pf-ecn" name="emergency_contact_name" value="{{ profile.get('emergencyContactName') or '' }}" maxlength="150"></div>
+<div><label for="pf-ecp">Emergency contact phone</label><input id="pf-ecp" name="emergency_contact_phone" type="tel" value="{{ profile.get('emergencyContactPhone') or '' }}" maxlength="25"></div>
+</div>
+<button class="primary">Save profile</button> <span class="hint" style="margin-left:10px">Last saved {{ (profile.get('updatedAt') or '')[:16]|replace('T', ' ') }} UTC</span>
+</form>
+{% else %}
+<div class="empty-state"><h3>Your profile could not be loaded.</h3><p>Refresh the page, or sign out and in again.</p></div>
+{% endif %}
+</section>
+{% if profile %}
+<section class="danger-zone"><h3>Delete my account</h3><p>This erases your profile details and closes your account. You will be signed out on every device that uses this session. This cannot be undone.</p>
+<form method="post" class="inline" onsubmit="return confirm('Delete your MediSlot account permanently?')"><input type="hidden" name="action" value="delete_account"><input name="confirm" placeholder="Type DELETE" autocomplete="off" aria-label="Type DELETE to confirm" pattern="DELETE" required><button class="danger" type="submit">Delete account</button></form></section>
+{% endif %}
+{% endif %}
+</main>{% endblock %}

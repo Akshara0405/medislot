@@ -62,7 +62,7 @@ jobs:
         run: pytest -q
 
       - name: Python syntax check
-        run: python -m compileall -q lambdas tests
+        run: python -m compileall -q lambdas tests dashboard
 
       - name: Validate CloudFormation templates
         run: |
@@ -196,6 +196,14 @@ jobs:
             unset FLASK_SECRET
           fi
 
+          # Password shared by the two long-lived CI probe doctors used by the Milestone 4 integration tests.
+          CI_PASSWORD_PARAMETER="/medislot/${ENVIRONMENT}/ci/probe-password"
+          if ! aws ssm get-parameter --name "$CI_PASSWORD_PARAMETER" --with-decryption --region "$AWS_REGION" >/dev/null 2>&1; then
+            CI_PASSWORD="$(python -c 'import secrets; print("Ci" + secrets.token_urlsafe(24) + "9")')"
+            aws ssm put-parameter --name "$CI_PASSWORD_PARAMETER" --type SecureString --value "$CI_PASSWORD" --region "$AWS_REGION" >/dev/null
+            unset CI_PASSWORD
+          fi
+
       - name: Deploy data stack
         shell: bash
         run: |
@@ -214,7 +222,7 @@ jobs:
           AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
           BUCKET="medislot-${ENVIRONMENT}-artifacts-${AWS_ACCOUNT_ID}"
 
-          for fn in authentication authorization doctor materializer; do
+          for fn in authentication authorization doctor patient materializer; do
             tmp="$(mktemp -d)"
 
             cp -R "lambdas/${fn}/." "$tmp/"
@@ -321,3 +329,34 @@ jobs:
           assert body.get("connected") is True, result
           '
 #
+      - name: Audit search indexes and EXPLAIN every filter combination
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws lambda invoke \
+            --function-name "medislot-${ENVIRONMENT}-patient" \
+            --payload '{"action":"explain-search"}' \
+            --cli-binary-format raw-in-base64-out \
+            /tmp/explain-search.json \
+            --region "$AWS_REGION" >/dev/null
+          python scripts/explain_report.py /tmp/explain-search.json
+
+      - name: Integration tests against the deployed API (Milestone 4)
+        shell: bash
+        run: |
+          set -euo pipefail
+          pip install --quiet -r requirements-dev.txt
+          export MEDISLOT_API_URL="$(aws cloudformation describe-stacks --stack-name "medislot-${ENVIRONMENT}-auth" --region "$AWS_REGION" --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue | [0]" --output text)"
+          export MEDISLOT_CI_PASSWORD="$(aws ssm get-parameter --name "/medislot/${ENVIRONMENT}/ci/probe-password" --with-decryption --region "$AWS_REGION" --query Parameter.Value --output text)"
+          echo "::add-mask::${MEDISLOT_CI_PASSWORD}"
+          pytest -v tests/integration --junitxml=integration-results.xml
+
+      - name: Publish integration test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m4-integration-results
+          path: |
+            integration-results.xml
+            /tmp/explain-search.json
+          if-no-files-found: ignore
