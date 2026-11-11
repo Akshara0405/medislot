@@ -71,8 +71,9 @@ Resources:
       Runtime: python3.12
       Handler: lambda_function.handler
       Role: !GetAtt AuthenticationRole.Arn
-      Timeout: 20
-      MemorySize: 256
+      # 60 s for the one-off "migrate" action. 512 MB doubles the CPU share, which halves bcrypt time on login/sign-up.
+      Timeout: 60
+      MemorySize: 512
       Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Sub '${ArtifactPrefix}/authentication.zip'}
       VpcConfig:
         SecurityGroupIds: [!ImportValue {Fn::Sub: 'MediSlot-${Environment}-LambdaSecurityGroupId'}]
@@ -240,7 +241,8 @@ Resources:
                 Action: [kms:Decrypt]
                 Resource: '*'
               - Effect: Allow
-                Action: [dynamodb:Query, dynamodb:PutItem]
+                # DeleteItem: removes unbooked slots of consultation types that no longer exist.
+                Action: [dynamodb:Query, dynamodb:PutItem, dynamodb:DeleteItem]
                 Resource:
                   - !Sub
                     - 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${SlotsTable}'
@@ -666,12 +668,21 @@ Resources:
     Properties:
       RestApiId: !Ref RestApi
       Description: !Sub 'MediSlot ${Environment} API deployment - Milestone 4 patient domain and doctor discovery'
+  # One JSON line per API call (success or failure), with total latency, Lambda latency and authorizer latency.
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/medislot-${Environment}-access'
+      RetentionInDays: 30
   ApiStage:
     Type: AWS::ApiGateway::Stage
     Properties:
       RestApiId: !Ref RestApi
       DeploymentId: !Ref ApiDeploymentPatientDomain
       StageName: !Ref Environment
+      AccessLogSetting:
+        DestinationArn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ApiAccessLogGroup}'
+        Format: '{"requestId":"$context.requestId","time":"$context.requestTime","ip":"$context.identity.sourceIp","method":"$context.httpMethod","resource":"$context.resourcePath","path":"$context.path","status":"$context.status","latencyMs":"$context.responseLatency","lambdaLatencyMs":"$context.integration.latency","lambdaStatus":"$context.integration.status","authorizerStatus":"$context.authorizer.status","authorizerLatencyMs":"$context.authorizer.latency","userId":"$context.authorizer.userId","error":"$context.error.message"}'
       MethodSettings:
         - ResourcePath: '/*'
           HttpMethod: '*'

@@ -37,7 +37,7 @@ import pymysql
 from boto3.dynamodb.conditions import Key
 from botocore.config import Config
 
-from common import auth_table, body, config, correlation, dbconn, emit, response, token_hash
+from common import auth_table, body, config, correlation, dbconn, emit, logged, release, response, token_hash
 
 log = logging.getLogger()
 
@@ -47,14 +47,12 @@ SLOT_WINDOW_DAYS = 30            # the materializer keeps today + 29 days of slo
 RANGE_DEFAULT_DAYS = 7
 NEXT_SLOT_LOOKAHEAD_DAYS = 14
 
-TYPE_LABELS = {'QUICK': 'Quick consult', 'STANDARD': 'Standard consult',
-               'DETAILED': 'Detailed consult', 'HEALTH_CAMP': 'Health camp'}
 GENDERS = {'female': 'Female', 'male': 'Male', 'non-binary': 'Non-binary', 'other': 'Other',
            'prefer not to say': 'Prefer not to say'}
 BLOOD_GROUPS = ('A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-')
 DELETE_CONFIRMATION = 'DELETE'
 
-# Columns Milestone 4 adds to `patients` (added automatically by ensure_milestone4_schema in common.py).
+# Columns Milestone 4 added to `patients` (schema/schema.sql; older databases get them from the migrate action).
 M4_PATIENT_COLUMNS = ('city', 'blood_group', 'emergency_contact_name', 'emergency_contact_phone',
                       'profile_version', 'updated_at')
 # Index name -> exact column list. explain-search reports any that are missing or different.
@@ -115,9 +113,17 @@ def positive_id(raw, name):
     return int(raw)
 
 
+_s3 = None
+_slots = None
+
+
 def s3_client():
-    return boto3.client('s3', region_name=os.environ.get('AWS_REGION'),
-                        config=Config(signature_version='s3v4', s3={'addressing_style': 'virtual'}))
+    """Created once per warm Lambda (search results presign one photo per doctor, so this matters)."""
+    global _s3
+    if _s3 is None:
+        _s3 = boto3.client('s3', region_name=os.environ.get('AWS_REGION'),
+                           config=Config(signature_version='s3v4', s3={'addressing_style': 'virtual'}))
+    return _s3
 
 
 def photo_url(key):
@@ -132,7 +138,10 @@ def photo_url(key):
 
 
 def slots_table():
-    return boto3.resource('dynamodb').Table(os.environ['SLOTS_TABLE'])
+    global _slots
+    if _slots is None:
+        _slots = boto3.resource('dynamodb').Table(os.environ['SLOTS_TABLE'])
+    return _slots
 
 
 def zone(name):
@@ -143,12 +152,12 @@ def zone(name):
 
 
 def type_payload(row):
-    code = row['name']
-    capacity = int(row['capacity']) if code == 'HEALTH_CAMP' else 1
-    return {'consultationTypeId': row['consultation_type_id'], 'code': code,
-            'label': TYPE_LABELS.get(code, code.replace('_', ' ').title()),
+    """One consultation type of a doctor. Kind, label, duration and seat limits come from the consultations table."""
+    low, high = int(row.get('min_capacity') or 1), int(row.get('max_capacity') or 1)
+    seats = max(low, min(high, int(row.get('capacity') or 1)))
+    return {'consultationTypeId': int(row['consultation_type_id']), 'code': row['code'], 'label': row['label'],
             'durationMinutes': int(row['duration_min']), 'fee': money(row['fee_amount']), 'currency': 'INR',
-            'seatsPerSlot': capacity, 'groupSession': code == 'HEALTH_CAMP'}
+            'seatsPerSlot': seats, 'groupSession': high > 1}
 
 
 # --------------------------------------------------------------------------- router
@@ -193,6 +202,7 @@ def resolve(event):
     return resource, params
 
 
+@logged('patient')
 def handler(event, context):
     event = event or {}
     if event.get('action') == 'explain-search':
@@ -206,36 +216,30 @@ def handler(event, context):
         known = any(r == resource for _, r in ROUTES)
         return reply(405 if known else 404, {'message': 'Method not allowed' if known else 'Route not found',
                                              'correlationId': cid}, cid)
-    started = time.time()
     conn = None
     try:
         conn = dbconn(config())
         status_body = globals()[name](conn, event, params, cid)
         status, payload = status_body[0], status_body[1]
         headers = status_body[2] if len(status_body) > 2 else None
-        emit('info', 'patient_domain_request', cid, route=f'{method} {resource}', status=status,
-             durationMs=int((time.time() - started) * 1000))
-        return reply(status, payload, cid, headers)
+        return reply(status, payload, cid, headers)        # @logged writes the success line to CloudWatch
     except ApiError as exc:
         rollback(conn)
-        emit('warning', 'patient_domain_rejected', cid, route=f'{method} {resource}', status=exc.status,
-             reason=exc.message)
         return reply(exc.status, {'message': exc.message, 'correlationId': cid, **exc.extra}, cid)
     except pymysql.err.MySQLError as exc:
         rollback(conn)
-        if exc.args and exc.args[0] == 1054:      # unknown column: Milestone 4 SQL not applied yet
-            log.exception('patient_schema_out_of_date correlationId=%s', cid)
-            return reply(503, {'message': 'The database has not been upgraded for Milestone 4 yet. '
-                                          'The automatic upgrade did not finish; check the Lambda logs, then retry.', 'correlationId': cid}, cid)
         raise_internal(exc, cid, method, resource)
+        if exc.args and exc.args[0] in (1054, 1146):      # unknown column / table: schema not migrated
+            return reply(503, {'message': 'The database schema is out of date. Run the migrate action '
+                                          '(deploy pipeline step "Apply database schema"), then retry.',
+                               'correlationId': cid}, cid)
         return reply(500, {'message': 'Internal server error', 'correlationId': cid}, cid)
     except Exception as exc:
         rollback(conn)
         raise_internal(exc, cid, method, resource)
         return reply(500, {'message': 'Internal server error', 'correlationId': cid}, cid)
     finally:
-        if conn:
-            conn.close()
+        release(conn)
 
 
 def rollback(conn):
@@ -247,8 +251,9 @@ def rollback(conn):
 
 
 def raise_internal(exc, cid, method, resource):
-    log.exception('patient_domain_failed route=%s %s correlationId=%s', method, resource, cid)
-    emit('error', 'patient_domain_failed', cid, route=f'{method} {resource}', errorType=type(exc).__name__)
+    log.exception('patient_domain_failed route=%s %s correlationId=%s', method, resource, cid)   # stack trace
+    emit('error', 'patient_domain_failed', cid, route=f'{method} {resource}', errorType=type(exc).__name__,
+         error=str(exc)[:500])
 
 
 def caller(event):
@@ -339,8 +344,9 @@ def search_sql(filters, after=None, limit=PAGE_DEFAULT):
                 'd.languages, d.photo_key, h.hospital_id, h.name AS hospital_name, h.city, '
                 '(SELECT MIN(ct.fee_amount) FROM consultation_types ct '
                 ' WHERE ct.doctor_id = d.user_id AND ct.is_active = TRUE) AS fee_from, '
-                "(SELECT GROUP_CONCAT(ct.name ORDER BY ct.duration_min SEPARATOR ',') FROM consultation_types ct "
-                ' WHERE ct.doctor_id = d.user_id AND ct.is_active = TRUE) AS type_codes '
+                "(SELECT GROUP_CONCAT(c.label ORDER BY c.sort_order SEPARATOR '|') FROM consultation_types ct "
+                ' JOIN consultations c ON c.consultation_id = ct.consultation_id '
+                ' WHERE ct.doctor_id = d.user_id AND ct.is_active = TRUE) AS type_labels '
                 f"{SEARCH_FROM} WHERE {' AND '.join(page_where)} "
                 'ORDER BY d.last_name, d.first_name, d.user_id LIMIT %s')
     page_args.append(limit + 1)                 # one extra row tells us whether another page exists
@@ -392,7 +398,7 @@ def search_doctors(conn, event, params, cid):
     rows = rows[:limit]
     items = []
     for r in rows:
-        codes = [c for c in (r.get('type_codes') or '').split(',') if c]
+        labels = [c for c in (r.get('type_labels') or '').split('|') if c]
         items.append({
             'doctorId': int(r['user_id']),
             'name': f"Dr. {r['first_name']} {r['last_name']}",
@@ -400,8 +406,8 @@ def search_doctors(conn, event, params, cid):
             'specialization': r['specialization'], 'qualification': r['qualification'],
             'experienceYears': int(r['experience_years'] or 0), 'languages': r.get('languages'),
             'hospital': {'hospitalId': int(r['hospital_id']), 'name': r['hospital_name'], 'city': r['city']},
-            'feeFrom': money(r.get('fee_from')), 'consultationTypes': [TYPE_LABELS.get(c, c) for c in codes],
-            'acceptingBookings': bool(codes), 'photoUrl': photo_url(r.get('photo_key')),
+            'feeFrom': money(r.get('fee_from')), 'consultationTypes': labels,
+            'acceptingBookings': bool(labels), 'photoUrl': photo_url(r.get('photo_key')),
         })
     applied = dict(filters)
     if 'name' in applied:
@@ -434,8 +440,10 @@ def load_doctor(cur, doctor_id):
     row = cur.fetchone()
     if not row:
         raise ApiError(404, 'Doctor not found')
-    cur.execute('SELECT consultation_type_id, name, duration_min, fee_amount, capacity FROM consultation_types '
-                'WHERE doctor_id = %s AND is_active = TRUE ORDER BY duration_min, name', (doctor_id,))
+    cur.execute('SELECT t.consultation_type_id, t.fee_amount, t.capacity, c.code, c.label, c.duration_min, '
+                'c.min_capacity, c.max_capacity FROM consultation_types t '
+                'JOIN consultations c ON c.consultation_id = t.consultation_id '
+                'WHERE t.doctor_id = %s AND t.is_active = TRUE ORDER BY c.sort_order', (doctor_id,))
     return row, cur.fetchall()
 
 
@@ -452,7 +460,7 @@ def day_slots(table, doctor_id, day_iso):
 
 def seat_view(item, types, tz, now_utc):
     """Patient-facing view of one Slots item, or None when the patient should not see it."""
-    ctype = types.get(item.get('consultation_type_id'))
+    ctype = types.get(str(item.get('consultation_type_id')))     # DynamoDB stores the id as text
     if not ctype:
         return None                                   # type deactivated since the slot was generated
     try:
@@ -483,7 +491,7 @@ def doctor_profile(conn, event, params, cid):
     tz = zone(tz_name)
     next_open = None
     if types:
-        table, by_id = slots_table(), {t['consultationTypeId']: t for t in types}
+        table, by_id = slots_table(), {str(t['consultationTypeId']): t for t in types}
         now_utc, today = datetime.now(timezone.utc), datetime.now(tz).date()
         for offset in range(NEXT_SLOT_LOOKAHEAD_DAYS):
             day = today + timedelta(days=offset)
@@ -515,11 +523,12 @@ def doctor_slots(conn, event, params, cid):
     q = query_params(event)
     with conn.cursor() as cur:
         row, type_rows = load_doctor(cur, doctor_id)
-    types = {t['consultation_type_id']: type_payload(t) for t in type_rows}
-    if q.get('consultationTypeId'):
-        if q['consultationTypeId'] not in types:
+    types = {str(t['consultation_type_id']): type_payload(t) for t in type_rows}
+    wanted = q.get('consultationTypeId')
+    if wanted:
+        if wanted not in types:
             raise ApiError(400, 'consultationTypeId is not an active consultation type of this doctor')
-        types = {q['consultationTypeId']: types[q['consultationTypeId']]}
+        types = {wanted: types[wanted]}
     include_full = q.get('includeFull', 'true').lower()
     if include_full not in ('true', 'false'):
         raise ApiError(400, 'includeFull must be true or false')
@@ -553,7 +562,7 @@ def doctor_slots(conn, event, params, cid):
     day = first
     while day <= last:
         raw = day_slots(table, doctor_id, day.isoformat()) if types else []
-        relevant = [i for i in raw if i.get('consultation_type_id') in types]
+        relevant = [i for i in raw if str(i.get('consultation_type_id')) in types]
         views = [v for v in (seat_view(i, types, tz, now_utc) for i in relevant) if v]
         visible = [v for v in views if v['status'] != 'CLOSED' and (include_full or v['freeSeats'] > 0)]
         visible.sort(key=lambda v: (v['startsAt'], v['label']))
@@ -569,7 +578,7 @@ def doctor_slots(conn, event, params, cid):
         shown += len(visible)
         day += timedelta(days=1)
     return 200, {'doctorId': doctor_id, 'timezone': tz_name, 'from': first.isoformat(), 'to': last.isoformat(),
-                 'consultationTypeId': q.get('consultationTypeId') or None, 'includeFull': include_full,
+                 'consultationTypeId': int(wanted) if wanted else None, 'includeFull': include_full,
                  'summary': {'days': len(days), 'slotsShown': shown, 'bookableSlots': bookable, 'freeSeats': total_free},
                  'notices': notices, 'days': days}
 
@@ -846,10 +855,9 @@ def explain_search():
                              for r in cur.fetchall()]
                     plans.append({'filters': list(combo) or ['(none)'], 'doctorsStep': next(
                         (s for s in steps if s['table'] == 'd'), None), 'plan': steps})
-        conn.rollback()
         return {'statusCode': 200, 'body': {'missingIndexes': missing, 'missingColumns': missing_columns,
                                             'doctorRows': doctor_rows, 'indexes': present, 'plans': plans,
                                             'note': 'With only a handful of rows MySQL may still choose a full scan; '
                                                     'possibleKeys shows the index is a candidate.'}}
     finally:
-        conn.close()
+        release(conn)

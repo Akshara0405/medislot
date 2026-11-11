@@ -1,4 +1,4 @@
-"""Rules enforced by the doctor Lambda: no overlapping patterns, fixed capacity per type."""
+"""Rules enforced by the doctor Lambda: no overlapping patterns, capacity limits from the consultations table."""
 import importlib.util, json, os, sys
 import pytest
 os.environ.setdefault('AWS_DEFAULT_REGION', 'ap-south-1')
@@ -9,10 +9,18 @@ sys.path.insert(0, ROOT)
 _spec = importlib.util.spec_from_file_location('doctor_lambda', os.path.join(ROOT, 'doctor', 'lambda_function.py'))
 lf = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(lf)
 
-TYPES = {
-    'quick':    {'name': 'QUICK',       'duration_min': 15},
-    'detailed': {'name': 'DETAILED',    'duration_min': 30},   # 30 min so 09:00-09:30 is a valid length
-    'camp':     {'name': 'HEALTH_CAMP', 'duration_min': 60},
+# The doctor's active consultation types (ids are AUTO_INCREMENT integers) and the consultations table.
+TYPE_IDS = {'quick': 1, 'detailed': 2, 'camp': 3}
+TYPES = [
+    {'consultation_type_id': 1, 'name': 'QUICK', 'label': 'Quick consult', 'duration_min': 15},
+    {'consultation_type_id': 2, 'name': 'DETAILED', 'label': 'Detailed consult', 'duration_min': 30},  # 30 so 09:00-09:30 fits
+    {'consultation_type_id': 3, 'name': 'HEALTH_CAMP', 'label': 'Health camp', 'duration_min': 60},
+]
+CONSULTATIONS = {
+    'QUICK': {'consultation_id': 1, 'code': 'QUICK', 'label': 'Quick consult', 'duration_min': 15, 'min_capacity': 1, 'max_capacity': 1},
+    'STANDARD': {'consultation_id': 2, 'code': 'STANDARD', 'label': 'Standard consult', 'duration_min': 30, 'min_capacity': 1, 'max_capacity': 1},
+    'DETAILED': {'consultation_id': 3, 'code': 'DETAILED', 'label': 'Detailed consult', 'duration_min': 60, 'min_capacity': 1, 'max_capacity': 1},
+    'HEALTH_CAMP': {'consultation_id': 4, 'code': 'HEALTH_CAMP', 'label': 'Health camp', 'duration_min': 60, 'min_capacity': 2, 'max_capacity': 10},
 }
 
 
@@ -23,17 +31,24 @@ def no_dynamodb(monkeypatch):
 
 
 class Cur:
-    def __init__(self): self.rows = []; self.saved = []; self.types_written = []
+    def __init__(self): self.rows = []; self.saved = []; self.types_written = []; self.lastrowid = 0; self.rowcount = 0
     def __enter__(self): return self
     def __exit__(self, *a): return False
     def execute(self, sql, params=()):
         s = ' '.join(sql.split())
-        if s.startswith('SELECT') and 'FROM consultation_types' in s and 'is_active=1' in s:
-            self.rows = [TYPES[params[0]]] if params[0] in TYPES else []
-        elif s.startswith('INSERT INTO availability_patterns'): self.saved.append(params)
-        elif s.startswith('INSERT INTO consultation_types'): self.types_written.append(params)
-        elif s.startswith('UPDATE consultation_types'): self.types_written.append(params); self.rowcount = 1
-        else: self.rows = []
+        if 'FROM consultation_types t JOIN consultations c' in s and 't.is_active = 1' in s:
+            self.rows = list(TYPES)
+        elif s.startswith('SELECT * FROM consultations WHERE code'):
+            self.rows = [CONSULTATIONS[params[0]]] if params[0] in CONSULTATIONS else []
+        elif s.startswith('INSERT INTO consultation_types'):
+            self.types_written.append(params); self.lastrowid = 10 + len(self.types_written)
+        elif s.startswith('UPDATE consultation_types'):
+            self.types_written.append(params); self.rowcount = 1
+        else:
+            self.rows = []            # no existing patterns, no existing type rows
+    def executemany(self, sql, rows):
+        if sql.startswith('INSERT INTO availability_patterns'):
+            self.saved.extend(rows)
     def fetchone(self): return self.rows[0] if self.rows else None
     def fetchall(self): return self.rows
 
@@ -42,6 +57,7 @@ class Conn:
     def __init__(self): self.c = Cur()
     def cursor(self): return self.c
     def commit(self): pass
+    def rollback(self): pass
     def close(self): pass
 
 
@@ -57,7 +73,7 @@ def call(monkeypatch, method, path, payload):
 
 
 def pattern(tid, start, end, day=0):
-    return {'day_of_week': day, 'consultation_type_id': tid, 'start_time': start, 'end_time': end}
+    return {'day_of_week': day, 'consultation_type_id': TYPE_IDS[tid], 'start_time': start, 'end_time': end}
 
 
 def put_patterns(monkeypatch, patterns):
@@ -109,8 +125,8 @@ def test_long_range_hides_a_later_overlap_no_more(monkeypatch):
     assert code == 400
 
 
-def type_payload(name, capacity, duration=15):
-    return {'name': name, 'duration_min': duration, 'capacity': capacity, 'fee_amount': '500'}
+def type_payload(name, capacity):
+    return {'name': name, 'capacity': capacity, 'fee_amount': '500'}
 
 
 def test_normal_types_must_have_capacity_exactly_1(monkeypatch):
@@ -125,10 +141,10 @@ def test_normal_types_must_have_capacity_exactly_1(monkeypatch):
 
 def test_health_camp_capacity_range(monkeypatch):
     for bad in (1, 0, 11, 50):
-        code, out, _ = call(monkeypatch, 'POST', '/doctor/me/consultation-types', type_payload('HEALTH_CAMP', bad, 60))
+        code, out, _ = call(monkeypatch, 'POST', '/doctor/me/consultation-types', type_payload('HEALTH_CAMP', bad))
         assert code == 400 and 'health camp' in out['message'].lower()
     for good in (2, 3, 5, 10):
-        code, _, _ = call(monkeypatch, 'POST', '/doctor/me/consultation-types', type_payload('HEALTH_CAMP', good, 60))
+        code, _, _ = call(monkeypatch, 'POST', '/doctor/me/consultation-types', type_payload('HEALTH_CAMP', good))
         assert code == 201
 
 
@@ -144,3 +160,23 @@ def test_if_the_booking_check_breaks_nothing_is_saved(monkeypatch):
     monkeypatch.setattr(lf, 'find_booking_conflicts', boom)
     code, out, cur = put_patterns(monkeypatch, [pattern('quick', '09:00', '09:30')])
     assert code == 503 and cur.saved == [] and 'nothing was saved' in out['message'].lower()
+
+
+def test_unknown_consultation_and_wrong_duration_are_rejected(monkeypatch):
+    code, out, _ = call(monkeypatch, 'POST', '/doctor/me/consultation-types', type_payload('MASSAGE', 1))
+    assert code == 400 and 'Unknown consultation' in out['message']
+    code, out, _ = call(monkeypatch, 'POST', '/doctor/me/consultation-types', dict(type_payload('QUICK', 1), duration_min=60))
+    assert code == 400 and '15 minutes' in out['message']
+
+
+def test_new_type_returns_its_integer_id(monkeypatch):
+    code, out, cur = call(monkeypatch, 'POST', '/doctor/me/consultation-types', type_payload('STANDARD', 1))
+    assert code == 201 and out['consultationTypeId'] == 11
+    assert cur.types_written[0][:2] == (7, 2)          # doctor 7, consultation_id of STANDARD
+
+
+def test_non_numeric_ids_are_rejected(monkeypatch):
+    code, out, _ = call(monkeypatch, 'PUT', '/doctor/me/consultation-types/1f0c-uuid', type_payload('QUICK', 1))
+    assert code == 400 and 'whole number' in out['message']
+    code, out, _ = put_patterns(monkeypatch, [{'day_of_week': 0, 'consultation_type_id': 'abc', 'start_time': '09:00', 'end_time': '10:00'}])
+    assert code == 400 and 'Unknown or inactive' in out['message']

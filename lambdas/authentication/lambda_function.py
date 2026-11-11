@@ -1,33 +1,30 @@
-import json
-import os
 import re
 import secrets
 import time
 import uuid
-import logging
 
 import bcrypt
 import jwt
-from botocore.exceptions import ClientError
 
-from common import SEED_HOSPITALS, auth_table, body, config, correlation, dbconn, emit, get_param, response, token_hash
+from common import auth_table, body, config, correlation, dbconn, emit, get_param, logged, release, response, token_hash
 
 
+@logged("authentication")
 def handler(event, context):
     event = event or {}
-    # A direct invocation used by the deployment pipeline to verify private RDS connectivity.
-    if event.get("action") == "health":
-        conn = None
+    # Direct invocations used by the deployment pipeline (not reachable through API Gateway).
+    if event.get("action") in ("health", "migrate"):
+        conn = dbconn(config())
         try:
-            c = config()
-            conn = dbconn(c)
+            if event["action"] == "migrate":
+                import migrate
+                return {"statusCode": 200, "body": migrate.run(conn)}
             with conn.cursor() as cur:
                 cur.execute("SELECT 1 AS connected")
                 row = cur.fetchone()
             return {"statusCode": 200, "body": {"connected": bool(row and row["connected"] == 1)}}
         finally:
-            if conn:
-                conn.close()
+            release(conn)
 
     cid = correlation(event)
     path = str(event.get("path", "")).rstrip("/").lower()
@@ -54,35 +51,23 @@ def handler(event, context):
             return response(200, {"userId": ctx.get("userId"), "role": ctx.get("role"), "message": "Authorization successful"})
         return response(404, {"message": "Route not found", "correlationId": cid})
     except Exception as exc:
-        # Keep the public response generic, but preserve the real failure in CloudWatch.
-        logging.getLogger().exception("authentication_request_failed route=%s correlationId=%s errorType=%s",
-                                      path, cid, type(exc).__name__)
-        emit("error", "authentication_request_failed", cid, route=path, errorType=type(exc).__name__)
+        # Keep the public response generic; the real error and stack trace go to CloudWatch.
+        emit("error", "authentication_request_failed", cid, route=path, errorType=type(exc).__name__,
+             error=str(exc)[:500])
         return response(500, {"message": "Internal server error", "correlationId": cid})
 
 
 def list_hospitals(cid):
     """Public list used by the doctor sign-up and profile dropdowns."""
+    # Read only. Hospitals are seeded once by the migration (schema/schema.sql), not on every request.
     conn = dbconn(config())
     try:
         with conn.cursor() as cur:
-            # Re-seed idempotently on this public read as well. This repairs an empty
-            # hospitals table even when this Lambda execution environment is warm.
-            cur.executemany(
-                "INSERT IGNORE INTO hospitals (name, city, address) VALUES (%s,%s,%s)",
-                SEED_HOSPITALS,
-            )
-            conn.commit()
             cur.execute("SELECT hospital_id, name, city FROM hospitals WHERE is_active=TRUE ORDER BY name, city")
             items = [{"hospital_id": int(r["hospital_id"]), "name": r["name"], "city": r["city"]} for r in cur.fetchall()]
-        emit("info", "hospital_list_loaded", cid, count=len(items))
         return response(200, {"items": items})
-    except Exception:
-        conn.rollback()
-        logging.getLogger().exception("hospital_list_query_failed correlationId=%s", cid)
-        raise
     finally:
-        conn.close()
+        release(conn)
 
 
 def register(data, role, cid):
@@ -131,12 +116,19 @@ def register(data, role, cid):
     conn = dbconn(c)
     try:
         with conn.cursor() as cur:
+            # Check everything that could make an INSERT fail BEFORE inserting. A failed or rolled-back
+            # INSERT still uses up an AUTO_INCREMENT number, which is what left gaps like 1,2,3,4,7,9.
+            cur.execute("SELECT 1 FROM users WHERE email=%s", (email,))
+            if cur.fetchone():
+                return response(409, {"message": "Unable to register with those details", "correlationId": cid})
             if role == "doctor":
                 cur.execute("SELECT hospital_id FROM hospitals WHERE hospital_id=%s AND is_active=TRUE", (hospital_id,))
                 if not cur.fetchone():
-                    conn.rollback()
                     return response(400, {"message": "hospitalId must reference an existing active hospital", "correlationId": cid})
-            cur.execute("INSERT INTO users(email,password_hash,role,full_name) VALUES(%s,%s,%s,NULL)", (email, hashed, role))
+                cur.execute("SELECT 1 FROM doctors WHERE license_number=%s", (license_number,))
+                if cur.fetchone():
+                    return response(409, {"message": "Unable to register with those details", "correlationId": cid})
+            cur.execute("INSERT INTO users(email,password_hash,role) VALUES(%s,%s,%s)", (email, hashed, role))
             user_id = int(cur.lastrowid)
             if role == "patient":
                 cur.execute("""INSERT INTO patients(user_id,first_name,last_name,phone,date_of_birth,gender,address)
@@ -150,11 +142,11 @@ def register(data, role, cid):
         conn.commit()
     except Exception as exc:
         conn.rollback()
-        if "Duplicate entry" in str(exc):
+        if "Duplicate entry" in str(exc):      # two sign-ups racing with the same email/licence
             return response(409, {"message": "Unable to register with those details", "correlationId": cid})
         raise
     finally:
-        conn.close()
+        release(conn)
     emit("info", "registration_succeeded", cid, role=role, userId=str(user_id))
     return response(201, {"userId": str(user_id), "role": role, "message": "Registration successful"})
 
@@ -177,7 +169,7 @@ def login(data, cid):
             cur.execute("SELECT user_id,password_hash,role,is_active FROM users WHERE email=%s", (email,))
             user = cur.fetchone()
     finally:
-        conn.close()
+        release(conn)
     if not user or not user["is_active"] or not bcrypt.checkpw(password.encode(), user["password_hash"].encode()):
         emit("warning", "login_rejected", cid)
         return response(401, {"message": "Invalid email or password", "correlationId": cid})
@@ -222,5 +214,6 @@ def logout(event, data, cid):
         if item and item.get("user_id") == claims["sub"]:
             table.delete_item(Key={"token_key": key, "token_type": "REFRESH"})
     table.put_item(Item={"token_key": "JTI#" + claims["jti"], "token_type": "DENYLIST", "user_id": claims["sub"], "created_at": int(time.time()), "expires_at": int(claims["exp"]), "status": "REVOKED"})
+    emit("info", "logout_succeeded", cid, userId=claims["sub"])
     return response(200, {"message": "Logged out"})
     

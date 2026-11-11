@@ -1,0 +1,78 @@
+{# Registration page for BOTH roles. app.py passes role = 'doctor' or 'patient' and the form values. #}
+{% extends 'base.html' %}
+{% set doctor = role == 'doctor' %}
+{% block title %}{{ 'Create doctor profile' if doctor else 'Create patient account' }} · MediSlot{% endblock %}
+{% block content %}
+<main class="shell auth-wrap">
+  <aside class="auth-aside{{ '' if doctor else ' aside-patient' }}">
+    {% if doctor %}
+      <div><span class="aside-pill">Join the care network</span><h2>Your expertise deserves a space that feels like you.</h2>
+        <p>Build your professional presence on MediSlot. Add your details once and step into your doctor workspace.</p></div>
+      <div><p class="lime-note">✦ Your profile. Your practice. Your pace.</p>
+        <p>Looking for a doctor instead? <a href="/patient/register" class="lime-note">Register as a patient</a>.</p></div>
+    {% else %}
+      <div><span class="aside-pill">Patient registration</span><h2>One profile.<br>Every doctor you need.</h2>
+        <p>Tell us a little about yourself once. Your city sets the default for doctor search, and your emergency contact is ready for when you book.</p></div>
+      <div><p class="lime-note">✦ Only you can read your profile.</p><p>Fields marked * are required.</p></div>
+    {% endif %}
+  </aside>
+
+  <section class="auth-panel">
+    {% if doctor %}
+      <span class="eyebrow">Doctor registration</span><h1>Create your profile</h1>
+      <p class="auth-sub">Fields marked * are required. Choose your specialisation and hospital from the lists, and enter your professional licence details.</p>
+    {% else %}
+      <span class="eyebrow warm"><span class="dot"></span> Join MediSlot</span><h1>Create your account</h1>
+      <p class="auth-sub">It takes about a minute.</p>
+    {% endif %}
+
+    <form method="post" id="register-form" {% if doctor %}enctype="multipart/form-data"{% else %}novalidate{% endif %}>
+      <div class="form-grid">
+        {# ---------- fields both roles share ---------- #}
+        <div class="field"><label for="first_name">FIRST NAME *</label><input id="first_name" name="first_name" value="{{ values.get('first_name','') }}" autocomplete="given-name" maxlength="75" required></div>
+        <div class="field"><label for="last_name">LAST NAME *</label><input id="last_name" name="last_name" value="{{ values.get('last_name','') }}" autocomplete="family-name" maxlength="75" required></div>
+        <div class="field"><label for="email">EMAIL ADDRESS *</label><input id="email" name="email" type="email" value="{{ values.get('email','') }}" autocomplete="email" maxlength="254" required></div>
+        <div class="field"><label for="phone">PHONE NUMBER *</label><input id="phone" name="phone" type="tel" value="{{ values.get('phone','') }}" autocomplete="tel" maxlength="25" pattern="\+?[0-9][0-9 \-]{5,22}" title="7 to 15 digits" required></div>
+
+        {% if doctor %}
+        {# ---------- doctor only ---------- #}
+        <div class="field"><label for="specialization">SPECIALISATION *</label><select id="specialization" name="specialization" required>
+          <option value="" disabled {{ '' if values.get('specialization') else 'selected' }}>Select your specialisation</option>
+          {% for sp in specializations %}<option value="{{ sp }}" {{ 'selected' if values.get('specialization') == sp else '' }}>{{ sp }}</option>{% endfor %}
+        </select></div>
+        <div class="field"><label for="qualification">QUALIFICATION *</label><input id="qualification" name="qualification" value="{{ values.get('qualification','') }}" placeholder="e.g. MBBS, MD" maxlength="150" required></div>
+        <div class="field"><label for="license_number">MEDICAL LICENCE NUMBER *</label><input id="license_number" name="license_number" value="{{ values.get('license_number','') }}" placeholder="TN-123456" pattern="[A-Za-z]{2}-[0-9]{6}" title="Format: two-letter state code, hyphen, six digits" required><span class="hint">Format: XX-123456</span></div>
+        <div class="field"><label for="hospital_id">HOSPITAL *</label><select id="hospital_id" name="hospital_id" required>
+          <option value="" disabled {{ '' if values.get('hospital_id') else 'selected' }}>{{ 'Select your hospital' if hospitals else 'Hospitals unavailable - refresh the page' }}</option>
+          {% for h in hospitals %}<option value="{{ h.hospital_id }}" {{ 'selected' if values.get('hospital_id')|string == h.hospital_id|string else '' }}>{{ h.name }}{{ ' · ' ~ h.city if h.city else '' }}</option>{% endfor %}
+        </select><span class="hint">Pick the hospital you practise at.</span></div>
+        <div class="field"><label for="experience_years">YEARS OF EXPERIENCE *</label><input id="experience_years" name="experience_years" type="number" min="0" max="80" value="{{ values.get('experience_years','') }}" required></div>
+        <div class="field full"><label for="photo">PROFILE PHOTO *</label><div class="photo-box"><div class="photo-preview" id="photo-preview">＋</div>
+          <div style="flex:1"><input id="photo" name="photo" type="file" accept="image/jpeg,image/png,image/webp" required><div class="hint">JPG, PNG or WEBP · Maximum 5 MB · A clear professional headshot works best.</div></div></div></div>
+
+        {% else %}
+        {# ---------- patient only ---------- #}
+        <div class="field"><label for="date_of_birth">DATE OF BIRTH *</label><input id="date_of_birth" name="date_of_birth" type="date" value="{{ values.get('date_of_birth','') }}" required></div>
+        <div class="field"><label for="gender">GENDER *</label><select id="gender" name="gender" required>
+          <option value="" disabled {{ '' if values.get('gender') else 'selected' }}>Select</option>
+          {% for g in genders %}<option {{ 'selected' if values.get('gender') == g else '' }}>{{ g }}</option>{% endfor %}
+        </select></div>
+        <div class="field"><label for="city">CITY *</label><input id="city" name="city" list="city-list" value="{{ values.get('city','') }}" maxlength="100" autocomplete="address-level2" required>
+          <datalist id="city-list">{% for c in cities %}<option value="{{ c }}">{% endfor %}</datalist><span class="hint">Doctor search starts in your city.</span></div>
+        <div class="field"><label for="blood_group">BLOOD GROUP</label><select id="blood_group" name="blood_group"><option value="">Not sure / skip</option>
+          {% for b in blood_groups %}<option {{ 'selected' if values.get('blood_group') == b else '' }}>{{ b }}</option>{% endfor %}</select></div>
+        <div class="field full"><label for="address">ADDRESS</label><input id="address" name="address" value="{{ values.get('address','') }}" maxlength="500" autocomplete="street-address"></div>
+        <div class="field"><label for="emergency_contact_name">EMERGENCY CONTACT NAME</label><input id="emergency_contact_name" name="emergency_contact_name" value="{{ values.get('emergency_contact_name','') }}" maxlength="150"></div>
+        <div class="field"><label for="emergency_contact_phone">EMERGENCY CONTACT PHONE</label><input id="emergency_contact_phone" name="emergency_contact_phone" type="tel" value="{{ values.get('emergency_contact_phone','') }}" maxlength="25" pattern="\+?[0-9][0-9 \-]{5,22}" title="7 to 15 digits"></div>
+        {% endif %}
+
+        <div class="field"><label for="password">PASSWORD *</label><input id="password" name="password" type="password" minlength="10" autocomplete="new-password" required><span class="hint">At least 10 characters, including a letter and a number.</span></div>
+        <div class="field"><label for="confirm_password">CONFIRM PASSWORD *</label><input id="confirm_password" name="confirm_password" type="password" minlength="10" autocomplete="new-password" required></div>
+      </div>
+      <button class="primary form-submit" type="submit" id="submit-btn">{{ 'Create my doctor account' if doctor else 'Create my patient account' }}&nbsp; ↗</button>
+    </form>
+    <div class="switch-auth">Already registered? <a href="{{ '/doctor/login' if doctor else '/patient/login' }}">Sign in</a></div>
+    <div class="switch-auth"><a href="/">← Back to home</a></div>
+  </section>
+</main>
+{% endblock %}

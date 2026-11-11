@@ -13,7 +13,9 @@ Rules
     the blackout re-opens them.
   * A single slot can also be closed by hand: its DynamoDB item carries manual_block=True and stays CLOSED
     (booking untouched) until the doctor re-opens it.
-  * Capacity is 1 for every type except HEALTH_CAMP (one patient at a time).
+  * Seats per slot come from the doctor's consultation type, kept inside the
+    min/max capacity of its row in the `consultations` table (1 for normal
+    consultations, 2-10 for a health camp).
   * Slots that already have bookings/holds are never deleted or overwritten;
     on a blackout day they are only switched to CLOSED (the booking stays).
   * Re-running is safe (idempotent): it only adds what is missing, removes
@@ -30,7 +32,15 @@ from boto3.dynamodb.conditions import Key
 WINDOW_DAYS = 30
 DEFAULT_TZ = 'Asia/Kolkata'
 OPEN, CLOSED, FULL = 'OPEN', 'CLOSED', 'FULL'
-CAMP_MIN_CAPACITY, CAMP_MAX_CAPACITY = 2, 10
+_table = None
+
+
+def slots_table():
+    """DynamoDB Slots table, created once per warm Lambda."""
+    global _table
+    if _table is None:
+        _table = boto3.resource('dynamodb').Table(os.environ['SLOTS_TABLE'])
+    return _table
 
 
 def query_schedule_window(table, doctor_id, first_day, days=WINDOW_DAYS):
@@ -54,11 +64,10 @@ def query_schedule_window(table, doctor_id, first_day, days=WINDOW_DAYS):
     return sorted(items, key=lambda item: (item.get('local_date', ''), item.get('start_at', '')))
 
 
-def effective_capacity(type_name, stored):
-    """1 for every normal consultation; a health camp keeps its configured group size."""
-    if type_name != 'HEALTH_CAMP':
-        return 1
-    return max(CAMP_MIN_CAPACITY, min(CAMP_MAX_CAPACITY, int(stored)))
+def effective_capacity(row):
+    """The doctor's seats per slot, kept within the consultation's min/max (consultations table)."""
+    low, high = int(row.get('min_capacity') or 1), int(row.get('max_capacity') or 1)
+    return max(low, min(high, int(row.get('capacity') or 1)))
 
 
 def as_time(value):
@@ -119,10 +128,12 @@ def doctor_timezone(cur, doctor_id):
 
 def desired_slots(cur, doctor_id, first_day, days, tz_name):
     """{iso_day: {slot_id: item}} for every day of the window."""
-    cur.execute("""SELECT a.day_of_week, a.start_time, a.end_time, t.consultation_type_id, t.name AS type_name, t.duration_min, t.capacity
+    cur.execute("""SELECT a.day_of_week, a.start_time, a.end_time, t.consultation_type_id, t.capacity,
+                          c.code AS type_name, c.duration_min, c.min_capacity, c.max_capacity
                    FROM availability_patterns a
-                   JOIN consultation_types t ON t.consultation_type_id=a.consultation_type_id
-                   WHERE a.doctor_id=%s AND t.is_active=1""", (doctor_id,))
+                   JOIN consultation_types t ON t.consultation_type_id = a.consultation_type_id
+                   JOIN consultations c ON c.consultation_id = t.consultation_id
+                   WHERE a.doctor_id = %s AND t.is_active = 1""", (doctor_id,))
     patterns = cur.fetchall()
     cur.execute('SELECT blackout_date FROM blackout_dates WHERE doctor_id=%s', (doctor_id,))
     blocked = {str(r['blackout_date']) for r in cur.fetchall()}
@@ -135,7 +146,7 @@ def desired_slots(cur, doctor_id, first_day, days, tz_name):
         for p in patterns:
             if int(p['day_of_week']) != day.weekday():
                 continue
-            capacity = effective_capacity(p.get('type_name'), p['capacity'])
+            capacity = effective_capacity(p)
             for item in generate_slots(doctor_id, p['consultation_type_id'], day, tz_name,
                                        as_time(p['start_time']), as_time(p['end_time']),
                                        int(p['duration_min']), capacity, status):
@@ -197,7 +208,7 @@ def find_booking_conflicts(cur, doctor_id, patterns, days=WINDOW_DAYS, table=Non
     `patterns` is the weekly list about to be saved: dicts with day_of_week, start_time, end_time
     (time or 'HH:MM'), consultation_type_id and duration_min.
     """
-    table = table or boto3.resource('dynamodb').Table(os.environ['SLOTS_TABLE'])
+    table = table or slots_table()
     tz_name = doctor_timezone(cur, doctor_id)
     tz = ZoneInfo(tz_name)
     first_day = today or datetime.now(tz).date()
@@ -230,7 +241,7 @@ def _open_status(item):
 
 def resync_slots(cur, doctor_id, days=WINDOW_DAYS, table=None, today=None):
     """Bring DynamoDB in line with MySQL. Returns counts of what changed."""
-    table = table or boto3.resource('dynamodb').Table(os.environ['SLOTS_TABLE'])
+    table = table or slots_table()
     tz_name = doctor_timezone(cur, doctor_id)
     first_day = today or datetime.now(ZoneInfo(tz_name)).date()
     plan = desired_slots(cur, doctor_id, first_day, days, tz_name)

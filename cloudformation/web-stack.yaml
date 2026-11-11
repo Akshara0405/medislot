@@ -38,6 +38,19 @@ Resources:
               - Effect: Allow
                 Action: [s3:GetObject]
                 Resource: !Sub arn:${AWS::Partition}:s3:::${ArtifactBucket}/${DashboardArtifactKey}
+        - PolicyName: WriteDashboardLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams]
+                Resource: !Sub '${DashboardLogGroup.Arn}'
+  # Every page request of the Flask app (success or failure), sent by watchtower from app.py.
+  DashboardLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/medislot/${Environment}/dashboard'
+      RetentionInDays: 30
   DashboardInstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:

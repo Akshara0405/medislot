@@ -1,3 +1,39 @@
-{% extends 'base.html' %}{% block title %}Doctor sign in · MediSlot{% endblock %}{% block content %}
-<main class="shell auth-wrap"><aside class="auth-aside"><div><span class="aside-pill">Doctor workspace</span><h2>Welcome back.<br>Let's make care happen.</h2><p>Your practice, your schedule, your professional space — all in one place.</p></div><p>✳ &nbsp; MediSlot keeps your care journey moving.</p></aside>
-<section class="auth-panel"><span class="eyebrow">Good to see you again</span><h1>Doctor sign in</h1><p class="auth-sub">Sign in with the email and password linked to your doctor account.</p><form method="post"><div class="field"><label for="email">EMAIL ADDRESS *</label><input id="email" name="email" type="email" autocomplete="email" placeholder="you@clinic.com" value="{{ email or '' }}" required></div><div class="field" style="margin-top:16px"><label for="password">PASSWORD *</label><input id="password" name="password" type="password" autocomplete="current-password" placeholder="Enter your password" required></div><button class="primary form-submit" type="submit">Sign in to dashboard&nbsp; ↗</button></form><div class="switch-auth">New to MediSlot? <a href="/doctor/signup">Create your doctor profile</a></div><div class="switch-auth"><a href="/">← Back to home</a></div></section></main>{% endblock %}
+{# Sign-in page for BOTH roles. app.py passes role = 'doctor' or 'patient'. #}
+{% extends 'base.html' %}
+{% set doctor = role == 'doctor' %}
+{% block title %}{{ 'Doctor' if doctor else 'Patient' }} sign in · MediSlot{% endblock %}
+{% block content %}
+<main class="shell auth-wrap">
+  <aside class="auth-aside{{ '' if doctor else ' aside-patient' }}">
+    {% if doctor %}
+      <div><span class="aside-pill">Doctor workspace</span><h2>Welcome back.<br>Let's make care happen.</h2>
+        <p>Your practice, your schedule, your professional space — all in one place.</p></div>
+      <p>✳ &nbsp; MediSlot keeps your care journey moving.</p>
+    {% else %}
+      <div><span class="aside-pill">Patient space</span><h2>The right doctor,<br>at a time that works.</h2>
+        <p>Search by name, hospital, specialisation or city, and see exactly how many seats are still free in every slot.</p></div>
+      <p>♡ &nbsp; Your details stay yours: only you can open your profile.</p>
+    {% endif %}
+  </aside>
+
+  <section class="auth-panel">
+    <span class="eyebrow{{ '' if doctor else ' warm' }}"><span class="dot"></span> {{ 'Good to see you again' if doctor else 'Welcome back' }}</span>
+    <h1>{{ 'Doctor' if doctor else 'Patient' }} sign in</h1>
+    <p class="auth-sub">{{ 'Sign in with the email and password linked to your doctor account.' if doctor else 'Use the email and password you registered with.' }}</p>
+    <form method="post">
+      <div class="field"><label for="email">EMAIL ADDRESS *</label>
+        <input id="email" name="email" type="email" autocomplete="email" placeholder="{{ 'you@clinic.com' if doctor else 'you@example.com' }}" value="{{ email or '' }}" required {{ '' if email else 'autofocus' }}></div>
+      <div class="field" style="margin-top:16px"><label for="password">PASSWORD *</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" placeholder="Enter your password" required {{ 'autofocus' if email else '' }}></div>
+      <button class="primary form-submit" type="submit">{{ 'Sign in to dashboard' if doctor else 'Sign in' }}&nbsp; ↗</button>
+    </form>
+    {% if doctor %}
+      <div class="switch-auth">New to MediSlot? <a href="/doctor/signup">Create your doctor profile</a></div>
+    {% else %}
+      <div class="switch-auth">New here? <a href="/patient/register">Create a patient account</a></div>
+      <div class="switch-auth">Are you a doctor? <a href="/doctor/login">Doctor sign in</a></div>
+    {% endif %}
+    <div class="switch-auth"><a href="/">← Back to home</a></div>
+  </section>
+</main>
+{% endblock %}

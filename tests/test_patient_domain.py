@@ -114,7 +114,7 @@ def doctor_row(uid, last, first='Asha'):
     return {'user_id': uid, 'first_name': first, 'last_name': last, 'specialization': 'Cardiology',
             'qualification': 'MBBS, MD', 'experience_years': 9, 'languages': 'English, Telugu', 'photo_key': None,
             'hospital_id': 3, 'hospital_name': 'CARE Hospitals', 'city': 'Hyderabad',
-            'fee_from': Decimal('450.00'), 'type_codes': 'QUICK,STANDARD'}
+            'fee_from': Decimal('450.00'), 'type_labels': 'Quick consult|Standard consult'}
 
 
 def test_search_is_public_and_returns_keyset_cursor(monkeypatch):
@@ -145,10 +145,12 @@ def test_cursor_cannot_be_reused_with_other_filters(monkeypatch):
 # ----------------------------------------------------------------- slots
 
 def test_seat_view_counts_free_seats_and_hides_past_or_unknown():
-    types = {'t1': pl.type_payload({'consultation_type_id': 't1', 'name': 'HEALTH_CAMP', 'duration_min': 60,
-                                    'fee_amount': Decimal('200'), 'capacity': 6})}
+    types = {'41': pl.type_payload({'consultation_type_id': 41, 'code': 'HEALTH_CAMP', 'label': 'Health camp',
+                                    'duration_min': 60, 'fee_amount': Decimal('200'), 'capacity': 6,
+                                    'min_capacity': 2, 'max_capacity': 10})}
+    assert types['41']['groupSession'] is True and types['41']['seatsPerSlot'] == 6
     tz, now = pl.zone('Asia/Kolkata'), datetime(2026, 11, 6, 3, 0, tzinfo=timezone.utc)
-    slot = {'slot_id': '5#t1#2026-11-07T04:30:00Z', 'consultation_type_id': 't1', 'start_at': '2026-11-07T04:30:00Z',
+    slot = {'slot_id': '5#41#2026-11-07T04:30:00Z', 'consultation_type_id': '41', 'start_at': '2026-11-07T04:30:00Z',
             'end_at': '2026-11-07T05:30:00Z', 'capacity': Decimal(6), 'booked_count': Decimal(2),
             'held_count': Decimal(1), 'status': 'OPEN'}
     view = pl.seat_view(slot, types, tz, now)
@@ -169,8 +171,9 @@ class SlotCur(Cur):
                           'timezone': 'Asia/Kolkata', 'hospital_id': 3, 'hospital_name': 'CARE', 'city': 'Hyderabad',
                           'address': 'Banjara Hills'}]
         elif 'FROM consultation_types' in s:
-            self.rows = [{'consultation_type_id': 't30', 'name': 'STANDARD', 'duration_min': 30,
-                          'fee_amount': Decimal('450.00'), 'capacity': 1}]
+            self.rows = [{'consultation_type_id': 30, 'code': 'STANDARD', 'label': 'Standard consult',
+                          'duration_min': 30, 'fee_amount': Decimal('450.00'), 'capacity': 1,
+                          'min_capacity': 1, 'max_capacity': 1}]
         else:
             super().execute(sql, args)
 
@@ -200,7 +203,7 @@ def test_slots_grouped_by_day_with_free_seat_totals(monkeypatch):
             assert IndexName == 'GSI_DoctorDate'
             if KeyConditionExpression._values[1] != f'5#{tomorrow.isoformat()}':
                 return {'Items': []}
-            base = {'consultation_type_id': 't30', 'capacity': 1, 'held_count': 0}
+            base = {'consultation_type_id': '30', 'capacity': 1, 'held_count': 0}
             return {'Items': [
                 dict(base, slot_id='a', start_at=f'{tomorrow}T03:30:00Z', end_at=f'{tomorrow}T04:00:00Z', booked_count=0, status='OPEN'),
                 dict(base, slot_id='b', start_at=f'{tomorrow}T04:00:00Z', end_at=f'{tomorrow}T04:30:00Z', booked_count=1, status='FULL'),
@@ -298,29 +301,3 @@ def test_delete_needs_confirmation_then_revokes_tokens(monkeypatch):
 def test_unknown_route_and_wrong_method(monkeypatch):
     assert run(monkeypatch, 'GET', '/patient/elsewhere')[0] == 404
     assert run(monkeypatch, 'PATCH', '/patient/me')[0] == 405
-
-
-# ----------------------------------------------------------------- automatic schema upgrade
-
-def test_milestone4_upgrade_adds_only_what_is_missing(monkeypatch):
-    import common
-
-    class UpgradeCur:
-        def __init__(self): self.ran, self.last = [], None
-        def execute(self, sql, args=()):
-            s = ' '.join(sql.split())
-            self.ran.append(s)
-            # Pretend patients.city and doctors.ix_doctors_name already exist.
-            self.last = {'1': 1} if args in (('patients', 'city'), ('doctors', 'ix_doctors_name')) else None
-        def fetchone(self): return self.last
-
-    monkeypatch.setattr(common, '_m4_ready', False)
-    monkeypatch.setattr(common, 'emit', lambda *a, **k: None)
-    cur = UpgradeCur()
-    common.ensure_milestone4_schema(cur)
-    alters = [s for s in cur.ran if s.startswith(('ALTER', 'CREATE INDEX'))]
-    assert len(alters) == 5 + 4
-    assert not any('ADD COLUMN city ' in s for s in alters) and not any('ix_doctors_name ON' in s for s in alters)
-    assert 'CREATE INDEX ix_doctors_spec_name ON doctors (specialization, last_name, first_name)' in alters
-    common.ensure_milestone4_schema(cur)               # second call in the same warm Lambda does nothing
-    assert len([s for s in cur.ran if s.startswith(('ALTER', 'CREATE INDEX'))]) == 9

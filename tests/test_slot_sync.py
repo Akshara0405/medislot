@@ -36,7 +36,10 @@ class FakeCur:
 
 
 def pat(day, start, end, tid, dur, cap=1, name='STANDARD'):
-    return {'day_of_week': day, 'start_time': start, 'end_time': end, 'consultation_type_id': tid, 'duration_min': dur, 'capacity': cap, 'type_name': name}
+    # min/max seats come from the consultations table: 2-10 for a health camp, exactly 1 otherwise.
+    low, high = (2, 10) if name == 'HEALTH_CAMP' else (1, 1)
+    return {'day_of_week': day, 'start_time': start, 'end_time': end, 'consultation_type_id': tid, 'duration_min': dur,
+            'capacity': cap, 'type_name': name, 'min_capacity': low, 'max_capacity': high}
 
 
 def test_9_to_1_is_split_by_consultation_length():

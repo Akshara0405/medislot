@@ -1,220 +1,176 @@
-import json, os, uuid, logging, boto3, pymysql, hashlib, time
+"""Shared helpers copied into every Lambda zip: config, MySQL connection, logging, small HTTP helpers.
+
+There is NO SQL schema code here any more. Tables are created once per deployment by
+lambdas/authentication/migrate.py from schema/schema.sql, so a request only runs its own queries.
+"""
+import base64
+import functools
+import hashlib
+import json
+import logging
+import os
+import time
+import traceback
+import uuid
 from functools import lru_cache
-from botocore.exceptions import ClientError
+
+import boto3
+import pymysql
+
 log = logging.getLogger()
 log.setLevel(logging.INFO)
-ssm = boto3.client("ssm")
-ddb = boto3.resource("dynamodb")
-def emit(level, message, correlation_id=None, **fields):
-    payload = {"level": level, "message": message, "correlationId": correlation_id or str(uuid.uuid4()), **fields}
-    getattr(log, level if level in ("info","warning","error") else "info")(json.dumps(payload))
-def response(status, body):
-    return {"statusCode": status, "headers": {"content-type":"application/json", "cache-control":"no-store"}, "body": json.dumps(body)}
+
+
+# --------------------------------------------------------------------------- AWS clients (created once per container)
+
+@lru_cache(maxsize=None)
+def client(name):
+    return boto3.client(name)
+
+
+@lru_cache(maxsize=None)
+def resource(name):
+    return boto3.resource(name)
+
+
+def table(name):
+    return resource('dynamodb').Table(name)
+
+
+def auth_table():
+    return table(f"MediSlot-{os.environ.get('ENVIRONMENT', 'dev')}-AuthTokens")
+
+
 @lru_cache(maxsize=64)
 def get_param(name, decrypt=False):
-    return ssm.get_parameter(Name=name, WithDecryption=decrypt)["Parameter"]["Value"]
+    return client('ssm').get_parameter(Name=name, WithDecryption=decrypt)['Parameter']['Value']
+
+
+@lru_cache(maxsize=1)
 def config():
-    env=os.environ.get("ENVIRONMENT","dev")
-    return {"env":env,"prefix":f"/medislot/{env}","jwt":get_param(f"/medislot/{env}/auth/jwt-secret",True),
-            "dbhost":get_param(f"/medislot/{env}/db/host"),"dbport":int(get_param(f"/medislot/{env}/db/port")),
-            "dbname":get_param(f"/medislot/{env}/db/name"),"dbuser":get_param(f"/medislot/{env}/db/username"),
-            "dbpass":get_param(f"/medislot/{env}/db/password",True)}
-_M3_COLUMNS = [
-    ("doctors", "timezone", "VARCHAR(64) NOT NULL DEFAULT 'Asia/Kolkata'"),
-    ("doctors", "languages", "VARCHAR(200) NULL"),
-    ("doctors", "photo_key", "VARCHAR(300) NULL"),
-]
-_M3_TABLES = [
-    """CREATE TABLE IF NOT EXISTS consultation_types (
-      consultation_type_id CHAR(36) PRIMARY KEY,
-      doctor_id BIGINT UNSIGNED NOT NULL,
-      name ENUM('QUICK','STANDARD','DETAILED','HEALTH_CAMP') NOT NULL,
-      duration_min SMALLINT NOT NULL,
-      fee_amount DECIMAL(10,2) NOT NULL,
-      capacity TINYINT NOT NULL,
-      is_active BOOLEAN NOT NULL DEFAULT TRUE,
-      UNIQUE KEY uq_doctor_type (doctor_id, name),
-      FOREIGN KEY (doctor_id) REFERENCES doctors(user_id)
-    ) ENGINE=InnoDB""",
-    """CREATE TABLE IF NOT EXISTS availability_patterns (
-      pattern_id CHAR(36) PRIMARY KEY,
-      doctor_id BIGINT UNSIGNED NOT NULL,
-      consultation_type_id CHAR(36) NOT NULL,
-      day_of_week TINYINT NOT NULL,
-      start_time TIME NOT NULL,
-      end_time TIME NOT NULL,
-      KEY ix_doctor_weekday (doctor_id, day_of_week),
-      FOREIGN KEY (doctor_id) REFERENCES doctors(user_id),
-      FOREIGN KEY (consultation_type_id) REFERENCES consultation_types(consultation_type_id)
-    ) ENGINE=InnoDB""",
-    """CREATE TABLE IF NOT EXISTS blackout_dates (
-      blackout_id CHAR(36) PRIMARY KEY,
-      doctor_id BIGINT UNSIGNED NOT NULL,
-      blackout_date DATE NOT NULL,
-      reason VARCHAR(200),
-      UNIQUE KEY uq_doctor_blackout (doctor_id, blackout_date),
-      FOREIGN KEY (doctor_id) REFERENCES doctors(user_id)
-    ) ENGINE=InnoDB""",
-]
-SEED_HOSPITALS = [
-    ("MediSlot General Hospital", "Hyderabad", "Main Road, Hyderabad"),
-    ("Apollo Hospitals", "Hyderabad", "Jubilee Hills, Hyderabad"),
-    ("Yashoda Hospitals", "Hyderabad", "Secunderabad, Hyderabad"),
-    ("KIMS Hospitals", "Hyderabad", "Secunderabad, Hyderabad"),
-    ("CARE Hospitals", "Hyderabad", "Banjara Hills, Hyderabad"),
-    ("Continental Hospitals", "Hyderabad", "Gachibowli, Hyderabad"),
-    ("AIG Hospitals", "Hyderabad", "Gachibowli, Hyderabad"),
-    ("Nizam's Institute of Medical Sciences", "Hyderabad", "Punjagutta, Hyderabad"),
-    ("Osmania General Hospital", "Hyderabad", "Afzalgunj, Hyderabad"),
-]
-_m3_ready = False
-def ensure_milestone3_schema(cur):
-    """Idempotent Milestone 3 schema (mirrors schema/milestone3.sql). Runs once per warm Lambda."""
-    global _m3_ready
-    if _m3_ready:
-        return
-    for tbl, col, ddl in _M3_COLUMNS:
-        cur.execute("""SELECT 1 FROM information_schema.COLUMNS
-                       WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND COLUMN_NAME=%s""", (tbl, col))
-        if not cur.fetchone():
-            try:
-                cur.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {ddl}")
-            except pymysql.err.OperationalError as exc:
-                if exc.args[0] != 1060:  # 1060 = duplicate column: another Lambda added it first
-                    raise
-    for statement in _M3_TABLES:
-        cur.execute(statement)
-    # Doctor sign-up shows these in a dropdown. INSERT IGNORE keeps this safe to re-run;
-    # edit or extend the list freely (hospitals are unique on name + city).
-    cur.executemany("INSERT IGNORE INTO hospitals (name, city, address) VALUES (%s,%s,%s)", SEED_HOSPITALS)
-    _m3_ready = True
-# Milestone 4: patient profile fields + doctor search indexes (why each index exists: docs/M4_SEARCH_INDEXES.md).
-# New tables already get these from the CREATE TABLE statements below; this upgrades tables created earlier.
-_M4_COLUMNS = [
-    ("patients", "city", "VARCHAR(100) NULL AFTER address"),
-    ("patients", "blood_group", "VARCHAR(3) NULL AFTER city"),
-    ("patients", "emergency_contact_name", "VARCHAR(150) NULL AFTER blood_group"),
-    ("patients", "emergency_contact_phone", "VARCHAR(25) NULL AFTER emergency_contact_name"),
-    ("patients", "profile_version", "INT UNSIGNED NOT NULL DEFAULT 1 AFTER emergency_contact_phone"),
-    ("patients", "updated_at", "DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) AFTER created_at"),
-]
-_M4_INDEXES = [
-    ("doctors", "ix_doctors_name", "last_name, first_name"),
-    ("doctors", "ix_doctors_first_name", "first_name"),
-    ("doctors", "ix_doctors_spec_name", "specialization, last_name, first_name"),
-    ("doctors", "ix_doctors_hospital_name", "hospital_id, last_name, first_name"),
-    ("hospitals", "ix_hospitals_city", "city, is_active"),
-]
-_m4_ready = False
-def ensure_milestone4_schema(cur):
-    """Idempotent Milestone 4 upgrade. Runs once per warm Lambda; safe if several Lambdas race."""
-    global _m4_ready
-    if _m4_ready:
-        return
-    for tbl, col, ddl in _M4_COLUMNS:
-        cur.execute("""SELECT 1 FROM information_schema.COLUMNS
-                       WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND COLUMN_NAME=%s""", (tbl, col))
-        if not cur.fetchone():
-            try:
-                cur.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {ddl}")
-                emit("info", "schema_upgraded", table=tbl, column=col)
-            except pymysql.err.MySQLError as exc:
-                if exc.args[0] != 1060:  # 1060 = duplicate column: another Lambda added it first
-                    raise
-    for tbl, name, cols in _M4_INDEXES:
-        cur.execute("""SELECT 1 FROM information_schema.STATISTICS
-                       WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND INDEX_NAME=%s LIMIT 1""", (tbl, name))
-        if not cur.fetchone():
-            try:
-                cur.execute(f"CREATE INDEX {name} ON {tbl} ({cols})")
-                emit("info", "schema_upgraded", table=tbl, index=name)
-            except pymysql.err.MySQLError as exc:
-                if exc.args[0] != 1061:  # 1061 = duplicate key name: another Lambda created it first
-                    raise
-    _m4_ready = True
+    env = os.environ.get('ENVIRONMENT', 'dev')
+    p = f'/medislot/{env}'
+    return {'env': env, 'prefix': p, 'jwt': get_param(f'{p}/auth/jwt-secret', True),
+            'dbhost': get_param(f'{p}/db/host'), 'dbport': int(get_param(f'{p}/db/port')),
+            'dbname': get_param(f'{p}/db/name'), 'dbuser': get_param(f'{p}/db/username'),
+            'dbpass': get_param(f'{p}/db/password', True)}
+
+
+# --------------------------------------------------------------------------- MySQL
+
+_conn = None
+
+
 def dbconn(c):
-    conn=pymysql.connect(host=c["dbhost"],port=c["dbport"],user=c["dbuser"],password=c["dbpass"],
-                         database=c["dbname"],connect_timeout=5,read_timeout=8,write_timeout=8,
-                         cursorclass=pymysql.cursors.DictCursor,autocommit=False)
-    with conn.cursor() as cur:
-        cur.execute("""CREATE TABLE IF NOT EXISTS users (
-          user_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-          email VARCHAR(254) NOT NULL UNIQUE,
-          password_hash VARCHAR(255) NOT NULL,
-          role ENUM('patient','doctor') NOT NULL,
-          full_name VARCHAR(150) NULL,
-          is_active BOOLEAN NOT NULL DEFAULT TRUE,
-          created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-          updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)
-        ) ENGINE=InnoDB""")
-        # Keep the legacy column for backward compatibility, but stop requiring or populating it.
-        cur.execute("""SELECT IS_NULLABLE FROM information_schema.COLUMNS
-                       WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='users' AND COLUMN_NAME='full_name'""")
-        legacy_name = cur.fetchone()
-        if legacy_name and legacy_name["IS_NULLABLE"] == "NO":
-            cur.execute("ALTER TABLE users MODIFY full_name VARCHAR(150) NULL")
-        cur.execute("""CREATE TABLE IF NOT EXISTS hospitals (
-          hospital_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-          name VARCHAR(150) NOT NULL,
-          address VARCHAR(500) NULL,
-          city VARCHAR(100) NULL,
-          is_active BOOLEAN NOT NULL DEFAULT TRUE,
-          created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-          UNIQUE KEY uq_hospitals_name_city (name, city),
-          KEY ix_hospitals_city (city, is_active)
-        ) ENGINE=InnoDB""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS patients (
-          user_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
-          first_name VARCHAR(75) NOT NULL,
-          last_name VARCHAR(75) NOT NULL,
-          phone VARCHAR(25) NOT NULL,
-          date_of_birth DATE NULL,
-          gender VARCHAR(30) NULL,
-          address VARCHAR(500) NULL,
-          city VARCHAR(100) NULL,
-          blood_group VARCHAR(3) NULL,
-          emergency_contact_name VARCHAR(150) NULL,
-          emergency_contact_phone VARCHAR(25) NULL,
-          profile_version INT UNSIGNED NOT NULL DEFAULT 1,
-          created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-          updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-          CONSTRAINT fk_patients_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
-        ) ENGINE=InnoDB""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS doctors (
-          user_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
-          first_name VARCHAR(75) NOT NULL,
-          last_name VARCHAR(75) NOT NULL,
-          phone VARCHAR(25) NOT NULL,
-          specialization VARCHAR(120) NOT NULL,
-          license_number VARCHAR(32) NOT NULL UNIQUE,
-          hospital_id BIGINT UNSIGNED NOT NULL,
-          qualification VARCHAR(150) NOT NULL,
-          experience_years SMALLINT UNSIGNED NOT NULL DEFAULT 0,
-          created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-          -- Milestone 4 search indexes (see docs/M4_SEARCH_INDEXES.md). InnoDB appends the primary key
-          -- (user_id) to every secondary index, so each one already ends in the keyset tie-breaker.
-          KEY ix_doctors_name (last_name, first_name),
-          KEY ix_doctors_first_name (first_name),
-          KEY ix_doctors_spec_name (specialization, last_name, first_name),
-          KEY ix_doctors_hospital_name (hospital_id, last_name, first_name),
-          CONSTRAINT fk_doctors_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
-          CONSTRAINT fk_doctors_hospital FOREIGN KEY (hospital_id) REFERENCES hospitals(hospital_id)
-        ) ENGINE=InnoDB""")
-        ensure_milestone3_schema(cur)
-        ensure_milestone4_schema(cur)
-    conn.commit()
-    return conn
-def table(name):
-    return ddb.Table(name)
-def auth_table():
-    return table(f"MediSlot-{os.environ.get('ENVIRONMENT','dev')}-AuthTokens")
+    """Return an open connection. A warm Lambda re-uses the one it opened before (saves a TCP + login per request)."""
+    global _conn
+    if _conn is not None:
+        try:
+            _conn.ping(reconnect=True)
+            return _conn
+        except Exception:
+            _conn = None
+    _conn = pymysql.connect(host=c['dbhost'], port=c['dbport'], user=c['dbuser'], password=c['dbpass'],
+                            database=c['dbname'], connect_timeout=5, read_timeout=8, write_timeout=8,
+                            cursorclass=pymysql.cursors.DictCursor, autocommit=False)
+    return _conn
+
+
+def release(conn):
+    """Call in `finally` instead of close(): ends any open transaction but keeps the connection for the next request."""
+    global _conn
+    if conn is None:
+        return
+    try:
+        conn.rollback()           # never leave a transaction (or its old snapshot) open between requests
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        if conn is _conn:
+            _conn = None
+
+
+# --------------------------------------------------------------------------- logging (CloudWatch)
+
+def emit(level, message, correlation_id=None, **fields):
+    """One JSON line per event, so CloudWatch Logs Insights can filter on any field."""
+    payload = {'level': level.upper(), 'message': message, 'correlationId': correlation_id or str(uuid.uuid4()),
+               **{k: v for k, v in fields.items() if v is not None}}
+    getattr(log, level if level in ('info', 'warning', 'error') else 'info')(json.dumps(payload, default=str))
+
+
+def logged(function):
+    """Decorator for every Lambda handler: logs one line for EVERY request, whether it succeeds or fails.
+
+    status < 400 -> INFO  "request_succeeded"
+    status 4xx   -> WARNING "request_rejected" (with the message sent to the client)
+    status 5xx or an exception -> ERROR "request_failed" (with the error type and stack trace)
+    """
+    def decorate(handler):
+        @functools.wraps(handler)
+        def wrapper(event, context):
+            event = event or {}
+            started = time.time()
+            cid = correlation(event)
+            who = (event.get('requestContext') or {}).get('authorizer') or {}
+            route = (f"{event.get('httpMethod', '')} {event.get('resource') or event.get('path', '')}".strip()
+                     or f"invoke:{event.get('action') or 'scheduled'}")
+            base = {'function': function, 'route': route, 'userId': who.get('userId'), 'role': who.get('role'),
+                    'requestId': getattr(context, 'aws_request_id', None)}
+            try:
+                result = handler(event, context)
+            except Exception as exc:
+                emit('error', 'request_failed', cid, **base, status=500, errorType=type(exc).__name__,
+                     error=str(exc)[:500], stack=traceback.format_exc()[-3000:],
+                     durationMs=int((time.time() - started) * 1000))
+                raise
+            status = result.get('statusCode') if isinstance(result, dict) else None
+            status = status if isinstance(status, int) else 200
+            fields = dict(base, status=status, durationMs=int((time.time() - started) * 1000))
+            if status >= 500:
+                emit('error', 'request_failed', cid, **fields, reason=_message(result))
+            elif status >= 400:
+                emit('warning', 'request_rejected', cid, **fields, reason=_message(result))
+            else:
+                emit('info', 'request_succeeded', cid, **fields)
+            return result
+        return wrapper
+    return decorate
+
+
+def _message(result):
+    try:
+        data = result.get('body')
+        data = json.loads(data) if isinstance(data, str) else data
+        return str(data.get('message'))[:300] if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------- HTTP helpers
+
+def response(status, body):
+    return {'statusCode': status, 'headers': {'content-type': 'application/json', 'cache-control': 'no-store'},
+            'body': json.dumps(body, default=str)}
+
+
 def token_hash(raw):
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
 def body(event):
     try:
-        value=event.get("body") or "{}"
-        if event.get("isBase64Encoded"): import base64; value=base64.b64decode(value).decode()
+        value = event.get('body') or '{}'
+        if event.get('isBase64Encoded'):
+            value = base64.b64decode(value).decode()
         return json.loads(value)
-    except Exception: return None
+    except Exception:
+        return None
+
+
 def correlation(event):
-    return (event.get("headers") or {}).get("x-correlation-id") or (event.get("requestContext") or {}).get("requestId") or str(uuid.uuid4())
+    headers = {str(k).lower(): v for k, v in (event.get('headers') or {}).items()}
+    return (headers.get('x-correlation-id') or event.get('correlationId')
+            or (event.get('requestContext') or {}).get('requestId') or str(uuid.uuid4()))

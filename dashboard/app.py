@@ -1,14 +1,15 @@
 import json
+import logging
 import os
 import re
 import time
-import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
-from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation
+from zoneinfo import ZoneInfo
 
 import requests
-from flask import Flask, render_template, request, redirect, session, url_for, flash
+from flask import Flask, flash, g, redirect, render_template, request, session, url_for
 
 app = Flask(__name__)
 app.secret_key = os.environ['FLASK_SECRET_KEY']
@@ -22,6 +23,49 @@ app.config.update(
 )
 API = os.environ['API_BASE_URL'].rstrip('/')
 ALLOWED_PHOTO_TYPES = {'image/jpeg', 'image/png', 'image/webp'}
+
+
+# ----------------------------------------------------------------------------- logging
+# Every page request is logged (success or failure). On the EC2 instance the lines also go to the
+# CloudWatch log group /medislot/<env>/dashboard (created by web-stack.yaml) through watchtower.
+log = logging.getLogger('medislot.dashboard')
+log.setLevel(logging.INFO)
+if not log.handlers:
+    log.addHandler(logging.StreamHandler())
+    try:
+        import boto3
+        import watchtower
+        region = (re.search(r'execute-api\.([a-z0-9-]+)\.amazonaws', API) or [None, 'ap-south-1'])[1]
+        log.addHandler(watchtower.CloudWatchLogHandler(
+            log_group_name=f"/medislot/{os.environ.get('ENVIRONMENT', 'dev')}/dashboard", create_log_group=False,
+            boto3_client=boto3.client('logs', region_name=region)))
+    except Exception:          # tests and local runs: console only
+        pass
+
+
+@app.before_request
+def _start_timer():
+    g.started = time.time()
+
+
+@app.after_request
+def _log_request(resp):
+    if request.endpoint != 'static':
+        level = logging.ERROR if resp.status_code >= 500 else logging.WARNING if resp.status_code >= 400 else logging.INFO
+        log.log(level, json.dumps({'message': 'page_request', 'method': request.method, 'path': request.path,
+                                   'status': resp.status_code, 'role': session.get('role'),
+                                   'durationMs': int((time.time() - g.get('started', time.time())) * 1000)}))
+    return resp
+
+
+@app.errorhandler(Exception)
+def _crash(exc):
+    from werkzeug.exceptions import HTTPException
+    if isinstance(exc, HTTPException):
+        return exc
+    log.exception(json.dumps({'message': 'page_failed', 'method': request.method, 'path': request.path,
+                              'errorType': type(exc).__name__}))
+    return 'Something went wrong. Please try again.', 500
 
 SPECIALIZATIONS = [
     'Allergy & Immunology', 'Anaesthesiology', 'Cardiology', 'Dermatology', 'Diabetology & Endocrinology',
@@ -66,7 +110,7 @@ def specialization_options(current=''):
 
 
 def render_signup(values, status=200):
-    return render_template('signup.html', values=values, hospitals=get_hospitals(),
+    return render_template('register.html', role='doctor', values=values, hospitals=get_hospitals(),
                            specializations=specialization_options(values.get('specialization', ''))), status
 
 
@@ -242,7 +286,7 @@ def login():
             flash('MediSlot could not reach the API. Please try again.', 'error')
     # After sign-up the email arrives as ?email=..., so the doctor only types the password.
     email = request.form.get('email') or request.args.get('email', '')
-    return render_template('login.html', email=email.strip()[:254])
+    return render_template('login.html', role='doctor', email=email.strip()[:254])
 
 
 @app.route('/doctor/logout')
@@ -254,9 +298,7 @@ def logout():
 TABS = [('profile', 'Profile overview'), ('types', 'Consultation types'), ('availability', 'Availability'),
         ('schedule', 'Schedule'), ('blackouts', 'Blackouts')]
 TAB_KEYS = {key for key, _ in TABS}
-CAMP_MIN_CAPACITY, CAMP_MAX_CAPACITY = 2, 10   # keep in step with lambdas/doctor/lambda_function.py
-TYPE_DURATION = {'QUICK': 15, 'STANDARD': 30, 'DETAILED': 60, 'HEALTH_CAMP': 60}
-ID_PATTERN = re.compile(r'^[0-9a-fA-F-]{36}$')
+ID_PATTERN = re.compile(r'^[1-9][0-9]{0,18}$')     # every database id is an AUTO_INCREMENT integer
 
 
 def api_items(response):
@@ -353,31 +395,17 @@ def handle_dashboard_post():
                         'Availability saved.', 'Could not save availability.')
 
         elif action in ('add_type', 'save_type'):
+            # Capacity limits and durations live in the consultations table; the API checks them.
             tab = 'types'
-            name = request.form.get('name', '')
             try:
-                if name not in TYPE_DURATION:
-                    raise ValueError('Choose a valid consultation type.')
-                try:
-                    capacity = int(request.form.get('capacity') or 1)
-                except ValueError:
-                    raise ValueError('Capacity must be a whole number.')
-                if name == 'HEALTH_CAMP':
-                    if not CAMP_MIN_CAPACITY <= capacity <= CAMP_MAX_CAPACITY:
-                        raise ValueError('A health camp needs a capacity between %d and %d.' % (CAMP_MIN_CAPACITY, CAMP_MAX_CAPACITY))
-                else:
-                    capacity = 1      # one patient at a time; whatever was typed is ignored
-                try:
-                    fee = Decimal(request.form.get('fee_amount', '').strip())
-                except InvalidOperation:
-                    raise ValueError('Enter a valid fee.')
+                capacity = int(request.form.get('capacity') or 1)
+                fee = Decimal(request.form.get('fee_amount', '').strip())
                 if not fee.is_finite() or fee < 0:
-                    raise ValueError('Enter a valid fee.')
-            except ValueError as exc:
-                flash(str(exc), 'error')
+                    raise InvalidOperation()
+            except (ValueError, InvalidOperation):
+                flash('Enter a whole-number capacity and a valid fee.', 'error')
             else:
-                payload = {'name': name, 'duration_min': TYPE_DURATION[name], 'capacity': capacity,
-                           'fee_amount': str(fee)}
+                payload = {'capacity': capacity, 'fee_amount': str(fee)}
                 if action == 'save_type':
                     type_id = request.form.get('type_id', '')
                     if not ID_PATTERN.match(type_id):
@@ -385,17 +413,13 @@ def handle_dashboard_post():
                     else:
                         outcome(api_request('PUT', '/doctor/me/consultation-types/' + type_id, payload=payload),
                                 'Consultation type saved.', 'Could not save the consultation type.')
+                elif not ID_PATTERN.match(request.form.get('consultation_id', '')):
+                    flash('Choose a valid consultation type.', 'error')
                 else:
-                    # A deactivated type of the same name is revived instead of duplicated.
-                    existing = next((t for t in api_items(api_request('GET', '/doctor/me/consultation-types'))
-                                     if t.get('name') == name), None)
-                    if existing:
-                        outcome(api_request('PUT', '/doctor/me/consultation-types/' + existing['consultation_type_id'],
-                                            payload=payload), 'Consultation type saved.',
-                                'Could not save the consultation type.')
-                    else:
-                        outcome(api_request('POST', '/doctor/me/consultation-types', payload=payload),
-                                'Consultation type added.', 'Could not add the consultation type.')
+                    # The API re-activates a type the doctor removed earlier instead of adding a duplicate.
+                    payload['consultation_id'] = int(request.form['consultation_id'])
+                    outcome(api_request('POST', '/doctor/me/consultation-types', payload=payload),
+                            'Consultation type added.', 'Could not add the consultation type.')
 
         elif action == 'delete_type':
             tab = 'types'
@@ -454,7 +478,7 @@ def decorate_slots(slots, type_labels, tz_name):
         except (KeyError, ValueError):
             continue
         rows.append(dict(slot, start_local=start.strftime('%I:%M %p').lstrip('0'), end_local=end.strftime('%I:%M %p').lstrip('0'),
-                         type_label=type_labels.get(slot.get('consultation_type_id'), 'Consultation')))
+                         type_label=type_labels.get(str(slot.get('consultation_type_id')), 'Consultation')))
     return rows
 
 
@@ -475,20 +499,30 @@ def dashboard():
         day_obj = date.today()
         day = day_obj.isoformat()
     try:
-        profile = api_request('GET', '/doctor/me')
+        # The five reads do not depend on each other, so they run at the same time (one API round trip, not five).
+        if session.get('refresh_token') and time.time() > session.get('token_exp', 0) - 60:
+            refresh_access_token()
+        token = session.get('token')
+        calls = {'profile': ('/doctor/me', None), 'availability': ('/doctor/me/availability', None),
+                 'schedule': ('/doctor/me/schedule', {'start_date': day, 'days': 30}),
+                 'types': ('/doctor/me/consultation-types', None), 'blackouts': ('/doctor/me/blackouts', None)}
+        with ThreadPoolExecutor(max_workers=len(calls)) as pool:
+            futures = {k: pool.submit(api_request, 'GET', path, params=params, token=token)
+                       for k, (path, params) in calls.items()}
+            got = {k: f.result() for k, f in futures.items()}
+        profile, availability, schedule = got['profile'], got['availability'], got['schedule']
         if profile.status_code == 401:
             session.clear()
             flash('Your session has expired. Please sign in again.', 'warning')
             return redirect(url_for('login'))
-        availability = api_request('GET', '/doctor/me/availability')
-        schedule = api_request('GET', '/doctor/me/schedule', params={'start_date': day, 'days': 30})
-        all_types = api_items(api_request('GET', '/doctor/me/consultation-types'))
+        all_types = api_items(got['types'])
+        catalog = got['types'].json().get('catalog', []) if got['types'].ok else []
         types = [t for t in all_types if t.get('is_active')]
-        blackouts = api_items(api_request('GET', '/doctor/me/blackouts'))
+        blackouts = api_items(got['blackouts'])
     except requests.RequestException:
         flash('Unable to load your dashboard from the API.', 'error')
         profile = availability = schedule = None
-        all_types, types, blackouts = [], [], []
+        all_types, types, blackouts, catalog = [], [], [], []
 
     active_ids = {t['consultation_type_id'] for t in types}
     patterns = [{'consultation_type_id': p.get('consultation_type_id'), 'day_of_week': p.get('day_of_week'),
@@ -496,7 +530,7 @@ def dashboard():
                 for p in (api_items(availability) if availability is not None else [])
                 if p.get('consultation_type_id') in active_ids]
     profile_data = profile.json() if profile is not None and profile.ok else {}
-    type_labels = {t['consultation_type_id']: '%s · %s min' % (str(t.get('name', '')).replace('_', ' ').title(), t.get('duration_min'))
+    type_labels = {str(t['consultation_type_id']): '%s · %s min' % (t.get('label'), t.get('duration_min'))
                    for t in all_types}
     slots = schedule.json().get('slots', []) if schedule is not None and schedule.ok else []
     decorated = decorate_slots(slots, type_labels, profile_data.get('timezone'))
@@ -518,20 +552,19 @@ def dashboard():
     open_total = sum(1 for g in schedule_days for s in g['slots']
                      if s.get('status') != 'CLOSED' and int(s.get('booked_count') or 0) < int(s.get('capacity') or 1))
     busy_days = [g for g in schedule_days if g['slots'] or g['blocked']]
+    offered = {t.get('consultation_id') for t in types}
     return render_template(
-        'dashboard.html',
+        'doctor.html',
         tabs=TABS, active=active, day=day, busy_days=busy_days, slot_total=slot_total, open_total=open_total, types=types, blackouts=blackouts, patterns=patterns,
         profile=profile_data,
         schedule=decorated, schedule_days=schedule_days,
         schedule_error=(schedule is not None and not schedule.ok),
         prev_day=(day_obj - timedelta(days=30)).isoformat(), next_day=(day_obj + timedelta(days=30)).isoformat(),
-        type_names=list(TYPE_DURATION),
-        camp_min=CAMP_MIN_CAPACITY, camp_max=CAMP_MAX_CAPACITY,
+        catalog=catalog, addable=[c for c in catalog if c.get('consultation_id') not in offered],
         hospitals=get_hospitals(),
         specializations=specialization_options(profile_data.get('specialization', '')),
         type_options=[{'id': t['consultation_type_id'], 'duration': t.get('duration_min'),
-                       'label': '%s · %s min' % (str(t.get('name', '')).replace('_', ' ').title(), t.get('duration_min'))}
-                      for t in types],
+                       'label': '%s · %s min' % (t.get('label'), t.get('duration_min'))} for t in types],
     )
 
 
@@ -604,14 +637,14 @@ def end_temporary_login(data):
 @app.route('/patient/signup', methods=['GET', 'POST'])
 def patient_register():
     if request.method == 'GET':
-        return render_template('patient_register.html', values={}, genders=GENDER_OPTIONS,
+        return render_template('register.html', role='patient', values={}, genders=GENDER_OPTIONS,
                                blood_groups=BLOOD_GROUP_OPTIONS, cities=search_options().get('cities', []))
     form = {k: (v or '').strip() for k, v in request.form.items()}
     form['password'], form['confirm_password'] = request.form.get('password', ''), request.form.get('confirm_password', '')
 
     def again(message, status=400):
         flash(message, 'error')
-        return render_template('patient_register.html', values=form, genders=GENDER_OPTIONS,
+        return render_template('register.html', role='patient', values=form, genders=GENDER_OPTIONS,
                                blood_groups=BLOOD_GROUP_OPTIONS, cities=search_options().get('cities', [])), status
 
     required = ['first_name', 'last_name', 'email', 'phone', 'password', 'confirm_password', 'date_of_birth',
@@ -690,7 +723,7 @@ def patient_login():
         except (requests.RequestException, ValueError):
             flash('MediSlot could not reach the API. Please try again.', 'error')
     email = request.form.get('email') or request.args.get('email', '')
-    return render_template('patient_login.html', email=email.strip()[:254])
+    return render_template('login.html', role='patient', email=email.strip()[:254])
 
 
 @app.route('/patient/logout')
@@ -768,7 +801,7 @@ def patient_dashboard():
     except requests.RequestException:
         search_error = 'MediSlot could not reach the API. Please try again.'
     prev_link, next_link = page_links(state, (results or {}).get('page', {}).get('nextCursor'))
-    return render_template('patient_dashboard.html', tabs=PATIENT_TABS, active=tab, profile=profile, state=state,
+    return render_template('patient.html', view='find', tabs=PATIENT_TABS, active=tab, profile=profile, state=state,
                            results=results, search_error=search_error, options=search_options(),
                            prev_link=prev_link, next_link=next_link, page_no=len(state['trail']) + 1,
                            genders=GENDER_OPTIONS, blood_groups=BLOOD_GROUP_OPTIONS)
@@ -844,7 +877,7 @@ def patient_doctor(doctor_id):
         start = min(max(start, today), today + timedelta(days=SLOT_WINDOW_DAYS - 1))
         end = min(start + timedelta(days=6), today + timedelta(days=SLOT_WINDOW_DAYS - 1))
         type_id = request.args.get('type', '')
-        if type_id and type_id not in {t['consultationTypeId'] for t in doctor.get('consultationTypes', [])}:
+        if type_id and type_id not in {str(t['consultationTypeId']) for t in doctor.get('consultationTypes', [])}:
             type_id = ''
         only_free = request.args.get('free') == '1'
         slots_res = public_get(f'/doctors/{doctor_id}/slots', {
@@ -865,7 +898,7 @@ def patient_doctor(doctor_id):
     last_day = today + timedelta(days=SLOT_WINDOW_DAYS - 1)
     next_week = (url_for('patient_doctor', doctor_id=doctor_id, **{k: v for k, v in nav.items() if v},
                          **{'from': (start + timedelta(days=7)).isoformat()}) if end < last_day else None)
-    return render_template('patient_doctor.html', doctor=doctor, slots=slots, slot_error=slot_error,
+    return render_template('patient.html', view='doctor', doctor=doctor, slots=slots, slot_error=slot_error,
                            start=start, end=end, type_id=type_id, only_free=only_free,
                            prev_week=prev_week, next_week=next_week,
                            next_open_time=twelve_hour((doctor.get('nextOpenSlot') or {}).get('localStart')))

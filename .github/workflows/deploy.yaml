@@ -227,6 +227,8 @@ jobs:
 
             cp -R "lambdas/${fn}/." "$tmp/"
             cp "lambdas/common.py" "$tmp/common.py"
+            # The migrate action (authentication Lambda) reads the schema from its own zip.
+            if [[ "$fn" == "authentication" ]]; then cp schema/schema.sql "$tmp/schema.sql"; fi
 
             pip install --quiet \
               -r "lambdas/${fn}/requirements.txt" \
@@ -304,6 +306,32 @@ jobs:
             --region "$AWS_REGION" \
             --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' \
             --output table
+
+      - name: Apply database schema (runs schema/schema.sql once per deployment)
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws lambda invoke \
+            --function-name "medislot-${ENVIRONMENT}-authentication" \
+            --payload '{"action":"migrate"}' \
+            --cli-binary-format raw-in-base64-out \
+            --cli-read-timeout 90 \
+            /tmp/migrate.json \
+            --region "$AWS_REGION" > /tmp/migrate-meta.json
+          cat /tmp/migrate.json
+          if grep -q FunctionError /tmp/migrate-meta.json; then
+            echo "::error::Database migration failed. Open CloudWatch log group /aws/lambda/medislot-${ENVIRONMENT}-authentication."
+            exit 1
+          fi
+          # Rebuild the 30-day slot window so slots use the current consultation type ids.
+          aws lambda invoke \
+            --function-name "medislot-${ENVIRONMENT}-slot-materializer" \
+            --payload '{"days":30}' \
+            --cli-binary-format raw-in-base64-out \
+            --cli-read-timeout 320 \
+            /tmp/materializer.json \
+            --region "$AWS_REGION" >/dev/null
+          cat /tmp/materializer.json
 
       - name: Test RDS connectivity
         shell: bash
