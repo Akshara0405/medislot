@@ -46,13 +46,13 @@
 {# ===================================================================== Consultation types #}
 <section class="dash-card panel{{ ' active' if active == 'types' else '' }}" id="panel-types">
 <h2>Consultation types</h2>
-<p class="hint">{% for c in catalog %}{{ c.label }} = {{ c.duration_min }} min{{ ' (' ~ c.min_capacity ~ '–' ~ c.max_capacity ~ ' people)' if c.max_capacity > 1 else '' }}{{ ', ' if not loop.last else '' }}{% endfor %}.
-  Every other type seats one patient at a time. Fees are in rupees.</p>
+{% set camp = catalog|selectattr('code', 'equalto', 'HEALTH_CAMP')|first|default({'min_capacity': 2, 'max_capacity': 10}) %}
+<p class="hint">Quick = 15 min, Standard = 30 min, Detailed = 60 min, Health camp = 60 min ({{ camp.min_capacity }}–{{ camp.max_capacity }} people). Every other type seats one patient at a time (capacity 1). Fees are in rupees.</p>
 {% if types %}
 <table><thead><tr><th>Type</th><th>Duration</th><th>Capacity</th><th>Fee</th><th></th></tr></thead><tbody>
 {% for t in types %}{% set form_id = 'save-' ~ t.consultation_type_id %}
 <tr>
-  <td>{{ t.label }}</td><td>{{ t.duration_min }} min</td>
+  <td>{{ t.name.replace('_',' ')|title }}</td><td>{{ t.duration_min }} min</td>
   <td>{% if t.max_capacity > 1 %}<input form="{{ form_id }}" name="capacity" type="number" min="{{ t.min_capacity }}" max="{{ t.max_capacity }}" value="{{ t.capacity }}" class="w-80">
       {% else %}1<input form="{{ form_id }}" type="hidden" name="capacity" value="1">{% endif %}</td>
   <td><input form="{{ form_id }}" name="fee_amount" type="number" min="0" step="0.01" value="{{ t.fee_amount }}" class="w-110"></td>
@@ -64,12 +64,12 @@
 </tbody></table>
 {% else %}<p class="empty">No consultation types yet. Add one below, then use it in your availability.</p>{% endif %}
 
-{% if addable %}
+{% if catalog %}
 <h3 class="mt-26">Add a consultation type</h3>
 <form method="post" class="add-row"><input type="hidden" name="action" value="add_type">
   <div><label for="t-name">Type</label><select id="t-name" name="consultation_id">
-    {% for c in addable %}<option value="{{ c.consultation_id }}" data-min="{{ c.min_capacity }}" data-max="{{ c.max_capacity }}">{{ c.label }} · {{ c.duration_min }} min</option>{% endfor %}</select></div>
-  <div><label for="t-cap">Capacity (group sessions only; other types are always 1)</label><input id="t-cap" name="capacity" type="number" min="1" value="1" class="w-110"></div>
+    {% for c in catalog %}<option value="{{ c.consultation_id }}" data-min="{{ c.min_capacity }}" data-max="{{ c.max_capacity }}">{{ c.code.replace('_',' ')|title }}</option>{% endfor %}</select></div>
+  <div><label for="t-cap">Capacity (health camp only, {{ camp.min_capacity }}–{{ camp.max_capacity }}; other types are always 1)</label><input id="t-cap" name="capacity" type="number" min="1" value="1" class="w-110"></div>
   <div><label for="t-fee">Fee</label><input id="t-fee" name="fee_amount" type="number" min="0" step="0.01" value="500" class="w-120" required></div>
   <button class="primary">Add type</button>
 </form>

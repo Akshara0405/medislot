@@ -2,6 +2,10 @@
 {% extends 'base.html' %}
 {% set doctor = role == 'doctor' %}
 {% block title %}{{ 'Create doctor profile' if doctor else 'Create patient account' }} · MediSlot{% endblock %}
+{% macro password_fields() %}
+        <div class="field"><label for="password">PASSWORD *</label><input id="password" name="password" type="password" minlength="10" autocomplete="new-password" required><span class="hint">At least 10 characters, including a letter and a number.</span></div>
+        <div class="field"><label for="confirm_password">CONFIRM PASSWORD *</label><input id="confirm_password" name="confirm_password" type="password" minlength="10" autocomplete="new-password" required></div>
+{% endmacro %}
 {% block content %}
 <main class="shell auth-wrap">
   <aside class="auth-aside{{ '' if doctor else ' aside-patient' }}">
@@ -35,6 +39,7 @@
         <div class="field"><label for="phone">PHONE NUMBER *</label><input id="phone" name="phone" type="tel" value="{{ values.get('phone','') }}" autocomplete="tel" maxlength="25" pattern="\+?[0-9][0-9 \-]{5,22}" title="7 to 15 digits" required></div>
 
         {% if doctor %}
+        {{ password_fields() }}{# doctor: password straight after phone, as before #}
         {# ---------- doctor only ---------- #}
         <div class="field"><label for="specialization">SPECIALISATION *</label><select id="specialization" name="specialization" required>
           <option value="" disabled {{ '' if values.get('specialization') else 'selected' }}>Select your specialisation</option>
@@ -66,8 +71,7 @@
         <div class="field"><label for="emergency_contact_phone">EMERGENCY CONTACT PHONE</label><input id="emergency_contact_phone" name="emergency_contact_phone" type="tel" value="{{ values.get('emergency_contact_phone','') }}" maxlength="25" pattern="\+?[0-9][0-9 \-]{5,22}" title="7 to 15 digits"></div>
         {% endif %}
 
-        <div class="field"><label for="password">PASSWORD *</label><input id="password" name="password" type="password" minlength="10" autocomplete="new-password" required><span class="hint">At least 10 characters, including a letter and a number.</span></div>
-        <div class="field"><label for="confirm_password">CONFIRM PASSWORD *</label><input id="confirm_password" name="confirm_password" type="password" minlength="10" autocomplete="new-password" required></div>
+        {% if not doctor %}{{ password_fields() }}{% endif %}{# patient: password last #}
       </div>
       <button class="primary form-submit" type="submit" id="submit-btn">{{ 'Create my doctor account' if doctor else 'Create my patient account' }}&nbsp; ↗</button>
     </form>

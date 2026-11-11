@@ -54,7 +54,7 @@
     var syncCap = function () {
       var opt = tName.options[tName.selectedIndex], min = +opt.dataset.min, max = +opt.dataset.max;
       tCap.min = min; tCap.max = max;
-      tCap.readOnly = min === max;                     // normal consultations: always 1 seat
+      tCap.disabled = min === max;    // normal consultations: always 1 seat (a disabled box is not sent; the API uses 1)
       if (+tCap.value < min || +tCap.value > max) tCap.value = min;
     };
     tName.addEventListener('change', syncCap);

@@ -416,10 +416,17 @@ def handle_dashboard_post():
                 elif not ID_PATTERN.match(request.form.get('consultation_id', '')):
                     flash('Choose a valid consultation type.', 'error')
                 else:
-                    # The API re-activates a type the doctor removed earlier instead of adding a duplicate.
+                    # Same as before: a type the doctor already offers is updated instead of added twice.
+                    # (The API itself re-activates a type the doctor removed earlier.)
                     payload['consultation_id'] = int(request.form['consultation_id'])
-                    outcome(api_request('POST', '/doctor/me/consultation-types', payload=payload),
-                            'Consultation type added.', 'Could not add the consultation type.')
+                    existing = next((t for t in api_items(api_request('GET', '/doctor/me/consultation-types'))
+                                     if t.get('consultation_id') == payload['consultation_id'] and t.get('is_active')), None)
+                    if existing:
+                        outcome(api_request('PUT', '/doctor/me/consultation-types/%s' % existing['consultation_type_id'],
+                                            payload=payload), 'Consultation type saved.', 'Could not save the consultation type.')
+                    else:
+                        outcome(api_request('POST', '/doctor/me/consultation-types', payload=payload),
+                                'Consultation type added.', 'Could not add the consultation type.')
 
         elif action == 'delete_type':
             tab = 'types'
@@ -530,7 +537,7 @@ def dashboard():
                 for p in (api_items(availability) if availability is not None else [])
                 if p.get('consultation_type_id') in active_ids]
     profile_data = profile.json() if profile is not None and profile.ok else {}
-    type_labels = {str(t['consultation_type_id']): '%s · %s min' % (t.get('label'), t.get('duration_min'))
+    type_labels = {str(t['consultation_type_id']): '%s · %s min' % (str(t.get('name', '')).replace('_', ' ').title(), t.get('duration_min'))
                    for t in all_types}
     slots = schedule.json().get('slots', []) if schedule is not None and schedule.ok else []
     decorated = decorate_slots(slots, type_labels, profile_data.get('timezone'))
@@ -552,7 +559,6 @@ def dashboard():
     open_total = sum(1 for g in schedule_days for s in g['slots']
                      if s.get('status') != 'CLOSED' and int(s.get('booked_count') or 0) < int(s.get('capacity') or 1))
     busy_days = [g for g in schedule_days if g['slots'] or g['blocked']]
-    offered = {t.get('consultation_id') for t in types}
     return render_template(
         'doctor.html',
         tabs=TABS, active=active, day=day, busy_days=busy_days, slot_total=slot_total, open_total=open_total, types=types, blackouts=blackouts, patterns=patterns,
@@ -560,11 +566,12 @@ def dashboard():
         schedule=decorated, schedule_days=schedule_days,
         schedule_error=(schedule is not None and not schedule.ok),
         prev_day=(day_obj - timedelta(days=30)).isoformat(), next_day=(day_obj + timedelta(days=30)).isoformat(),
-        catalog=catalog, addable=[c for c in catalog if c.get('consultation_id') not in offered],
+        catalog=catalog,
         hospitals=get_hospitals(),
         specializations=specialization_options(profile_data.get('specialization', '')),
         type_options=[{'id': t['consultation_type_id'], 'duration': t.get('duration_min'),
-                       'label': '%s · %s min' % (t.get('label'), t.get('duration_min'))} for t in types],
+                       'label': '%s · %s min' % (str(t.get('name', '')).replace('_', ' ').title(), t.get('duration_min'))}
+                      for t in types],
     )
 
 
