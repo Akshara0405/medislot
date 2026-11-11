@@ -17,8 +17,8 @@ import time
 from common import emit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCHEMA_PATHS = [os.path.join(HERE, 'schema.sql'),                              # inside the Lambda zip
-                os.path.join(HERE, '..', '..', 'schema', 'schema.sql')]        # in the repository
+SCHEMA_PATHS = [os.path.join(HERE, '..', '..', 'schema', 'schema.sql'),        # in the repository
+                os.path.join(HERE, 'schema.sql')]                              # inside the Lambda zip
 
 LEGACY = ['consultation_types', 'availability_patterns', 'blackout_dates']
 
@@ -47,8 +47,10 @@ UPGRADE_INDEXES = [
 def load_statements(path=None):
     """schema.sql split into single statements (full-line '--' comments removed)."""
     path = path or next(p for p in SCHEMA_PATHS if os.path.exists(p))
-    with open(path, encoding='utf-8') as handle:
-        text = '\n'.join(line for line in handle.read().splitlines() if not line.strip().startswith('--'))
+    with open(path, encoding='utf-8-sig') as handle:          # -sig: ignore a BOM some Windows editors add
+        text = handle.read().replace('\r\n', '\n').replace('\r', '\n')   # Windows / old Mac line endings
+    text = re.sub(r'/\*.*?\*/', '', text, flags=re.S)                    # /* block comments */
+    text = '\n'.join(line for line in text.splitlines() if not line.strip().startswith(('--', '#')))
     return [s.strip() for s in re.split(r';[ \t]*(?:\n|$)', text) if s.strip()]
 
 
