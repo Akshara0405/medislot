@@ -442,8 +442,8 @@ def release_seat(table, slot_id, ref, max_attempts=8, sleep=None):
             return False
         seen = int(item.get('version', 0) or 0)
         stays_closed = item.get('status') == CLOSED or item.get('manual_block')
-        values = {':one': 1, ':zero': 0, ':next': seen + 1, ':ref': ref, ':refset': {ref},
-                  ':status': CLOSED if stays_closed else OPEN}
+        values = {':one': 1, ':next': seen + 1, ':ref': ref, ':refset': {ref},
+                  ':status': CLOSED if stays_closed else OPEN}      # DynamoDB rejects unused values: none here
         guard = 'attribute_not_exists(version)'
         if 'version' in item:
             values[':seen'], guard = seen, 'version = :seen'

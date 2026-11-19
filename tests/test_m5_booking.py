@@ -183,6 +183,22 @@ def apply_update(item, text, names, values):
                 item.pop(names.get(clause, clause), None)
 
 
+def validate_placeholders(*expressions, names=None, values=None):
+    """Real DynamoDB refuses a request whose ExpressionAttributeNames/Values contain an entry that no expression
+    uses (ValidationException), or that uses one that is not supplied. Enforce the same here."""
+    text = ' '.join(e for e in expressions if e)
+    used_values, used_names = set(re.findall(r':[A-Za-z0-9_]+', text)), set(re.findall(r'#[A-Za-z0-9_]+', text))
+    for kind, given, used in (('values', set(values or {}), used_values), ('names', set(names or {}), used_names)):
+        if given - used:
+            raise ClientError({'Error': {'Code': 'ValidationException',
+                                         'Message': f'Value provided in ExpressionAttribute{kind.title()} unused in '
+                                                    f'expressions: keys: {sorted(given - used)}'}}, 'UpdateItem')
+        if used - given:
+            raise ClientError({'Error': {'Code': 'ValidationException',
+                                         'Message': f'ExpressionAttribute{kind.title()} missing: {sorted(used - given)}'}},
+                              'UpdateItem')
+
+
 def ccf():
     return ClientError({'Error': {'Code': 'ConditionalCheckFailedException', 'Message': 'The conditional request failed'}},
                        'UpdateItem')
@@ -212,12 +228,15 @@ class FakeTable:
             raise ccf()
 
     def put_item(self, Item, ConditionExpression=None, ExpressionAttributeNames=None, ExpressionAttributeValues=None):
+        validate_placeholders(ConditionExpression, names=ExpressionAttributeNames, values=ExpressionAttributeValues)
         with self.lock:
             self._check(self.items.get(Item[self.key]), ConditionExpression, ExpressionAttributeNames, ExpressionAttributeValues)
             self.items[Item[self.key]] = self._copy(Item)
 
     def update_item(self, Key, UpdateExpression, ConditionExpression=None, ExpressionAttributeNames=None,
                     ExpressionAttributeValues=None, **kw):
+        validate_placeholders(UpdateExpression, ConditionExpression, names=ExpressionAttributeNames,
+                              values=ExpressionAttributeValues)
         with self.lock:
             current = self.items.get(Key[self.key])
             self._check(current, ConditionExpression, ExpressionAttributeNames, ExpressionAttributeValues)
@@ -227,6 +246,7 @@ class FakeTable:
             self.updates += 1
 
     def delete_item(self, Key, ConditionExpression=None, ExpressionAttributeNames=None, ExpressionAttributeValues=None):
+        validate_placeholders(ConditionExpression, names=ExpressionAttributeNames, values=ExpressionAttributeValues)
         with self.lock:
             self._check(self.items.get(Key[self.key]), ConditionExpression, ExpressionAttributeNames, ExpressionAttributeValues)
             self.items.pop(Key[self.key], None)
