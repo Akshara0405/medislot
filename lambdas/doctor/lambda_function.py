@@ -418,7 +418,11 @@ def blackouts(conn, cur, doctor_id, method, ident, data):
 
 
 def slot_block(cur, doctor_id, data):
-    """Close (blocked=true) or re-open (blocked=false) ONE slot. A booking on it is never cancelled."""
+    """Close (blocked=true) or re-open (blocked=false) ONE slot. A booking on it is never cancelled.
+
+    Milestone 5: both writes bump the slot's `version`, so a booking racing this change retries against the
+    new state instead of overwriting it. Re-opening also clears a doctor cancellation (cancelled_by_doctor).
+    """
     slot_id, blocked = data.get('slot_id'), data.get('blocked', True)
     if (not isinstance(slot_id, str) or not slot_id.startswith(f'{doctor_id}#') or len(slot_id) > 190
             or type(blocked) is not bool):
@@ -431,11 +435,16 @@ def slot_block(cur, doctor_id, data):
     if cur.fetchone():
         return fail(409, f"{slot.get('local_date')} is a blackout day, so every slot that day stays closed. "
                          f"Remove the blackout date first (Blackouts tab), then open or close single slots.")
+    bump = {':one': 1, ':zero': 0}
     if blocked:
-        table.update_item(Key={'slot_id': slot_id}, UpdateExpression='SET manual_block = :t',
-                          ExpressionAttributeValues={':t': True})
+        table.update_item(Key={'slot_id': slot_id},
+                          UpdateExpression='SET manual_block = :t, version = if_not_exists(version, :zero) + :one',
+                          ExpressionAttributeValues={':t': True, **bump})
     else:
-        table.update_item(Key={'slot_id': slot_id}, UpdateExpression='REMOVE manual_block')
+        table.update_item(Key={'slot_id': slot_id},
+                          UpdateExpression='SET version = if_not_exists(version, :zero) + :one '
+                                           'REMOVE manual_block, cancelled_by_doctor, cancelled_at',
+                          ExpressionAttributeValues=bump)
     return response(200, {'slotId': slot_id, 'blocked': blocked,
                           'hasBooking': int(slot.get('booked_count', 0) or 0) > 0, **sync(cur, doctor_id)})
 
@@ -453,4 +462,6 @@ def schedule(doctor_id, params):
     if not 1 <= days <= 30:
         return fail(400, 'days must be between 1 and 30')
     items = query_schedule_window(slots_table(), doctor_id, first_day, days)
-    return response(200, {'startDate': first_day.isoformat(), 'days': days, 'slots': [jsonable(x) for x in items]})
+    # booking_refs (Milestone 5) is the engine's internal seat ledger: count only, never the refs themselves.
+    return response(200, {'startDate': first_day.isoformat(), 'days': days,
+                          'slots': [jsonable({k: v for k, v in x.items() if k != 'booking_refs'}) for x in items]})

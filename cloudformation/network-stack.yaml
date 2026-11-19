@@ -107,6 +107,16 @@ Resources:
       PrivateDnsEnabled: true
       SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
       SecurityGroupIds: [!GetAtt EndpointSecurityGroup.GroupId]
+  # Milestone 5: the booking Lambda publishes to EventBridge from the private subnets (there is no NAT).
+  EventsInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref MediSlotVPC
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.events'
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      SecurityGroupIds: [!GetAtt EndpointSecurityGroup.GroupId]
   S3GatewayEndpoint:
     Type: AWS::EC2::VPCEndpoint
     Properties:

@@ -10,6 +10,10 @@ T30, T15, T60 = 'type-30', 'type-15', 'type-60'
 class FakeTable:
     def __init__(self): self.items = {}
     def update_item(self, Key, ExpressionAttributeValues, **kw): self.items[Key['slot_id']]['status'] = ExpressionAttributeValues[':s']
+    # Milestone 5: resync writes one conditional item at a time (conditions always hold in these single-threaded tests).
+    def put_item(self, Item, **kw): self.items[Item['slot_id']] = dict(Item)
+    def delete_item(self, Key, **kw): self.items.pop(Key['slot_id'], None)
+    def get_item(self, Key, **kw): return {'Item': dict(self.items[Key['slot_id']])} if Key['slot_id'] in self.items else {}
     def query(self, IndexName, KeyConditionExpression, **kw):
         key = KeyConditionExpression._values[1]
         return {'Items': sorted((dict(i) for i in self.items.values() if i['doctor_date'] == key), key=lambda i: i['start_at'])}

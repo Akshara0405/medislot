@@ -276,3 +276,28 @@ td,th{text-align:left;padding:10px;border-bottom:1px solid var(--line)}
 @media(max-width:800px){.hero,.auth-wrap{grid-template-columns:minmax(0,1fr)}.visual{min-height:360px}.role-grid{grid-template-columns:1fr}.auth-aside{min-height:270px}.auth-panel{padding:25px}.hero{padding-top:35px}.nav{height:70px}.nav-link{display:none}}
 @media(max-width:520px){.form-grid{grid-template-columns:1fr}.field.full{grid-column:auto}.role-card{align-items:flex-start;flex-wrap:wrap}.role-card .role-action{margin-left:78px}.footer{gap:12px;flex-direction:column}.auth-panel h1{font-size:29px}}
 @media(min-width:1800px){.shell{max-width:1480px}.auth-wrap{max-width:1280px}}
+/* ===== Milestone 5: booking, appointments, family, refunds ===== */
+.book-box{margin-top:8px}
+.book-box summary{cursor:pointer;font-weight:800;font-size:12px;color:var(--teal);list-style:none}
+.book-box summary::-webkit-details-marker{display:none}
+.book-form{display:flex;flex-direction:column;gap:6px;margin-top:8px}
+.book-form label{display:flex;flex-direction:column;font-size:11px;font-weight:700;gap:3px;color:var(--ink)}
+.book-form input,.book-form select{padding:7px 9px;border:1px solid var(--line);border-radius:9px;background:#fff;font-size:13px}
+.book-form .primary,.book-form .danger{padding:9px 12px;font-size:13px}
+.appt-card{border:1px solid var(--line);border-radius:18px;padding:16px 18px;margin:12px 0;background:#fff}
+.appt-main{display:grid;grid-template-columns:220px 1fr;gap:18px;align-items:start}
+.appt-main h3{margin:0 0 4px;font-size:19px;letter-spacing:-.5px}
+.appt-main p{margin:0 0 8px}
+.appt-when{background:var(--mint);border-radius:14px;padding:12px 14px;display:flex;flex-direction:column;gap:3px;color:#14594f}
+.appt-when small{font-size:12px}
+.refund-strip{border-top:1px dashed var(--line);margin-top:14px;padding-top:12px}
+.refund-strip p{margin:0 0 8px}
+.refund-strip .inline{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.refund-strip .inline input{padding:9px 11px;border:1px solid var(--line);border-radius:10px;min-width:220px}
+.tier-line{display:flex;gap:8px;list-style:none;padding:0;margin:0 0 12px;flex-wrap:wrap}
+.tier-line li{border:1px solid var(--line);border-radius:12px;padding:7px 11px;display:flex;flex-direction:column;font-size:12px;color:var(--muted)}
+.tier-line li b{color:var(--ink);font-size:14px}
+.tier-line li.now{border-color:var(--teal);background:#e6f5ee;color:#14594f}
+.status-pill{display:inline-block;border-radius:20px;padding:4px 10px;font-size:12px;font-weight:700;background:var(--mint);color:#1d6b5f}
+.status-pill.cancelled_by_patient,.status-pill.cancelled_by_doctor{background:#fff0ed;color:#a43c2d}
+@media (max-width:720px){.appt-main{grid-template-columns:1fr}}

@@ -21,6 +21,9 @@ Rules
   * Re-running is safe (idempotent): it only adds what is missing, removes
     unbooked slots that no longer belong, and refreshes unbooked slots whose
     end time, capacity or status changed.
+  * Milestone 5: every write here is CONDITIONAL and bumps the slot's `version`, exactly like the booking
+    engine's optimistic concurrency. A slot that a patient books while this sync runs is therefore never
+    overwritten or deleted: the conditional write fails, the slot is left alone and counted as keptBooked.
 """
 import os
 from datetime import datetime, timedelta, timezone, time as dtime
@@ -28,6 +31,7 @@ from zoneinfo import ZoneInfo
 
 import boto3
 from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError
 
 WINDOW_DAYS = 30
 DEFAULT_TZ = 'Asia/Kolkata'
@@ -239,6 +243,62 @@ def _open_status(item):
     return FULL if taken >= int(item.get('capacity', 1) or 1) else OPEN
 
 
+def _conditional(write):
+    """Run one conditional DynamoDB write. False when the condition failed (someone changed the slot first)."""
+    try:
+        write()
+        return True
+    except ClientError as exc:
+        if exc.response.get('Error', {}).get('Code') != 'ConditionalCheckFailedException':
+            raise
+        return False
+
+
+def _version_guard(old):
+    """Condition + values that only match the exact item we read (same version, still no booking refs)."""
+    if 'version' in old:
+        return ('version = :seen AND attribute_not_exists(booking_refs)', {':seen': int(old['version'])})
+    return ('attribute_not_exists(version) AND attribute_not_exists(booking_refs)', {})
+
+
+def _put_if_unchanged(table, item, old):
+    condition, values = _version_guard(old)
+    kwargs = {'Item': item, 'ConditionExpression': condition}
+    if values:
+        kwargs['ExpressionAttributeValues'] = values
+    return _conditional(lambda: table.put_item(**kwargs))
+
+
+def _delete_if_unchanged(table, old):
+    condition, values = _version_guard(old)
+    kwargs = {'Key': {'slot_id': old['slot_id']}, 'ConditionExpression': condition}
+    if values:
+        kwargs['ExpressionAttributeValues'] = values
+    return _conditional(lambda: table.delete_item(**kwargs))
+
+
+def _set_status(table, old, closing):
+    """Change only the status of a booked/held slot, re-reading if a booking raced us (max 3 tries)."""
+    item = old
+    for _ in range(3):
+        new_status = CLOSED if closing else _open_status(item)
+        if item.get('status') == new_status:
+            return None
+        guard = 'version = :seen' if 'version' in item else 'attribute_not_exists(version)'
+        values = {':s': new_status, ':one': 1, ':zero': 0}
+        if 'version' in item:
+            values[':seen'] = int(item['version'])
+        if _conditional(lambda: table.update_item(
+                Key={'slot_id': item['slot_id']}, ConditionExpression=guard,
+                UpdateExpression='SET #s = :s, version = if_not_exists(version, :zero) + :one',
+                ExpressionAttributeNames={'#s': 'status'}, ExpressionAttributeValues=values)):
+            return new_status
+        item = table.get_item(Key={'slot_id': item['slot_id']}, ConsistentRead=True).get('Item')
+        if not item:
+            return None
+    return None
+
+
 def resync_slots(cur, doctor_id, days=WINDOW_DAYS, table=None, today=None):
     """Bring DynamoDB in line with MySQL. Returns counts of what changed."""
     table = table or slots_table()
@@ -248,43 +308,45 @@ def resync_slots(cur, doctor_id, days=WINDOW_DAYS, table=None, today=None):
 
     created = updated = removed = kept_booked = closed = reopened = skipped = 0
     status_only = []                       # booked/held slots: change status, never replace the item
-    with table.batch_writer() as batch:
-        for day_iso, wanted in plan.items():
-            current = {i['slot_id']: i for i in _existing(table, doctor_id, day_iso)}
-            wanted, dropped = _dedupe(wanted, current)
-            skipped += dropped
-            for slot_id, item in current.items():
-                if slot_id not in wanted:
-                    if _in_use(item):
-                        kept_booked += 1          # never cancel a patient's booking
-                    else:
-                        batch.delete_item(Key={'slot_id': slot_id})
-                        removed += 1
-            for slot_id, item in wanted.items():
-                old = current.get(slot_id)
-                if old is not None and old.get('manual_block'):
-                    item['status'], item['manual_block'] = CLOSED, True      # doctor closed this one slot by hand
-                if old is None:
-                    batch.put_item(Item=item)
+    for day_iso, wanted in plan.items():
+        current = {i['slot_id']: i for i in _existing(table, doctor_id, day_iso)}
+        wanted, dropped = _dedupe(wanted, current)
+        skipped += dropped
+        for slot_id, item in current.items():
+            if slot_id not in wanted:
+                if _in_use(item) or not _delete_if_unchanged(table, item):
+                    kept_booked += 1          # never cancel a patient's booking (also one made a moment ago)
+                else:
+                    removed += 1
+        for slot_id, item in wanted.items():
+            old = current.get(slot_id)
+            if old is not None and old.get('manual_block'):
+                item['status'], item['manual_block'] = CLOSED, True      # doctor closed this one slot by hand
+                for extra in ('cancelled_by_doctor', 'cancelled_at'):
+                    if extra in old:
+                        item[extra] = old[extra]
+            if old is None:
+                if _conditional(lambda: table.put_item(Item=item, ConditionExpression='attribute_not_exists(slot_id)')):
                     created += 1
                     closed += item['status'] == CLOSED
+                continue
+            if _in_use(old):
+                # keep the booking; only the status can change (CLOSED on a blackout, back to OPEN/FULL after)
+                status_only.append((old, item['status'] == CLOSED))
+                continue
+            if (old.get('end_at') != item['end_at'] or int(old.get('capacity', 0)) != item['capacity']
+                    or old.get('status') != item['status']):
+                item['version'] = int(old.get('version', 0) or 0) + 1
+                if not _put_if_unchanged(table, item, old):
+                    kept_booked += 1          # booked between our read and this write: leave it alone
                     continue
-                if _in_use(old):
-                    # keep the booking; only the status can change (CLOSED on a blackout, back to OPEN/FULL after)
-                    new_status = CLOSED if item['status'] == CLOSED else _open_status(old)
-                    if old.get('status') != new_status:
-                        status_only.append((slot_id, new_status))
-                        closed += new_status == CLOSED
-                        reopened += new_status != CLOSED
-                    continue
-                if (old.get('end_at') != item['end_at'] or int(old.get('capacity', 0)) != item['capacity']
-                        or old.get('status') != item['status']):
-                    batch.put_item(Item=item)
-                    updated += 1
-                    closed += item['status'] == CLOSED and old.get('status') != CLOSED
-                    reopened += item['status'] != CLOSED and old.get('status') == CLOSED
-    for slot_id, new_status in status_only:
-        table.update_item(Key={'slot_id': slot_id}, UpdateExpression='SET #s = :s',
-                          ExpressionAttributeNames={'#s': 'status'}, ExpressionAttributeValues={':s': new_status})
+                updated += 1
+                closed += item['status'] == CLOSED and old.get('status') != CLOSED
+                reopened += item['status'] != CLOSED and old.get('status') == CLOSED
+    for old, closing in status_only:
+        new_status = _set_status(table, old, closing)
+        if new_status is not None:
+            closed += new_status == CLOSED
+            reopened += new_status != CLOSED
     return {'created': created, 'updated': updated, 'removed': removed, 'closed': closed, 'reopened': reopened,
             'keptBooked': kept_booked, 'skippedOverlap': skipped, 'days': days, 'startDate': first_day.isoformat()}

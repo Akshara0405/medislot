@@ -1,6 +1,6 @@
 
 AWSTemplateFormatVersion: '2010-09-09'
-Description: MediSlot private RDS MySQL, DynamoDB state tables, S3 buckets and SSM runtime configuration.
+Description: MediSlot private RDS MySQL, DynamoDB state tables, S3 buckets, SSM runtime configuration and the booking event bus.
 
 Parameters:
   Environment:
@@ -278,6 +278,68 @@ Resources:
       Type: String
       Value: '7'
 
+  # ------------------------------------------------------------------ Milestone 5: booking engine
+  # Refund windows. A tier applies when (appointment start - cancellation time) >= minHoursBefore; exactly AT a
+  # cutoff the higher tier still applies. Edit in the SSM console to test (the Lambda re-reads within 60 s);
+  # change it here to make it permanent (the next deploy writes this value back).
+  RefundPolicyParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/medislot/${Environment}/booking/refund-policy'
+      Type: String
+      Description: MediSlot refund tiers (JSON). Invalid JSON pauses cancellations (fail closed) instead of refunding wrongly.
+      Value: '{"version":"2026-11-v1","currency":"INR","tiers":[{"tier":"FULL","minHoursBefore":24,"refundPercent":100},{"tier":"PARTIAL","minHoursBefore":6,"refundPercent":50},{"tier":"LATE","minHoursBefore":0,"refundPercent":0}]}'
+
+  BookingLimitsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/medislot/${Environment}/booking/limits'
+      Type: String
+      Description: MediSlot patient booking limits and optimistic-concurrency retry settings (JSON).
+      Value: '{"maxUpcomingPerPatient":3,"minLeadMinutes":0,"maxOccAttempts":10,"backoffBaseMs":15,"backoffCapMs":400}'
+
+  BookingEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub 'medislot-${Environment}-events'
+
+  # Every booking event is kept 30 days and can be replayed into the bus (e.g. for a new consumer).
+  BookingEventArchive:
+    Type: AWS::Events::Archive
+    Properties:
+      ArchiveName: !Sub 'medislot-${Environment}-booking-archive'
+      SourceArn: !GetAtt BookingEventBus.Arn
+      RetentionDays: 30
+      EventPattern:
+        source: [medislot.booking]
+
+  # Audit trail the mentor can read: every AppointmentBooked / AppointmentCancelled / SlotSeatFreed / SlotCancelled.
+  BookingEventLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/events/medislot-${Environment}-booking'
+      RetentionInDays: 30
+
+  BookingEventLogPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: !Sub 'medislot-${Environment}-eventbridge-to-logs'
+      PolicyDocument: !Sub '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":["events.amazonaws.com","delivery.logs.amazonaws.com"]},"Action":["logs:CreateLogStream","logs:PutLogEvents"],"Resource":"${BookingEventLogGroup.Arn}"}]}'
+
+  BookingEventLogRule:
+    Type: AWS::Events::Rule
+    DependsOn: BookingEventLogPolicy
+    Properties:
+      Name: !Sub 'medislot-${Environment}-booking-events-to-logs'
+      Description: Copy every MediSlot booking event to CloudWatch Logs.
+      EventBusName: !Ref BookingEventBus
+      State: ENABLED
+      EventPattern:
+        source: [medislot.booking]
+      Targets:
+        - Id: BookingEventLog
+          Arn: !GetAtt BookingEventLogGroup.Arn
+
 Outputs:
   DBEndpoint:
     Value: !GetAtt MediSlotDatabase.Endpoint.Address
@@ -295,6 +357,18 @@ Outputs:
       Name: !Sub 'MediSlot-${Environment}-SlotsTableName'
   IdempotencyTableName:
     Value: !Ref IdempotencyTable
+    Export:
+      Name: !Sub 'MediSlot-${Environment}-IdempotencyTableName'
+  BookingEventBusName:
+    Value: !Ref BookingEventBus
+    Export:
+      Name: !Sub 'MediSlot-${Environment}-BookingEventBusName'
+  BookingEventBusArn:
+    Value: !GetAtt BookingEventBus.Arn
+    Export:
+      Name: !Sub 'MediSlot-${Environment}-BookingEventBusArn'
+  BookingEventLogGroupName:
+    Value: !Ref BookingEventLogGroup
   AuthTokensTableName:
     Value: !Ref AuthTokensTable
   WaitlistTableName:

@@ -12,7 +12,7 @@ import migrate  # noqa: E402
 def test_schema_sql_has_no_uuid_or_enum_ids_and_splits_cleanly():
     statements = migrate.load_statements()
     creates = [s for s in statements if s.startswith('CREATE TABLE')]
-    assert len(creates) == 8
+    assert len(creates) == 10            # 8 tables + Milestone 5: appointments, refund_ledger
     text = '\n'.join(statements)
     assert 'CHAR(36)' not in text and "ENUM('QUICK'" not in text
     for table in ('users', 'hospitals', 'consultations', 'consultation_types', 'availability_patterns', 'blackout_dates'):

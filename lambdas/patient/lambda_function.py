@@ -783,6 +783,16 @@ def delete_me(conn, event, params, cid):
         raise ApiError(400, f'To delete your account send {{"confirm": "{DELETE_CONFIRMATION}"}}')
     with conn.cursor() as cur:
         fetch_profile(cur, patient_id)
+        # Milestone 5: a closed account must not keep seats. Ask the patient to cancel first (refunds apply).
+        try:
+            cur.execute("SELECT COUNT(*) AS n FROM appointments WHERE patient_id = %s AND status = 'CONFIRMED' "
+                        'AND slot_start_utc > UTC_TIMESTAMP(6)', (patient_id,))
+            upcoming = int((cur.fetchone() or {}).get('n') or 0)
+        except pymysql.err.ProgrammingError:
+            upcoming = 0                                  # booking tables not migrated yet
+        if upcoming:
+            raise ApiError(409, f'You have {upcoming} upcoming appointment(s). Cancel them first, then delete '
+                                'your account.', upcomingAppointments=upcoming)
         cur.execute('DELETE FROM patients WHERE user_id = %s', (patient_id,))
         # Keep the users row (future bookings point at it) but make it unusable and free the email for re-use.
         cur.execute("UPDATE users SET is_active = FALSE, email = %s, password_hash = '!deleted' "

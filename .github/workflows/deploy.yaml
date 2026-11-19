@@ -1,5 +1,5 @@
 
-name: MediSlot Milestone 2 CI and Deployment
+name: MediSlot CI and Deployment (Milestone 5 booking engine)
 
 on:
   pull_request:
@@ -60,6 +60,15 @@ jobs:
           AWS_REGION: ap-south-1
           AWS_DEFAULT_REGION: ap-south-1
         run: pytest -q
+
+      - name: Milestone 5 mandatory tests (concurrency + idempotency), run 5 times to catch flakiness
+        env:
+          AWS_REGION: ap-south-1
+          AWS_DEFAULT_REGION: ap-south-1
+        run: |
+          for run in 1 2 3 4 5; do
+            pytest -q -k "mandatory_1 or mandatory_2" tests/test_m5_booking.py
+          done
 
       - name: Python syntax check
         run: python -m compileall -q lambdas tests dashboard
@@ -222,7 +231,7 @@ jobs:
           AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
           BUCKET="medislot-${ENVIRONMENT}-artifacts-${AWS_ACCOUNT_ID}"
 
-          for fn in authentication authorization doctor patient materializer; do
+          for fn in authentication authorization doctor patient materializer booking; do
             tmp="$(mktemp -d)"
 
             cp -R "lambdas/${fn}/." "$tmp/"
@@ -379,12 +388,37 @@ jobs:
           echo "::add-mask::${MEDISLOT_CI_PASSWORD}"
           pytest -v tests/integration --junitxml=integration-results.xml
 
+      - name: Show the refund policy and booking limits the booking Lambda reads from SSM
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws lambda invoke --function-name "medislot-${ENVIRONMENT}-booking" --payload '{"action":"policy"}' \
+            --cli-binary-format raw-in-base64-out /tmp/booking-policy.json --region "$AWS_REGION" >/dev/null
+          cat /tmp/booking-policy.json
+          python -c '
+          import json
+          body = json.load(open("/tmp/booking-policy.json"))["body"]
+          assert "error" not in body["refundPolicy"], body
+          '
+
+      - name: Milestone 5 live tests (mandatory concurrency + idempotency against the deployed API)
+        shell: bash
+        run: |
+          set -euo pipefail
+          pip install --quiet -r requirements-dev.txt
+          export MEDISLOT_API_URL="$(aws cloudformation describe-stacks --stack-name "medislot-${ENVIRONMENT}-auth" --region "$AWS_REGION" --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue | [0]" --output text)"
+          export MEDISLOT_CI_PASSWORD="$(aws ssm get-parameter --name "/medislot/${ENVIRONMENT}/ci/probe-password" --with-decryption --region "$AWS_REGION" --query Parameter.Value --output text)"
+          echo "::add-mask::${MEDISLOT_CI_PASSWORD}"
+          pytest -v -s -m live tests/test_m5_booking.py --junitxml=m5-live-results.xml
+
       - name: Publish integration test report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: m4-integration-results
+          name: integration-results
           path: |
             integration-results.xml
+            m5-live-results.xml
             /tmp/explain-search.json
+            /tmp/booking-policy.json
           if-no-files-found: ignore

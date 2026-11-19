@@ -16,6 +16,7 @@
   <div class="nav-right">
     {% if role == 'patient' %}
       <a class="nav-link" href="/patient/dashboard">Find a doctor</a>
+      <a class="nav-link" href="/patient/dashboard?tab=appointments">My appointments</a>
       <a class="nav-link" href="/patient/dashboard?tab=profile">My profile</a>
       <a class="nav-cta" href="/patient/logout">Sign out <span>↗</span></a>
     {% elif role == 'doctor' %}

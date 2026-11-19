@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: MediSlot API, doctor scheduling, patient domain and rolling slot materializer Lambdas.
+Description: MediSlot API, doctor scheduling, patient domain, booking engine and rolling slot materializer Lambdas.
 Parameters:
   Environment:
     Type: String
@@ -641,6 +641,229 @@ Resources:
       AuthorizationType: CUSTOM
       AuthorizerId: !Ref ApiAuthorizer
       Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorFunction.Arn}/invocations'}
+  # =================================================================== Milestone 5: booking engine
+  BookingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'MediSlot-${Environment}-BookingRole'
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]}
+      ManagedPolicyArns: [!Ref LambdaExecutionBasePolicy]
+      Policies:
+        - PolicyName: BookingRuntimeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ssm:GetParameter]
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/*'
+              - Effect: Allow
+                Action: [kms:Decrypt]
+                Resource: '*'
+              # Seats: read + conditional update only. No PutItem/DeleteItem: the booking engine can never
+              # create or remove a slot, only take or give back a seat under a version check.
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:Query]
+                Resource:
+                  - !Sub
+                    - 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${SlotsTable}'
+                    - SlotsTable: !ImportValue
+                        Fn::Sub: 'MediSlot-${Environment}-SlotsTableName'
+                  - !Sub
+                    - 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${SlotsTable}/index/*'
+                    - SlotsTable: !ImportValue
+                        Fn::Sub: 'MediSlot-${Environment}-SlotsTableName'
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem]
+                Resource: !Sub
+                  - 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${IdemTable}'
+                  - IdemTable: !ImportValue
+                      Fn::Sub: 'MediSlot-${Environment}-IdempotencyTableName'
+              - Effect: Allow
+                Action: [events:PutEvents]
+                Resource: !ImportValue
+                  Fn::Sub: 'MediSlot-${Environment}-BookingEventBusArn'
+  BookingLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/medislot-${Environment}-booking'
+      RetentionInDays: 30
+  BookingFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: BookingLogGroup
+    Properties:
+      FunctionName: !Sub 'medislot-${Environment}-booking'
+      Description: Booking engine (Milestone 5) - optimistic concurrency, idempotency, cancellations, refund ledger, events.
+      Runtime: python3.12
+      Handler: lambda_function.handler
+      Role: !GetAtt BookingRole.Arn
+      Timeout: 28
+      MemorySize: 512
+      Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Sub '${ArtifactPrefix}/booking.zip'}
+      VpcConfig:
+        SecurityGroupIds: [!ImportValue {Fn::Sub: 'MediSlot-${Environment}-LambdaSecurityGroupId'}]
+        SubnetIds:
+          - Fn::ImportValue: !Sub 'MediSlot-${Environment}-PrivateSubnet1Id'
+          - Fn::ImportValue: !Sub 'MediSlot-${Environment}-PrivateSubnet2Id'
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          SLOTS_TABLE: !ImportValue
+            Fn::Sub: 'MediSlot-${Environment}-SlotsTableName'
+          IDEMPOTENCY_TABLE: !ImportValue
+            Fn::Sub: 'MediSlot-${Environment}-IdempotencyTableName'
+          EVENT_BUS_NAME: !ImportValue
+            Fn::Sub: 'MediSlot-${Environment}-BookingEventBusName'
+  # Seat sweeper: gives back the seat of any cancellation whose in-request release did not finish.
+  BookingSeatSweeperSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'medislot-${Environment}-booking-seat-sweeper'
+      Description: Free seats of cancelled appointments that were not released (idempotent).
+      ScheduleExpression: rate(5 minutes)
+      State: ENABLED
+      Targets:
+        - Id: BookingSeatSweeper
+          Arn: !GetAtt BookingFunction.Arn
+          Input: '{"action":"release-pending"}'
+  BookingSeatSweeperPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BookingFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BookingSeatSweeperSchedule.Arn
+  BookingInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BookingFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*/*'
+  PatientAppointmentsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref PatientResource, PathPart: 'appointments'}
+  PatientAppointmentItemResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref PatientAppointmentsResource, PathPart: '{appointmentId}'}
+  PatientAppointmentQuoteResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref PatientAppointmentItemResource, PathPart: 'refund-quote'}
+  PatientAppointmentCancelResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref PatientAppointmentItemResource, PathPart: 'cancel'}
+  PatientRefundsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref PatientResource, PathPart: 'refunds'}
+  DoctorAppointmentsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref DoctorMeResource, PathPart: 'appointments'}
+  DoctorSlotCancellationsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref DoctorMeResource, PathPart: 'slot-cancellations'}
+  BookingAppointmentsPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PatientAppointmentsResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'}
+  BookingAppointmentsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PatientAppointmentsResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'}
+  BookingAppointmentItemGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PatientAppointmentItemResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'}
+  BookingRefundQuoteGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PatientAppointmentQuoteResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'}
+  BookingCancelPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PatientAppointmentCancelResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'}
+  BookingRefundsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PatientRefundsResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'}
+  BookingDoctorAppointmentsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorAppointmentsResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'}
+  BookingSlotCancellationsPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorSlotCancellationsResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'}
+  BookingRetriesExhaustedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'medislot-${Environment}-booking-retries-exhausted'
+      AlarmDescription: A booking gave up after maxOccAttempts optimistic-concurrency retries (503 to the patient).
+      Namespace: MediSlot/Booking
+      MetricName: BookingRetriesExhausted
+      Dimensions: [{Name: Environment, Value: !Ref Environment}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+  # One page for the checkpoint: contention (retries) next to outcomes, cancellations by refund tier, events.
+  BookingDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'MediSlot-${Environment}-Booking'
+      DashboardBody: !Sub |
+        {"widgets":[
+         {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"BookingConflictRetries (Sum = retries, SampleCount = booking attempts)","region":"${AWS::Region}","stat":"Sum","period":60,"view":"timeSeries",
+          "metrics":[["MediSlot/Booking","BookingConflictRetries","Environment","${Environment}",{"label":"conflict retries"}],["...",{"stat":"SampleCount","label":"booking attempts"}],["MediSlot/Booking","BookingRetriesExhausted","Environment","${Environment}",{"label":"gave up (503)"}]]}},
+         {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"Booking outcomes","region":"${AWS::Region}","stat":"Sum","period":60,"view":"timeSeries",
+          "metrics":[["MediSlot/Booking","BookingsConfirmed","Environment","${Environment}",{"label":"booked (201)"}],["MediSlot/Booking","IdempotentReplays","Environment","${Environment}",{"label":"idempotent replays"}],[{"expression":"SEARCH('{MediSlot/Booking,Environment,Reason} MetricName=\"BookingsRejected\" Environment=\"${Environment}\"', 'Sum', 60)","id":"rej","label":"rejected"}]]}},
+         {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"CancellationsByTier","region":"${AWS::Region}","stat":"Sum","period":300,"view":"bar",
+          "metrics":[[{"expression":"SEARCH('{MediSlot/Booking,Environment,Tier} MetricName=\"CancellationsByTier\" Environment=\"${Environment}\"', 'Sum', 300)","id":"tiers"}]]}},
+         {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"title":"Refunded amount (INR) by tier, and event publish failures","region":"${AWS::Region}","stat":"Sum","period":300,"view":"timeSeries",
+          "metrics":[[{"expression":"SEARCH('{MediSlot/Booking,Environment,Tier} MetricName=\"RefundAmount\" Environment=\"${Environment}\"', 'Sum', 300)","id":"amt"}],["MediSlot/Booking","EventPublishFailures","Environment","${Environment}"]]}},
+         {"type":"log","x":0,"y":12,"width":24,"height":6,"properties":{"title":"Booking events on the bus (latest)","region":"${AWS::Region}","view":"table",
+          "query":"SOURCE '/aws/events/medislot-${Environment}-booking' | fields @timestamp, `detail-type`, detail.appointmentId, detail.slotId, detail.refund.tier, detail.refund.refundAmount | sort @timestamp desc | limit 50"}}
+        ]}
   DoctorInvokePermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -662,12 +885,13 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*/*'
-  ApiDeploymentPatientDomain:
+  # A NEW logical id per milestone makes CloudFormation create a fresh deployment that includes the new routes.
+  ApiDeploymentBookingEngine:
     Type: AWS::ApiGateway::Deployment
-    DependsOn: [PatientMePostMethod, PatientMePutMethod, PatientMeDeleteMethod, PatientProfileItemGetMethod, DirectorySearchGetMethod, DirectoryFiltersGetMethod, DirectoryDoctorGetMethod, DirectoryDoctorSlotsGetMethod, DoctorSlotBlocksPostMethod, HospitalsGetMethod, RegisterPatientMethod, RegisterDoctorMethod, LoginMethod, RefreshMethod, LogoutMethod, PatientMeMethod, DoctorMeMethod, DoctorMePutMethod, DoctorPhotoPostMethod, DoctorAvailabilityGetMethod, DoctorAvailabilityPutMethod, DoctorScheduleGetMethod, DoctorTypesGetMethod, DoctorTypesPostMethod, DoctorTypeItemPutMethod, DoctorTypeItemDeleteMethod, DoctorBlackoutsGetMethod, DoctorBlackoutsPostMethod, DoctorBlackoutItemDeleteMethod]
+    DependsOn: [BookingAppointmentsPostMethod, BookingAppointmentsGetMethod, BookingAppointmentItemGetMethod, BookingRefundQuoteGetMethod, BookingCancelPostMethod, BookingRefundsGetMethod, BookingDoctorAppointmentsGetMethod, BookingSlotCancellationsPostMethod, PatientMePostMethod, PatientMePutMethod, PatientMeDeleteMethod, PatientProfileItemGetMethod, DirectorySearchGetMethod, DirectoryFiltersGetMethod, DirectoryDoctorGetMethod, DirectoryDoctorSlotsGetMethod, DoctorSlotBlocksPostMethod, HospitalsGetMethod, RegisterPatientMethod, RegisterDoctorMethod, LoginMethod, RefreshMethod, LogoutMethod, PatientMeMethod, DoctorMeMethod, DoctorMePutMethod, DoctorPhotoPostMethod, DoctorAvailabilityGetMethod, DoctorAvailabilityPutMethod, DoctorScheduleGetMethod, DoctorTypesGetMethod, DoctorTypesPostMethod, DoctorTypeItemPutMethod, DoctorTypeItemDeleteMethod, DoctorBlackoutsGetMethod, DoctorBlackoutsPostMethod, DoctorBlackoutItemDeleteMethod]
     Properties:
       RestApiId: !Ref RestApi
-      Description: !Sub 'MediSlot ${Environment} API deployment - Milestone 4 patient domain and doctor discovery'
+      Description: !Sub 'MediSlot ${Environment} API deployment - Milestone 5 booking engine'
   # One JSON line per API call (success or failure), with total latency, Lambda latency and authorizer latency.
   ApiAccessLogGroup:
     Type: AWS::Logs::LogGroup
@@ -678,7 +902,7 @@ Resources:
     Type: AWS::ApiGateway::Stage
     Properties:
       RestApiId: !Ref RestApi
-      DeploymentId: !Ref ApiDeploymentPatientDomain
+      DeploymentId: !Ref ApiDeploymentBookingEngine
       StageName: !Ref Environment
       AccessLogSetting:
         DestinationArn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ApiAccessLogGroup}'
@@ -697,6 +921,14 @@ Resources:
           DataTraceEnabled: false
           ThrottlingRateLimit: 25
           ThrottlingBurstLimit: 50
+        # Booking: high enough for the 20+ parallel checkpoint test, low enough to blunt a runaway client.
+        - ResourcePath: '/~1patient~1appointments'
+          HttpMethod: POST
+          MetricsEnabled: true
+          LoggingLevel: INFO
+          DataTraceEnabled: false
+          ThrottlingRateLimit: 100
+          ThrottlingBurstLimit: 200
         - ResourcePath: '/~1doctors~1{doctorId}~1slots'
           HttpMethod: GET
           MetricsEnabled: true
@@ -719,6 +951,13 @@ Outputs:
   DoctorFunctionName: {Value: !Ref DoctorFunction}
   MaterializerFunctionName: {Value: !Ref MaterializerFunction}
   PatientFunctionName: {Value: !Ref PatientFunction}
+  BookingFunctionName: {Value: !Ref BookingFunction}
+  BookingUrl:
+    Description: POST here with an Idempotency-Key header to book a slot.
+    Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/patient/appointments'
+  BookingDashboardUrl:
+    Description: CloudWatch dashboard with BookingConflictRetries, outcomes and CancellationsByTier.
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=MediSlot-${Environment}-Booking'
   DoctorSearchUrl:
     Description: Public doctor search (filters name, hospitalId, hospital, specialization, city; keyset pagination).
     Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/doctors'

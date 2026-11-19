@@ -1,6 +1,6 @@
 {# Patient portal. Two pages share this file:
-     view == 'doctor'  -> one doctor's profile, fees and free seats   (route /patient/doctors/<id>)
-     otherwise         -> "Find a doctor" and "My profile" tabs        (route /patient/dashboard) #}
+     view == 'doctor'  -> one doctor's profile, fees, free seats and the Book buttons   (route /patient/doctors/<id>)
+     otherwise         -> tabs: Find a doctor, My appointments, Refunds, My profile (route /patient/dashboard) #}
 {% extends 'base.html' %}
 {% block title %}{{ doctor.name if view == 'doctor' else 'Find a doctor' }} · MediSlot{% endblock %}
 {% block content %}
@@ -47,13 +47,19 @@
     {% if day.slots %}<div class="seat-grid">{% for s in day.slots %}
       <div class="seat-card{{ ' full' if s.freeSeats == 0 else '' }}"><span class="t">{{ s.start12 }}</span><span class="k">{{ s.label }} · {{ s.durationMinutes }} min · ₹{{ s.fee }}</span>
         <span class="seat-dots" aria-hidden="true">{% for i in range(s.capacity) %}<i class="{{ 'free' if i < s.freeSeats else '' }}"></i>{% endfor %}</span>
-        <span class="s">{% if s.freeSeats %}{{ s.freeSeats }} of {{ s.capacity }} seat{{ '' if s.capacity == 1 else 's' }} free{% else %}Full{% endif %}</span></div>{% endfor %}</div>
+        <span class="s">{% if s.freeSeats %}{{ s.freeSeats }} of {{ s.capacity }} seat{{ '' if s.capacity == 1 else 's' }} free{% else %}Full{% endif %}</span>
+        {% if s.freeSeats and s.slotId %}<details class="book-box"><summary>Book ↗</summary>
+          <form method="post" action="{{ url_for('patient_dashboard') }}" class="book-form" onsubmit="this.querySelector('button').disabled=true;this.querySelector('button').textContent='Booking…'">
+            <input type="hidden" name="action" value="book"><input type="hidden" name="slot_id" value="{{ s.slotId }}">
+            <input type="hidden" name="doctor_id" value="{{ doctor.doctorId }}"><input type="hidden" name="idem_key" value="{{ s.idem_key }}">
+            <button class="primary" type="submit">Confirm · ₹{{ s.fee }}</button>
+          </form></details>{% endif %}</div>{% endfor %}</div>
     {% elif day.closed %}<div class="day-note closed">The doctor is not seeing patients this day.</div>
     {% elif day.fullyBooked %}<div class="day-note full">Every slot is taken. A whole-day waitlist arrives with booking.</div>
     {% else %}<div class="day-note">No consultations scheduled.</div>{% endif %}
   </div>
   {% endfor %}
-  <p class="hint" style="margin-top:14px">Booking opens in the next release. Seat counts are live from the slot calendar.</p>
+  <p class="hint" style="margin-top:14px">Seat counts are live. If two people book the last seat at the same moment, exactly one gets it and the other is told straight away.</p>
 {% endif %}
 </section>
 
@@ -115,6 +121,54 @@
     {% if state.city %}<p><a class="ghost" href="{{ url_for('patient_dashboard', tab='find', searched='1', name=state.name, specialization=state.specialization) }}">Search every city</a></p>{% endif %}</div>
   {% endif %}
 {% endif %}
+
+{% elif active == 'appointments' %}
+{# ===================================================================== My appointments (Milestone 5) #}
+{% if booking.error %}<div class="alert error">{{ booking.error }}</div>{% endif %}
+<section class="dash-card"><h2 class="mt-0">Upcoming</h2>
+{% for a in booking.upcoming %}
+  <article class="appt-card">
+    <div class="appt-main">
+      <div class="appt-when"><b>{{ a.when }}</b><small>to {{ a.until }} · {{ a.timezone }}</small></div>
+      <div><h3>{{ a.doctor.name }}</h3><p class="muted">{{ a.consultation.label }} · {{ a.doctor.hospital.name }} · ₹{{ a.fee }}</p>
+        <div class="doc-facts"><span class="chip">{{ a.reference }}</span></div></div>
+    </div>
+    {% set c = a.cancellation %}
+    {% if c and c.cancellable %}
+    <div class="refund-strip">
+      <p><b>Cancel now:</b> ₹{{ c.refundAmount }} back ({{ c.refundPercent }}% · {{ tier_labels.get(c.tier, c.tier) }})</p>
+      <ol class="tier-line">{% for t in c.schedule %}<li class="{{ 'now' if t.tier == c.tier else '' }}"><b>{{ t.refundPercent }}%</b> ₹{{ t.refundAmount }}<small>{% if t.cancelBy %}until {{ t.by_label }}{% else %}until start{% endif %}</small></li>{% endfor %}</ol>
+      <form method="post" class="inline" onsubmit="return confirm('Cancel {{ a.reference }}? You get ₹{{ c.refundAmount }} back.')">
+        <input type="hidden" name="action" value="cancel_appointment"><input type="hidden" name="appointment_id" value="{{ a.appointmentId }}">
+        <input name="reason" maxlength="300" placeholder="Reason (optional)" aria-label="Reason"><button class="danger" type="submit">Cancel appointment</button></form>
+    </div>
+    {% elif c %}<p class="hint">{{ c.reason }}</p>
+    {% else %}<p class="hint">Cancellation is paused for a moment (refund policy unavailable). Please try again shortly.</p>{% endif %}
+  </article>
+{% else %}<div class="empty-state"><h3>No upcoming appointments.</h3><p><a class="primary" href="{{ url_for('patient_dashboard', tab='find') }}">Find a doctor ↗</a></p></div>{% endfor %}
+</section>
+{% if booking.history %}
+<section class="dash-card"><h2 class="mt-0">Past &amp; cancelled</h2>
+<table><thead><tr><th>When</th><th>Doctor</th><th>Status</th><th>Refund</th></tr></thead><tbody>
+{% for a in booking.history %}<tr><td>{{ a.when }}</td><td>{{ a.doctor.name }}<br><small class="muted">{{ a.consultation.label }} · {{ a.reference }}</small></td>
+  <td><span class="status-pill {{ a.status|lower }}">{{ {'CONFIRMED': 'Confirmed', 'COMPLETED': 'Completed', 'NO_SHOW': 'No-show', 'CANCELLED_BY_PATIENT': 'Cancelled by you', 'CANCELLED_BY_DOCTOR': 'Cancelled by doctor'}.get(a.status, a.status) }}</span></td>
+  <td>{% if a.refund %}₹{{ a.refund.refundAmount }} <small class="muted">({{ a.refund.refundPercent }}%)</small>{% else %}—{% endif %}</td></tr>{% endfor %}
+</tbody></table></section>{% endif %}
+
+{% elif active == 'refunds' %}
+{# ===================================================================== Refund ledger (Milestone 5) #}
+<section class="dash-card"><h2 class="mt-0">Refunds</h2>
+{% if booking.error %}<div class="alert error">{{ booking.error }}</div>
+{% elif booking.refunds and booking.refunds['items'] %}
+  <div class="chips"><span class="chip">{{ booking.refunds.count }} refund{{ '' if booking.refunds.count == 1 else 's' }}</span><span class="chip">₹{{ booking.refunds.totalRefunded }} returned in total</span></div>
+  <table><thead><tr><th>Appointment</th><th>Recorded</th><th>Tier</th><th>Paid</th><th>Refund</th></tr></thead><tbody>
+  {% for r in booking.refunds['items'] %}<tr><td>{{ r.doctor }}<br><small class="muted">{{ r.consultation }} · {{ r.when }} · {{ r.reference }}</small></td>
+    <td>{{ r.recorded }}<br><small class="muted">{{ {'PATIENT_CANCEL': 'you cancelled', 'DOCTOR_CANCEL': 'doctor cancelled', 'NO_SHOW': 'no-show'}.get(r.reason, r.reason) }}</small></td><td><span class="status-pill">{{ tier_labels.get(r.tier, r.tier) }}</span><br><small class="muted">{{ r.refundPercent }}%</small></td>
+    <td>₹{{ r.amountPaid }}</td><td><b>₹{{ r.refundAmount }}</b></td></tr>{% endfor %}
+  </tbody></table>
+  <p class="hint">Each cancellation has exactly one ledger entry, so nothing is ever refunded twice.</p>
+{% else %}<p class="empty">No refunds yet.</p>{% endif %}
+</section>
 
 {% else %}
 {# ===================================================================== My profile #}

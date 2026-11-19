@@ -135,6 +135,61 @@ CREATE TABLE IF NOT EXISTS blackout_dates (
   CONSTRAINT fk_bd_doctor FOREIGN KEY (doctor_id) REFERENCES doctors (user_id)
 ) ENGINE=InnoDB;
 
+-- ---------------------------------------------------------------- booking engine (Milestone 5)
+-- Seats are counted in DynamoDB (Slots table, optimistic concurrency on its "version" attribute).
+-- RDS is the system of record for WHO holds a seat (appointments) and for money (refund_ledger).
+
+-- active_flag is 1 while the appointment is CONFIRMED and NULL otherwise. MySQL allows many NULLs in a
+-- unique index, so uq_appt_patient_slot_active allows ONE live booking per patient per slot but keeps
+-- every cancelled one as history.
+CREATE TABLE IF NOT EXISTS appointments (
+  appointment_id        BIGINT UNSIGNED  NOT NULL AUTO_INCREMENT,
+  patient_id            BIGINT UNSIGNED  NOT NULL,
+  doctor_id             BIGINT UNSIGNED  NOT NULL,
+  consultation_type_id  BIGINT UNSIGNED  NOT NULL,
+  slot_id               VARCHAR(100)     NOT NULL,
+  slot_start_utc        DATETIME(6)      NOT NULL,
+  slot_end_utc          DATETIME(6)      NOT NULL,
+  status                ENUM('CONFIRMED', 'COMPLETED', 'CANCELLED_BY_PATIENT', 'CANCELLED_BY_DOCTOR', 'NO_SHOW')
+                                         NOT NULL DEFAULT 'CONFIRMED',
+  active_flag           TINYINT UNSIGNED NULL DEFAULT 1,
+  reschedule_count      TINYINT UNSIGNED NOT NULL DEFAULT 0,
+  fee_amount            DECIMAL(10,2)    NOT NULL,
+  created_at            DATETIME(6)      NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  updated_at            DATETIME(6)      NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+  PRIMARY KEY (appointment_id),
+  UNIQUE KEY uq_appt_patient_slot_active (patient_id, slot_id, active_flag),
+  KEY ix_appt_patient_start (patient_id, slot_start_utc),
+  KEY ix_appt_doctor_start (doctor_id, slot_start_utc),
+  KEY ix_appt_slot_status (slot_id, status),
+  KEY ix_appt_status_updated (status, updated_at),
+  CONSTRAINT ck_appt_active_flag CHECK ((status = 'CONFIRMED' AND active_flag = 1) OR (status <> 'CONFIRMED' AND active_flag IS NULL)),
+  CONSTRAINT fk_appt_patient FOREIGN KEY (patient_id)           REFERENCES users (user_id),
+  CONSTRAINT fk_appt_doctor  FOREIGN KEY (doctor_id)            REFERENCES doctors (user_id),
+  CONSTRAINT fk_appt_type    FOREIGN KEY (consultation_type_id) REFERENCES consultation_types (consultation_type_id)
+) ENGINE=InnoDB;
+
+-- Refund ledger: append-only, exactly one row per cancelled appointment (even a 0% refund is recorded),
+-- so a cancellation can never be refunded twice. fee_amount = what was paid; amounts in whole paise.
+CREATE TABLE IF NOT EXISTS refund_ledger (
+  refund_id        BIGINT UNSIGNED  NOT NULL AUTO_INCREMENT,
+  appointment_id   BIGINT UNSIGNED  NOT NULL,
+  patient_id       BIGINT UNSIGNED  NOT NULL,
+  reason           ENUM('PATIENT_CANCEL', 'DOCTOR_CANCEL', 'NO_SHOW') NOT NULL,
+  tier             VARCHAR(30)      NOT NULL,
+  refund_percent   TINYINT UNSIGNED NOT NULL,
+  fee_amount       DECIMAL(10,2)    NOT NULL,
+  refund_amount    DECIMAL(10,2)    NOT NULL,
+  created_at       DATETIME(6)      NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  PRIMARY KEY (refund_id),
+  UNIQUE KEY uq_refund_appointment (appointment_id),
+  KEY ix_refund_patient (patient_id, created_at),
+  CONSTRAINT ck_refund_amount  CHECK (refund_amount >= 0 AND refund_amount <= fee_amount),
+  CONSTRAINT ck_refund_percent CHECK (refund_percent <= 100),
+  CONSTRAINT fk_refund_appt    FOREIGN KEY (appointment_id) REFERENCES appointments (appointment_id),
+  CONSTRAINT fk_refund_patient FOREIGN KEY (patient_id)     REFERENCES users (user_id)
+) ENGINE=InnoDB;
+
 -- ---------------------------------------------------------------- seed data
 -- One single-row INSERT per row, and only when the row is missing. Unlike INSERT IGNORE,
 -- this never uses up an AUTO_INCREMENT number when the row already exists.
