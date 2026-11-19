@@ -12,6 +12,7 @@ Two kinds of test in this one file:
   * Live tests (marked `live`, skipped unless MEDISLOT_API_URL and MEDISLOT_CI_PASSWORD are set). The deploy
     job runs them against the real API Gateway -> Lambda -> DynamoDB -> RDS:  pytest -m live tests/test_m5_booking.py
 """
+import collections
 import concurrent.futures
 import importlib.util
 import itertools
@@ -1205,8 +1206,24 @@ def sign_in(email):
     return res.json() if res.ok else None
 
 
+def body_of(res):
+    """JSON body, or {'message': <text>} when API Gateway answered with something that is not JSON."""
+    try:
+        data = res.json()
+        return data if isinstance(data, dict) else {'message': str(data)[:200]}
+    except ValueError:
+        return {'message': res.text[:200]}
+
+
+def label(status, data):
+    """'409 SLOT_FULL'. Our Lambda always sends a code on errors; one WITHOUT a code came from API Gateway itself."""
+    if status in (200, 201):
+        return f'{status} OK'
+    return f"{status} {data.get('code') or 'GATEWAY: ' + str(data.get('message'))}"
+
+
 def probe_patient(i):
-    """24 long-lived probe patients, registered on the first run and reused (no junk accounts per run)."""
+    """Long-lived probe patients, registered on the first run and reused (no junk accounts per run)."""
     email = f'ci-m5-patient-{i:02d}@medislot-ci.example'
     session = sign_in(email)
     if not session:
@@ -1220,8 +1237,8 @@ def probe_patient(i):
 
 
 @pytest.fixture(scope='module')
-def camp_slot():
-    """Probe doctor with a capacity-3 Health Camp every day 07:00-21:00; returns a future slot with 3 free seats."""
+def camp_doctor():
+    """Probe doctor offering a capacity-3 Health Camp every day 07:00-21:00 (registered once, then reused)."""
     email = 'ci-probe-camp@medislot-ci.example'
     session = sign_in(email)
     if not session:
@@ -1247,64 +1264,106 @@ def camp_slot():
         type_id = made.json()['consultationTypeId']
     week = [{'day_of_week': d, 'consultation_type_id': type_id, 'start_time': '07:00', 'end_time': '21:00'} for d in range(7)]
     assert http('PUT', '/doctor/me/availability', token, json={'patterns': week}).ok
+    return {'id': doctor_id, 'token': token, 'typeId': type_id}
+
+
+@pytest.fixture(scope='module')
+def probe_patients(camp_doctor):
+    """Sign in the probe patients and cancel anything a previous (failed) run left booked with the probe doctor."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        patients = list(pool.map(probe_patient, range(LIVE_PARALLEL)))
+    leftovers = 0
+    for p in patients:
+        mine = http('GET', '/patient/appointments', p['token'], params={'view': 'upcoming', 'limit': 50})
+        for a in body_of(mine).get('items', []):
+            if a['doctor']['doctorId'] == camp_doctor['id']:
+                http('POST', f"/patient/appointments/{a['appointmentId']}/cancel", p['token'], json={'reason': 'CI leftover'})
+                leftovers += 1
+    if leftovers:
+        print(f'\nLIVE: cancelled {leftovers} leftover booking(s) from an earlier run')
+    return patients
+
+
+def empty_camp_slot(doctor):
+    """A future capacity-3 slot of the probe doctor with all 3 seats free (a different one for each test)."""
     soon = (datetime.now(UTC) + timedelta(days=2)).date()
-    days = http('GET', f'/doctors/{doctor_id}/slots', params={'from': soon.isoformat(), 'to': (soon + timedelta(days=6)).isoformat(),
-                                                              'consultationTypeId': str(type_id)}).json()['days']
-    free = [s for d in days for s in d['slots'] if s['freeSeats'] == 3 and s['capacity'] == 3]
-    assert free, 'no empty capacity-3 slot found'
-    return {'slotId': random.choice(free)['slotId'], 'doctorId': doctor_id, 'doctorToken': token}
+    days = http('GET', f"/doctors/{doctor['id']}/slots", params={
+        'from': soon.isoformat(), 'to': (soon + timedelta(days=6)).isoformat(),
+        'consultationTypeId': str(doctor['typeId'])}).json()['days']
+    free = [s['slotId'] for d in days for s in d['slots'] if s['freeSeats'] == 3 and s['capacity'] == 3]
+    assert free, 'no empty capacity-3 slot found for the probe doctor'
+    return random.choice(free)
+
+
+def warm_up(patients):
+    """Same number of parallel authenticated calls first, so the burst below is not measuring Lambda cold starts.
+    If THIS already fails, the account cannot run that many Lambdas at once (see the assertion message)."""
+    def ping(p):
+        res = http('GET', '/patient/appointments', p['token'], params={'view': 'upcoming', 'limit': 1})
+        return label(res.status_code, body_of(res)) if res.status_code != 200 else None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(patients)) as pool:
+        return [x for x in pool.map(ping, patients) if x]
+
+
+CONCURRENCY_HINT = ('API Gateway answered some requests itself (no "code" in the body), so they never reached the '
+                    'booking logic. Usual causes: the account Lambda concurrency limit is lower than the number of '
+                    'parallel requests (check: aws lambda get-account-settings -> ConcurrentExecutions; new accounts '
+                    'often have 10) or a cold-start timeout. Details: ')
 
 
 @pytest.mark.live
 @live
-def test_live_mandatory_1_parallel_bookings_exactly_3_succeed(camp_slot):
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        patients = list(pool.map(probe_patient, range(LIVE_PARALLEL)))
-    gate = threading.Barrier(len(patients))
+def test_live_mandatory_1_parallel_bookings_exactly_3_succeed(camp_doctor, probe_patients):
+    slot_id = empty_camp_slot(camp_doctor)
+    cold = warm_up(probe_patients)
+    assert not cold, CONCURRENCY_HINT + str(collections.Counter(cold))
+    gate = threading.Barrier(len(probe_patients))
 
     def one(p):
         gate.wait()
-        res = http('POST', '/patient/appointments', p['token'], json={'slotId': camp_slot['slotId']},
+        res = http('POST', '/patient/appointments', p['token'], json={'slotId': slot_id},
                    headers={'Idempotency-Key': f'live-{uuid.uuid4().hex}'})
-        return p, res.status_code, res.json()
+        return p, res.status_code, body_of(res)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(patients)) as pool:
-        results = list(pool.map(one, patients))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(probe_patients)) as pool:
+        results = list(pool.map(one, probe_patients))
     won = [(p, b) for p, s, b in results if s == 201]
-    codes = sorted({b.get('code') for p, s, b in results if s != 201})
-    retries = sum((b.get('concurrency') or {}).get('conflictRetries', 0) if s == 201 else b.get('conflictRetries', 0)
-                  for p, s, b in results)
-    print(f'\nLIVE: {len(won)} booked, {len(results) - len(won)} rejected {codes}, conflict retries seen: {retries}')
     try:
-        assert len(won) == 3, [(s, b.get('code')) for _, s, b in results]
-        assert codes == ['SLOT_FULL'], codes
-        assert sorted(b['concurrency']['slotVersion'] for _, b in won) == sorted({b['concurrency']['slotVersion'] for _, b in won})
+        outcome = collections.Counter(label(s, b) for _, s, b in results)
+        retries = sum((b.get('concurrency') or {}).get('conflictRetries', 0) if s == 201 else b.get('conflictRetries', 0)
+                      for _, s, b in results)
+        print(f'\nLIVE slot {slot_id}: {dict(outcome)}; conflict retries seen: {retries}')
+        gateway = [k for k in outcome if 'GATEWAY' in k]
+        assert not gateway, CONCURRENCY_HINT + str({k: outcome[k] for k in gateway})
+        assert outcome == {'201 OK': 3, '409 SLOT_FULL': len(results) - 3}, dict(outcome)
+        versions = [b['concurrency']['slotVersion'] for _, b in won]
+        assert len(set(versions)) == 3, versions                         # each seat won at its own version
     finally:
-        for p, b in won:                                                    # free the seats for the next run
+        for p, b in won:                                                    # always free the seats again
             http('POST', f"/patient/appointments/{b['appointmentId']}/cancel", p['token'], json={'reason': 'CI cleanup'})
 
 
 @pytest.mark.live
 @live
-def test_live_mandatory_2_idempotency_replay_returns_the_original_appointment(camp_slot):
-    p = probe_patient(0)
+def test_live_mandatory_2_idempotency_replay_returns_the_original_appointment(camp_doctor, probe_patients):
+    p, slot_id = probe_patients[0], empty_camp_slot(camp_doctor)
     key = f'live-replay-{uuid.uuid4().hex}'
-    first = http('POST', '/patient/appointments', p['token'], json={'slotId': camp_slot['slotId']},
-                 headers={'Idempotency-Key': key})
+    first = http('POST', '/patient/appointments', p['token'], json={'slotId': slot_id}, headers={'Idempotency-Key': key})
     assert first.status_code == 201, first.text
+    appointment_id = first.json()['appointmentId']
     try:
         for _ in range(3):
-            again = http('POST', '/patient/appointments', p['token'], json={'slotId': camp_slot['slotId']},
+            again = http('POST', '/patient/appointments', p['token'], json={'slotId': slot_id},
                          headers={'Idempotency-Key': key})
-            assert again.status_code == 201 and again.headers.get('Idempotent-Replayed') == 'true'
-            assert again.json()['appointmentId'] == first.json()['appointmentId']
+            assert again.status_code == 201 and again.headers.get('Idempotent-Replayed') == 'true', again.text
+            assert again.json()['appointmentId'] == appointment_id
         mine = http('GET', '/patient/appointments', p['token'], params={'view': 'upcoming', 'limit': 50}).json()['items']
-        assert sum(1 for a in mine if a['slotId'] == camp_slot['slotId']) == 1
-        quote = http('GET', f"/patient/appointments/{first.json()['appointmentId']}/refund-quote", p['token'])
-        assert quote.status_code == 200 and quote.json()['tier'] in ('FULL', 'PARTIAL')
+        assert sum(1 for a in mine if a['slotId'] == slot_id) == 1                    # exactly one appointment
+        quote = http('GET', f'/patient/appointments/{appointment_id}/refund-quote', p['token'])
+        assert quote.status_code == 200 and quote.json()['tier'] in ('FULL', 'PARTIAL'), quote.text
     finally:
-        done = http('POST', f"/patient/appointments/{first.json()['appointmentId']}/cancel", p['token'], json={})
-        assert done.status_code == 200 and done.json()['refund']['tier'] in ('FULL', 'PARTIAL')
+        done = http('POST', f'/patient/appointments/{appointment_id}/cancel', p['token'], json={})
+        assert done.status_code == 200 and done.json()['refund']['tier'] in ('FULL', 'PARTIAL'), done.text
 
 
 # =============================================================================================== dashboard (Flask)
