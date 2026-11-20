@@ -73,9 +73,7 @@
     <small>{% if profile.get('profileComplete') %}Ready for booking{% else %}Add: {{ (profile.get('missingFields') or [])|join(', ')|replace('dateOfBirth','date of birth')|replace('emergencyContactPhone','emergency contact') }}{% endif %}</small>
     <div class="meter-bar"><i style="width:{{ done * 25 }}%"></i></div></a>{% endif %}
 </div>
-<nav class="tabs" role="tablist" aria-label="Patient sections">{% for key, label in tabs %}
-  <a class="tab{{ ' active' if key == active else '' }}" role="tab" href="{{ url_for('patient_dashboard', tab=key) }}" aria-selected="{{ 'true' if key == active else 'false' }}">{{ label }}</a>{% endfor %}
-</nav>
+{# The section tabs now live in the top bar (templates/base.html). #}
 
 {% if active == 'find' %}
 {# ===================================================================== Find a doctor #}

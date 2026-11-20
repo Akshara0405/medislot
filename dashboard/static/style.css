@@ -301,3 +301,24 @@ td,th{text-align:left;padding:10px;border-bottom:1px solid var(--line)}
 .status-pill{display:inline-block;border-radius:20px;padding:4px 10px;font-size:12px;font-weight:700;background:var(--mint);color:#1d6b5f}
 .status-pill.cancelled_by_patient,.status-pill.cancelled_by_doctor{background:#fff0ed;color:#a43c2d}
 @media (max-width:720px){.appt-main{grid-template-columns:1fr}}
+
+/* ===================================================================== Top bar (white header with tab links) */
+.topbar{background:#fff;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:20}
+.topbar .nav{height:76px}
+.nav-left{display:flex;align-items:center;gap:clamp(20px,4vw,56px);min-width:0;height:100%}
+.nav-main{display:flex;align-items:stretch;gap:clamp(14px,2.2vw,30px);height:100%}
+.topbar .nav-link{position:relative;display:flex;align-items:center;padding:0;border-radius:0;font:700 17px Manrope,sans-serif;letter-spacing:-.2px;color:var(--ink);white-space:nowrap;transition:color .15s}
+.topbar .nav-link:hover{color:var(--teal)}
+.topbar .nav-link.active{color:var(--teal)}
+.topbar .nav-link.active:after{content:'';position:absolute;left:0;right:0;bottom:0;height:3px;border-radius:3px 3px 0 0;background:var(--teal)}
+.nav-btn{display:inline-flex;align-items:center;padding:9px 16px;border:1px solid #d4dde1;border-radius:6px;font-weight:500;font-size:16px;color:var(--muted);background:#fff;white-space:nowrap;transition:border-color .15s,color .15s}
+.nav-btn:hover{border-color:var(--ink);color:var(--ink)}
+@media(max-width:900px){
+  .topbar .nav{height:auto;flex-wrap:wrap;row-gap:0;padding-top:12px}
+  .nav-left{flex-wrap:wrap;width:100%;justify-content:space-between}
+  .nav-main{order:3;width:100%;height:46px;overflow-x:auto;scrollbar-width:none}
+  .nav-main::-webkit-scrollbar{display:none}
+  .topbar .nav-link{display:flex;font-size:15px}
+  .nav-right{position:absolute;right:clamp(18px,3vw,40px);top:14px}
+  .topbar .shell{position:relative}
+}

@@ -11,23 +11,35 @@
 </head>
 <body>
 {% set role = session.get('role') if session.get('token') else None %}
-<header class="shell nav">
-  <a class="brand" href="/"><span class="brand-mark">✚</span>medislot<span style="color:var(--teal)">.</span></a>
-  <div class="nav-right">
-    {% if role == 'patient' %}
-      <a class="nav-link" href="/patient/dashboard">Find a doctor</a>
-      <a class="nav-link" href="/patient/dashboard?tab=appointments">My appointments</a>
-      <a class="nav-link" href="/patient/dashboard?tab=profile">My profile</a>
-      <a class="nav-cta" href="/patient/logout">Sign out <span>↗</span></a>
-    {% elif role == 'doctor' %}
-      <a class="nav-link" href="/doctor/dashboard">My workspace</a>
-      <a class="nav-cta" href="/doctor/logout">Sign out <span>↗</span></a>
-    {% else %}
-      <a class="nav-link" href="/#how">How it works</a>
-      <a class="nav-link" href="/patient/login">Patient sign in</a>
-      <a class="nav-link" href="/doctor/login">Doctor sign in</a>
-      <a class="nav-cta" href="/patient/register">Find care <span>↗</span></a>
-    {% endif %}
+{% set on_dashboard = request.path.rstrip('/') == '/patient/dashboard' %}
+{% set current_tab = request.args.get('tab', 'find') if on_dashboard else None %}
+<header class="topbar">
+  <div class="shell nav">
+    <div class="nav-left">
+      <a class="brand" href="/"><span class="brand-mark">✚</span><span>medislot<span style="color:var(--teal)">.</span></span></a>
+      <nav class="nav-main" aria-label="Main">
+        {% if role == 'patient' %}
+          {% for key, label in [('find', 'Find a doctor'), ('appointments', 'My appointments'), ('refunds', 'Refunds'), ('profile', 'My profile')] %}
+            <a class="nav-link{{ ' active' if current_tab == key else '' }}" href="/patient/dashboard{{ '' if key == 'find' else '?tab=' ~ key }}"{% if current_tab == key %} aria-current="page"{% endif %}>{{ label }}</a>
+          {% endfor %}
+        {% elif role == 'doctor' %}
+          <a class="nav-link{{ ' active' if request.path.startswith('/doctor/dashboard') else '' }}" href="/doctor/dashboard">My workspace</a>
+        {% else %}
+          <a class="nav-link" href="/#how">How it works</a>
+          <a class="nav-link" href="/patient/login">Patient sign in</a>
+          <a class="nav-link" href="/doctor/login">Doctor sign in</a>
+        {% endif %}
+      </nav>
+    </div>
+    <div class="nav-right">
+      {% if role == 'patient' %}
+        <a class="nav-btn" href="/patient/logout">Sign out</a>
+      {% elif role == 'doctor' %}
+        <a class="nav-btn" href="/doctor/logout">Sign out</a>
+      {% else %}
+        <a class="nav-btn" href="/patient/register">Find care</a>
+      {% endif %}
+    </div>
   </div>
 </header>
 
