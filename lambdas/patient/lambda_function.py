@@ -6,7 +6,12 @@ One Lambda, two audiences:
     GET  /doctors                      search: name, hospital, specialisation, city + keyset pagination
     GET  /doctors/filters              values for the search dropdowns
     GET  /doctors/{doctorId}           public doctor profile with consultation types and fees
-    GET  /doctors/{doctorId}/slots     free seats per slot for a date range (DynamoDB Slots table)
+
+  Shared by patients AND doctors (one endpoint, one query: common.query_slots)
+    GET  /doctors/{doctorId}/slots     slots for a date range (DynamoDB Slots table)
+         - no token / a patient token / another doctor's token -> "public" view: future, bookable slots only
+         - that doctor's own Bearer token                        -> "owner" view: every slot incl. closed,
+           started and past ones, with the manual-close flag (the doctor dashboard's Schedule tab)
 
   Patient-only (JWT Lambda authorizer; the authorizer denies any non-patient token on /patient/*)
     POST   /patient/me                 create the profile row (registration normally does this)
@@ -18,7 +23,7 @@ One Lambda, two audiences:
   Direct invocation only (not reachable through API Gateway)
     {"action": "explain-search"}       EXPLAIN every filter combination + report missing indexes/columns
 
-The caller's identity comes ONLY from the authorizer context, never from the path, query or body.
+The caller's identity comes ONLY from the authorizer context or a verified JWT, never from the path, query or body.
 """
 import base64
 import hashlib
@@ -34,10 +39,10 @@ from zoneinfo import ZoneInfo
 
 import boto3
 import pymysql
-from boto3.dynamodb.conditions import Key
 from botocore.config import Config
 
-from common import auth_table, body, config, correlation, dbconn, emit, logged, release, response, token_hash
+from common import (auth_table, bearer_token, body, config, correlation, dbconn, emit, logged, query_slots, release,
+                    response, token_hash, verify_access_token)
 
 log = logging.getLogger()
 
@@ -447,39 +452,60 @@ def load_doctor(cur, doctor_id):
     return row, cur.fetchall()
 
 
-def day_slots(table, doctor_id, day_iso):
-    kwargs = {'IndexName': 'GSI_DoctorDate', 'KeyConditionExpression': Key('doctor_date').eq(f'{doctor_id}#{day_iso}')}
-    items = []
-    while True:
-        page = table.query(**kwargs)
-        items.extend(page.get('Items', []))
-        if not page.get('LastEvaluatedKey'):
-            return items
-        kwargs['ExclusiveStartKey'] = page['LastEvaluatedKey']
+def seat_view(item, types, tz, now_utc, owner=False):
+    """One Slots item as the API returns it, or None when this caller should not see it.
 
-
-def seat_view(item, types, tz, now_utc):
-    """Patient-facing view of one Slots item, or None when the patient should not see it."""
+    Public view: only slots of active consultation types that have not started yet.
+    Owner view (the doctor themself): every slot, plus localDate, manualBlock and started.
+    """
     ctype = types.get(str(item.get('consultation_type_id')))     # DynamoDB stores the id as text
-    if not ctype:
+    if not ctype and not owner:
         return None                                   # type deactivated since the slot was generated
     try:
         start = datetime.fromisoformat(str(item['start_at']).replace('Z', '+00:00'))
         end = datetime.fromisoformat(str(item['end_at']).replace('Z', '+00:00'))
     except (KeyError, ValueError):
         return None
-    if start <= now_utc:
+    if start <= now_utc and not owner:
         return None                                   # already started
     capacity = int(item.get('capacity', 1) or 1)
-    taken = int(item.get('booked_count', 0) or 0) + int(item.get('held_count', 0) or 0)
-    free = 0 if item.get('status') == 'CLOSED' else max(0, capacity - taken)
-    return {'slotId': item['slot_id'], 'consultationTypeId': ctype['consultationTypeId'], 'type': ctype['code'],
-            'label': ctype['label'], 'durationMinutes': ctype['durationMinutes'], 'fee': ctype['fee'],
+    booked, held = int(item.get('booked_count', 0) or 0), int(item.get('held_count', 0) or 0)
+    closed = item.get('status') == 'CLOSED'
+    free = 0 if closed else max(0, capacity - booked - held)
+    raw_type = str(item.get('consultation_type_id', ''))
+    view = {'slotId': item['slot_id'],
+            'consultationTypeId': ctype['consultationTypeId'] if ctype else (int(raw_type) if raw_type.isdigit() else None),
+            'type': ctype['code'] if ctype else None, 'label': ctype['label'] if ctype else None,
+            'durationMinutes': ctype['durationMinutes'] if ctype else int((end - start).total_seconds() // 60),
+            'fee': ctype['fee'] if ctype else None,
             'startsAt': item['start_at'], 'endsAt': item['end_at'],
             'localStart': start.astimezone(tz).strftime('%H:%M'), 'localEnd': end.astimezone(tz).strftime('%H:%M'),
-            'capacity': capacity, 'booked': int(item.get('booked_count', 0) or 0),
-            'held': int(item.get('held_count', 0) or 0), 'freeSeats': free,
-            'status': 'CLOSED' if item.get('status') == 'CLOSED' else ('AVAILABLE' if free else 'FULL')}
+            'capacity': capacity, 'booked': booked, 'held': held, 'freeSeats': free,
+            'status': 'CLOSED' if closed else ('AVAILABLE' if free else 'FULL')}
+    if owner:
+        view.update(localDate=item.get('local_date'), manualBlock=bool(item.get('manual_block')),
+                    started=start <= now_utc, activeType=bool(ctype))
+    return view
+
+
+def slot_viewer(event, doctor_id):
+    """'owner' when the caller is this doctor, otherwise 'public'.
+
+    The route has no API Gateway authorizer (patients may browse signed out), so a Bearer token is optional and
+    verified here. A token that is sent but invalid, expired or revoked is a 401, so the client can refresh it.
+    """
+    ctx = (event.get('requestContext') or {}).get('authorizer') or {}
+    if ctx.get('role'):
+        return 'owner' if ctx.get('role') == 'doctor' and str(ctx.get('userId')) == str(doctor_id) else 'public'
+    token = bearer_token(event)
+    if not token:
+        return 'public'
+    try:
+        claims = verify_access_token(token, config().get('jwt') or '')
+    except ValueError as exc:
+        emit('warning', 'slots_token_rejected', None, doctorId=str(doctor_id), reason=str(exc)[:200])
+        raise ApiError(401, 'Your sign-in has expired or is not valid. Sign in again, or call without a token.')
+    return 'owner' if claims['role'] == 'doctor' and str(claims['sub']) == str(doctor_id) else 'public'
 
 
 def doctor_profile(conn, event, params, cid):
@@ -491,16 +517,15 @@ def doctor_profile(conn, event, params, cid):
     tz = zone(tz_name)
     next_open = None
     if types:
-        table, by_id = slots_table(), {str(t['consultationTypeId']): t for t in types}
+        by_id = {str(t['consultationTypeId']): t for t in types}
         now_utc, today = datetime.now(timezone.utc), datetime.now(tz).date()
-        for offset in range(NEXT_SLOT_LOOKAHEAD_DAYS):
-            day = today + timedelta(days=offset)
-            views = [v for v in (seat_view(i, by_id, tz, now_utc) for i in day_slots(table, doctor_id, day.isoformat()))
-                     if v and v['freeSeats'] > 0]
-            if views:
-                first = min(views, key=lambda v: v['startsAt'])
-                next_open = {'date': day.isoformat(), 'localStart': first['localStart'], 'label': first['label'],
-                             'freeSeats': first['freeSeats'], 'slotId': first['slotId']}
+        # One query for the whole look-ahead window (sorted by date, then start).
+        items = query_slots(slots_table(), doctor_id, today, today + timedelta(days=NEXT_SLOT_LOOKAHEAD_DAYS - 1))
+        for item in items:
+            v = seat_view(item, by_id, tz, now_utc)
+            if v and v['freeSeats'] > 0:
+                next_open = {'date': item.get('local_date'), 'localStart': v['localStart'], 'label': v['label'],
+                             'freeSeats': v['freeSeats'], 'slotId': v['slotId']}
                 break
     fees = [Decimal(t['fee']) for t in types]
     status = 'NOT_CONFIGURED' if not types else ('ACCEPTING' if next_open else 'NO_OPEN_SLOTS_SOON')
@@ -519,7 +544,15 @@ def doctor_profile(conn, event, params, cid):
 
 
 def doctor_slots(conn, event, params, cid):
+    """GET /doctors/{doctorId}/slots: the ONE slot-reading endpoint, used by patients and by the doctor.
+
+    Query: from, to (YYYY-MM-DD, at most 30 days), consultationTypeId, includeFull (true|false).
+    The public view only covers today .. today+29 and hides closed and started slots. The owner view (the
+    doctor's own token) may look at any 30-day range, past included, and shows every slot.
+    """
     doctor_id = positive_id(params.get('doctorId'), 'doctorId')
+    view = slot_viewer(event, doctor_id)
+    owner = view == 'owner'
     q = query_params(event)
     with conn.cursor() as cur:
         row, type_rows = load_doctor(cur, doctor_id)
@@ -547,27 +580,35 @@ def doctor_slots(conn, event, params, cid):
         raise ApiError(400, 'to must be on or after from')
     if (last - first).days + 1 > SLOT_WINDOW_DAYS:
         raise ApiError(400, f'A date range can cover at most {SLOT_WINDOW_DAYS} days')
-    if last < today:
-        raise ApiError(400, 'The date range is entirely in the past')
     notices = []
-    if first < today:
-        first = today
-        notices.append('Past dates were skipped.')
-    if last > window_end:
-        last = window_end
-        notices.append(f'Slots open {SLOT_WINDOW_DAYS} days ahead; dates after {window_end.isoformat()} are not open yet.')
+    if not owner:
+        if last < today:
+            raise ApiError(400, 'The date range is entirely in the past')
+        if first < today:
+            first = today
+            notices.append('Past dates were skipped.')
+        if last > window_end:
+            last = window_end
+            notices.append(f'Slots open {SLOT_WINDOW_DAYS} days ahead; dates after {window_end.isoformat()} are not open yet.')
 
-    table, now_utc = slots_table(), datetime.now(timezone.utc)
+    # ONE DynamoDB query for the whole range (doctor partition + local_date LSI), then grouped by day.
+    by_day = {}
+    if types or owner:
+        for item in query_slots(slots_table(), doctor_id, first, last):
+            by_day.setdefault(str(item.get('local_date')), []).append(item)
+    now_utc = datetime.now(timezone.utc)
     days, total_free, bookable, shown = [], 0, 0, 0
     day = first
     while day <= last:
-        raw = day_slots(table, doctor_id, day.isoformat()) if types else []
-        relevant = [i for i in raw if str(i.get('consultation_type_id')) in types]
-        views = [v for v in (seat_view(i, types, tz, now_utc) for i in relevant) if v]
-        visible = [v for v in views if v['status'] != 'CLOSED' and (include_full or v['freeSeats'] > 0)]
-        visible.sort(key=lambda v: (v['startsAt'], v['label']))
-        free = sum(v['freeSeats'] for v in visible)
-        open_count = sum(1 for v in visible if v['freeSeats'] > 0)
+        raw = by_day.get(day.isoformat(), [])
+        relevant = [i for i in raw if str(i.get('consultation_type_id')) in types or (owner and not wanted)]
+        views = [v for v in (seat_view(i, types, tz, now_utc, owner) for i in relevant) if v]
+        visible = [v for v in views if (owner or v['status'] != 'CLOSED') and
+                   (include_full or v['freeSeats'] > 0 or v['status'] == 'CLOSED')]
+        visible.sort(key=lambda v: (v['startsAt'], v['label'] or ''))
+        bookable_views = [v for v in visible if v['status'] != 'CLOSED' and not v.get('started')]
+        free = sum(v['freeSeats'] for v in bookable_views)
+        open_count = sum(1 for v in bookable_views if v['freeSeats'] > 0)
         closed_day = bool(relevant) and all(i.get('status') == 'CLOSED' for i in relevant)
         days.append({'date': day.isoformat(), 'weekday': day.strftime('%A'), 'closed': closed_day,
                      'fullyBooked': bool(views) and not closed_day and open_count == 0 and
@@ -577,8 +618,9 @@ def doctor_slots(conn, event, params, cid):
         bookable += open_count
         shown += len(visible)
         day += timedelta(days=1)
-    return 200, {'doctorId': doctor_id, 'timezone': tz_name, 'from': first.isoformat(), 'to': last.isoformat(),
-                 'consultationTypeId': int(wanted) if wanted else None, 'includeFull': include_full,
+    return 200, {'doctorId': doctor_id, 'view': view, 'timezone': tz_name, 'from': first.isoformat(),
+                 'to': last.isoformat(), 'consultationTypeId': int(wanted) if wanted else None,
+                 'includeFull': include_full,
                  'summary': {'days': len(days), 'slotsShown': shown, 'bookableSlots': bookable, 'freeSeats': total_free},
                  'notices': notices, 'days': days}
 
@@ -783,16 +825,6 @@ def delete_me(conn, event, params, cid):
         raise ApiError(400, f'To delete your account send {{"confirm": "{DELETE_CONFIRMATION}"}}')
     with conn.cursor() as cur:
         fetch_profile(cur, patient_id)
-        # Milestone 5: a closed account must not keep seats. Ask the patient to cancel first (refunds apply).
-        try:
-            cur.execute("SELECT COUNT(*) AS n FROM appointments WHERE patient_id = %s AND status = 'CONFIRMED' "
-                        'AND slot_start_utc > UTC_TIMESTAMP(6)', (patient_id,))
-            upcoming = int((cur.fetchone() or {}).get('n') or 0)
-        except pymysql.err.ProgrammingError:
-            upcoming = 0                                  # booking tables not migrated yet
-        if upcoming:
-            raise ApiError(409, f'You have {upcoming} upcoming appointment(s). Cancel them first, then delete '
-                                'your account.', upcomingAppointments=upcoming)
         cur.execute('DELETE FROM patients WHERE user_id = %s', (patient_id,))
         # Keep the users row (future bookings point at it) but make it unusable and free the email for re-use.
         cur.execute("UPDATE users SET is_active = FALSE, email = %s, password_hash = '!deleted' "

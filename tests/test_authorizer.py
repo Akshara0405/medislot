@@ -32,3 +32,23 @@ def test_expired_token_unauthorized(monkeypatch):
 def test_revoked_token_unauthorized(monkeypatch):
     setup(monkeypatch,denied=True)
     with pytest.raises(Exception,match="Unauthorized"): authorizer.handler(event(token()),None)
+
+
+# ---- common.verify_access_token: the same checks, used by the shared public slots endpoint
+import common
+
+
+def test_shared_token_check_accepts_valid_and_rejects_bad_tokens(monkeypatch):
+    monkeypatch.setattr(common, "auth_table", lambda: FakeTable())
+    assert common.verify_access_token(token("doctor"), SECRET)["role"] == "doctor"
+    for bad in (token()[:-2] + "xx", token(exp=int(time.time()) - 60)):
+        with pytest.raises(ValueError):
+            common.verify_access_token(bad, SECRET)
+    monkeypatch.setattr(common, "auth_table", lambda: FakeTable(denied=True))
+    with pytest.raises(ValueError, match="revoked"):
+        common.verify_access_token(token(), SECRET)
+
+
+def test_bearer_token_is_read_case_insensitively():
+    assert common.bearer_token({"headers": {"authorization": "Bearer abc"}}) == "abc"
+    assert common.bearer_token({"headers": {}}) is None

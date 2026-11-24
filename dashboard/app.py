@@ -1,9 +1,9 @@
+import base64
 import json
 import logging
 import os
 import re
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -122,7 +122,27 @@ def store_login(data, role='doctor'):
         session['refresh_token'] = data['refreshToken']
     session['token_exp'] = time.time() + int(data.get('expiresIn') or 900)
     session['role'] = role
+    if str(data.get('userId', '')).isdigit():
+        session['user_id'] = str(data['userId'])
     session.permanent = True
+
+
+def session_user_id():
+    """The signed-in user's id: saved at login, or read from the access token (sessions from before that change).
+
+    Only used to build a URL. The API verifies the token itself and decides what the caller may see.
+    """
+    if str(session.get('user_id', '')).isdigit():
+        return session['user_id']
+    try:
+        part = str(session.get('token', '')).split('.')[1]
+        sub = str(json.loads(base64.urlsafe_b64decode(part + '=' * (-len(part) % 4))).get('sub', ''))
+    except (IndexError, ValueError, TypeError, AttributeError):
+        return None
+    if sub.isdigit():
+        session['user_id'] = sub
+        return sub
+    return None
 
 
 def end_signup_login(data):
@@ -449,21 +469,6 @@ def handle_dashboard_post():
             else:
                 flash('Invalid slot.', 'error')
 
-        elif action == 'cancel_slot':
-            # Milestone 5: the doctor cancels a slot; every booked patient is refunded in full by the API.
-            tab = 'schedule'
-            slot_id, reason = request.form.get('slot_id', ''), request.form.get('reason', '').strip()
-            if not slot_id or len(slot_id) > 190 or '#' not in slot_id:
-                flash('Invalid slot.', 'error')
-            elif len(reason) < 3:
-                flash('Give patients a short reason (at least 3 characters) for cancelling.', 'error')
-            else:
-                result = api_request('POST', '/doctor/me/slot-cancellations', payload={'slotId': slot_id, 'reason': reason[:300]})
-                if result.ok:
-                    flash(api_message(result, 'Slot cancelled.'), 'success')
-                else:
-                    outcome(result, '', 'Could not cancel the slot.')
-
         elif action == 'add_blackout':
             tab = 'blackouts'
             day = request.form.get('blackout_date', '')
@@ -487,21 +492,22 @@ def handle_dashboard_post():
     return redirect(url_for('dashboard', tab=tab))
 
 
-def decorate_slots(slots, type_labels, tz_name):
-    """Show slot times in the doctor's own timezone, with the consultation type name."""
-    try:
-        tz = ZoneInfo(tz_name or 'Asia/Kolkata')
-    except Exception:
-        tz = ZoneInfo('Asia/Kolkata')
+def decorate_slots(slots_payload, type_labels):
+    """Flatten the shared GET /doctors/{id}/slots answer (owner view) into the rows the Schedule tab shows.
+
+    Times come back already in the doctor's timezone (localStart/localEnd); only the 12-hour format is added here.
+    """
     rows = []
-    for slot in slots:
-        try:
-            start = datetime.fromisoformat(str(slot['start_at']).replace('Z', '+00:00')).astimezone(tz)
-            end = datetime.fromisoformat(str(slot['end_at']).replace('Z', '+00:00')).astimezone(tz)
-        except (KeyError, ValueError):
-            continue
-        rows.append(dict(slot, start_local=start.strftime('%I:%M %p').lstrip('0'), end_local=end.strftime('%I:%M %p').lstrip('0'),
-                         type_label=type_labels.get(str(slot.get('consultation_type_id')), 'Consultation')))
+    for day in (slots_payload or {}).get('days', []):
+        for slot in day.get('slots', []):
+            rows.append({
+                'slot_id': slot.get('slotId'), 'local_date': slot.get('localDate') or day.get('date'),
+                'consultation_type_id': slot.get('consultationTypeId'), 'status': slot.get('status'),
+                'booked_count': int(slot.get('booked') or 0), 'held_count': int(slot.get('held') or 0),
+                'capacity': int(slot.get('capacity') or 1), 'manual_block': bool(slot.get('manualBlock')),
+                'start_local': twelve_hour(slot.get('localStart')), 'end_local': twelve_hour(slot.get('localEnd')),
+                'type_label': type_labels.get(str(slot.get('consultationTypeId'))) or slot.get('label') or 'Consultation',
+            })
     return rows
 
 
@@ -526,10 +532,12 @@ def dashboard():
         if session.get('refresh_token') and time.time() > session.get('token_exp', 0) - 60:
             refresh_access_token()
         token = session.get('token')
+        # Slots come from the same endpoint patients use; with the doctor's own token it returns the owner view.
+        doctor_id = session_user_id() or '0'
         calls = {'profile': ('/doctor/me', None), 'availability': ('/doctor/me/availability', None),
-                 'schedule': ('/doctor/me/schedule', {'start_date': day, 'days': 30}),
-                 'types': ('/doctor/me/consultation-types', None), 'blackouts': ('/doctor/me/blackouts', None),
-                 'appointments': ('/doctor/me/appointments', {'from': day, 'days': 30})}
+                 'schedule': (f'/doctors/{doctor_id}/slots',
+                              {'from': day, 'to': (day_obj + timedelta(days=29)).isoformat()}),
+                 'types': ('/doctor/me/consultation-types', None), 'blackouts': ('/doctor/me/blackouts', None)}
         with ThreadPoolExecutor(max_workers=len(calls)) as pool:
             futures = {k: pool.submit(api_request, 'GET', path, params=params, token=token)
                        for k, (path, params) in calls.items()}
@@ -543,14 +551,10 @@ def dashboard():
         catalog = got['types'].json().get('catalog', []) if got['types'].ok else []
         types = [t for t in all_types if t.get('is_active')]
         blackouts = api_items(got['blackouts'])
-        try:
-            booked_names = got['appointments'].json().get('bySlot', {}) if got['appointments'].ok else {}
-        except ValueError:
-            booked_names = {}
     except requests.RequestException:
         flash('Unable to load your dashboard from the API.', 'error')
         profile = availability = schedule = None
-        all_types, types, blackouts, catalog, booked_names = [], [], [], [], {}
+        all_types, types, blackouts, catalog = [], [], [], []
 
     active_ids = {t['consultation_type_id'] for t in types}
     patterns = [{'consultation_type_id': p.get('consultation_type_id'), 'day_of_week': p.get('day_of_week'),
@@ -560,12 +564,8 @@ def dashboard():
     profile_data = profile.json() if profile is not None and profile.ok else {}
     type_labels = {str(t['consultation_type_id']): '%s · %s min' % (str(t.get('name', '')).replace('_', ' ').title(), t.get('duration_min'))
                    for t in all_types}
-    slots = schedule.json().get('slots', []) if schedule is not None and schedule.ok else []
-    decorated = decorate_slots(slots, type_labels, profile_data.get('timezone'))
-    now_z = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    for slot in decorated:                       # who booked it (Milestone 5) and whether it can still be cancelled
-        slot['patients'] = booked_names.get(slot.get('slot_id'), [])
-        slot['future'] = str(slot.get('start_at', '')) > now_z
+    schedule_ok = schedule is not None and schedule.ok and schedule.json().get('view') == 'owner'
+    decorated = decorate_slots(schedule.json() if schedule_ok else None, type_labels)
     slots_by_day = {}
     for slot in decorated:
         slots_by_day.setdefault(slot.get('local_date') or day, []).append(slot)
@@ -589,7 +589,7 @@ def dashboard():
         tabs=TABS, active=active, day=day, busy_days=busy_days, slot_total=slot_total, open_total=open_total, types=types, blackouts=blackouts, patterns=patterns,
         profile=profile_data,
         schedule=decorated, schedule_days=schedule_days,
-        schedule_error=(schedule is not None and not schedule.ok),
+        schedule_error=(schedule is not None and not schedule_ok),
         prev_day=(day_obj - timedelta(days=30)).isoformat(), next_day=(day_obj + timedelta(days=30)).isoformat(),
         catalog=catalog,
         hospitals=get_hospitals(),
@@ -606,10 +606,7 @@ def dashboard():
 # =====================================================================================================
 GENDER_OPTIONS = ['Female', 'Male', 'Non-binary', 'Other', 'Prefer not to say']
 BLOOD_GROUP_OPTIONS = ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-']
-PATIENT_TABS = [('find', 'Find a doctor'), ('appointments', 'My appointments'), ('refunds', 'Refunds'),
-                ('profile', 'My profile')]
-IDEM_PATTERN = re.compile(r'^[A-Za-z0-9_\-:.]{8,64}$')
-TIER_LABELS = {'FULL': 'full refund', 'PARTIAL': 'partial refund', 'LATE': 'no refund', 'DOCTOR_CANCELLED': 'doctor cancelled'}
+PATIENT_TABS = [('find', 'Find a doctor'), ('profile', 'My profile')]
 PHONE_PATTERN = re.compile(r'^\+?[0-9][0-9 \-]{5,22}$')
 PATIENT_PROFILE_FORM = {          # form field -> API field
     'first_name': 'firstName', 'last_name': 'lastName', 'phone': 'phone', 'date_of_birth': 'dateOfBirth',
@@ -813,7 +810,6 @@ def patient_dashboard():
     if tab not in {k for k, _ in PATIENT_TABS}:
         tab = 'find'
     profile, results, search_error = {}, None, None
-    booking = {'upcoming': [], 'history': [], 'refunds': None, 'error': None}
     state = search_state()
     try:
         me = api_request('GET', '/patient/me')
@@ -827,145 +823,25 @@ def patient_dashboard():
             flash(api_message(me, 'Your profile could not be loaded.'), 'warning')
         if state['first_visit'] and profile.get('city'):
             state['city'] = profile['city']
-        if tab in ('appointments', 'refunds'):
-            booking = load_booking_tab(tab)
+        params = {'name': state['name'], 'specialization': state['specialization'],
+                  'hospitalId': state['hospital_id'], 'city': state['city'], 'cursor': state['cursor'], 'limit': 8}
+        res = public_get('/doctors', params)
+        if res.ok:
+            results = res.json()
         else:
-            params = {'name': state['name'], 'specialization': state['specialization'],
-                      'hospitalId': state['hospital_id'], 'city': state['city'], 'cursor': state['cursor'], 'limit': 8}
-            res = public_get('/doctors', params)
-            if res.ok:
-                results = res.json()
-            else:
-                search_error = api_message(res, 'Search is unavailable right now.')
+            search_error = api_message(res, 'Search is unavailable right now.')
     except requests.RequestException:
         search_error = 'MediSlot could not reach the API. Please try again.'
     prev_link, next_link = page_links(state, (results or {}).get('page', {}).get('nextCursor'))
     return render_template('patient.html', view='find', tabs=PATIENT_TABS, active=tab, profile=profile, state=state,
                            results=results, search_error=search_error, options=search_options(),
                            prev_link=prev_link, next_link=next_link, page_no=len(state['trail']) + 1,
-                           genders=GENDER_OPTIONS, blood_groups=BLOOD_GROUP_OPTIONS, booking=booking,
-                           tier_labels=TIER_LABELS)
-
-
-# ----------------------------------------------------------------------------- Milestone 5: booking pages
-
-def local_label(iso_value, tz_name, fmt='%a %d %b, %I:%M %p'):
-    """'2026-11-21T03:30:00Z' -> 'Sat 21 Nov, 9:00 AM' in the appointment's own timezone."""
-    if not iso_value:
-        return ''
-    try:
-        tz = ZoneInfo(tz_name or 'Asia/Kolkata')
-    except Exception:
-        tz = ZoneInfo('Asia/Kolkata')
-    try:
-        when = datetime.fromisoformat(str(iso_value).replace('Z', '+00:00')).astimezone(tz)
-    except ValueError:
-        return str(iso_value)
-    return when.strftime(fmt).replace(' 0', ' ')
-
-
-def decorate_appointment(a):
-    tz = a.get('timezone')
-    a['when'] = local_label(a.get('startsAt'), tz, '%a %d %b %Y, %I:%M %p')
-    a['until'] = local_label(a.get('endsAt'), tz, '%I:%M %p')
-    for step in (a.get('cancellation') or {}).get('schedule', []):
-        step['by_label'] = local_label(step.get('cancelBy') or step.get('cancelBefore'), tz)
-    return a
-
-
-def load_booking_tab(tab):
-    """Data for the My appointments / Refunds tabs. Every read goes through API Gateway."""
-    out = {'upcoming': [], 'history': [], 'refunds': None, 'error': None}
-    if tab == 'appointments':
-        upcoming = api_request('GET', '/patient/appointments', params={'view': 'upcoming', 'limit': 50})
-        history = api_request('GET', '/patient/appointments', params={'view': 'all', 'limit': 50})
-        if upcoming.ok:
-            out['upcoming'] = [decorate_appointment(a) for a in upcoming.json().get('items', [])]
-            live_ids = {a['appointmentId'] for a in out['upcoming']}
-            out['history'] = [decorate_appointment(a) for a in (history.json().get('items', []) if history.ok else [])
-                              if a['appointmentId'] not in live_ids]
-        else:
-            out['error'] = api_message(upcoming, 'Your appointments could not be loaded.')
-    else:
-        res = api_request('GET', '/patient/refunds')
-        if res.ok:
-            out['refunds'] = res.json()
-            for r in out['refunds'].get('items', []):
-                r['when'] = local_label(r.get('appointmentStartsAt'), r.get('timezone'), '%d %b %Y, %I:%M %p')
-                r['recorded'] = local_label(r.get('recordedAt'), r.get('timezone'), '%d %b %Y, %I:%M %p')
-        else:
-            out['error'] = api_message(res, 'Your refunds could not be loaded.')
-    return out
-
-
-def api_code(result):
-    try:
-        return result.json().get('code')
-    except (ValueError, AttributeError):
-        return None
-
-
-def handle_booking_post(action):
-    """book / cancel_appointment. Returns a redirect."""
-    if action == 'book':
-        slot_id, key = request.form.get('slot_id', ''), request.form.get('idem_key', '')
-        doctor_id = request.form.get('doctor_id', '')
-        back = url_for('patient_doctor', doctor_id=int(doctor_id)) if ID_PATTERN.match(doctor_id) else url_for('patient_dashboard')
-        if not slot_id or len(slot_id) > 190 or '#' not in slot_id or not IDEM_PATTERN.match(key):
-            flash('That booking form is no longer valid. Please choose the slot again.', 'error')
-            return redirect(back)
-        payload = {'slotId': slot_id}
-        # The key was generated when the page was drawn: pressing Book twice (or Back + Book) sends the SAME key,
-        # so the API returns the same appointment instead of booking a second seat.
-        result = api_request('POST', '/patient/appointments', payload=payload, headers={'Idempotency-Key': key})
-        if result.status_code == 201:
-            data = result.json()
-            message = (f"Booked with {data['doctor']['name']} on "
-                       f"{local_label(data['startsAt'], data.get('timezone'), '%a %d %b, %I:%M %p')}. "
-                       f"Reference {data['reference']}.")
-            if data.get('replayed'):
-                message += ' (That was the same booking sent twice - you have one appointment, not two.)'
-            flash(message, 'success')
-            return redirect(url_for('patient_dashboard', tab='appointments'))
-        if result.status_code == 401:
-            session.clear()
-            flash('Your session has expired. Please sign in again.', 'warning')
-            return redirect(url_for('patient_login'))
-        if api_code(result) == 'SLOT_FULL':
-            flash('Someone booked the last seat a moment before you. Please pick another slot.', 'warning')
-        else:
-            flash(api_message(result, 'The booking did not go through.'), 'error')
-        return redirect(back)
-
-    if action == 'cancel_appointment':
-        appointment_id = request.form.get('appointment_id', '')
-        if not ID_PATTERN.match(appointment_id):
-            flash('Unknown appointment.', 'error')
-        else:
-            reason = re.sub(r'\s+', ' ', request.form.get('reason', '')).strip()[:300]
-            result = api_request('POST', f'/patient/appointments/{appointment_id}/cancel',
-                                 payload={'reason': reason} if reason else {})
-            if result.ok:
-                data = result.json()
-                refund = data.get('refund') or {}
-                if data.get('alreadyCancelled'):
-                    flash(f"{data['reference']} was already cancelled.", 'warning')
-                else:
-                    flash(f"{data['reference']} cancelled. Refund: ₹{refund.get('refundAmount')} "
-                          f"({refund.get('refundPercent')}% - {TIER_LABELS.get(refund.get('tier'), refund.get('tier'))}).",
-                          'success')
-            else:
-                flash(api_message(result, 'Could not cancel the appointment.'), 'error')
-        return redirect(url_for('patient_dashboard', tab='appointments'))
-
-    return redirect(url_for('patient_dashboard'))
+                           genders=GENDER_OPTIONS, blood_groups=BLOOD_GROUP_OPTIONS)
 
 
 def handle_patient_post():
     action = request.form.get('action', '')
     try:
-        if action in ('book', 'cancel_appointment'):
-            return handle_booking_post(action)
         if action == 'profile':
             payload = {api: request.form.get(field, '').strip() for field, api in PATIENT_PROFILE_FORM.items()
                        if field in request.form}
@@ -1048,7 +924,6 @@ def patient_doctor(doctor_id):
         day['label'] = date.fromisoformat(day['date']).strftime('%a %d %b')
         for slot in day['slots']:
             slot['start12'], slot['end12'] = twelve_hour(slot['localStart']), twelve_hour(slot['localEnd'])
-            slot['idem_key'] = 'web-' + uuid.uuid4().hex     # one key per Book button (Milestone 5 idempotency)
     nav = {'type': type_id or None, 'free': '1' if only_free else None}
     prev_week = (url_for('patient_doctor', doctor_id=doctor_id, **{k: v for k, v in nav.items() if v},
                          **{'from': max(today, start - timedelta(days=7)).isoformat()}) if start > today else None)

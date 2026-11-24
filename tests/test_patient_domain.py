@@ -195,29 +195,96 @@ def test_slot_range_longer_than_window_rejected(monkeypatch):
     assert status == 400 and 'at most 30 days' in out['message']
 
 
+class SlotsTable:
+    """Fake Slots table: (doctor_id, slot_id) key, LSI_DoctorDate on (doctor_id, local_date). Records every query."""
+    def __init__(self, items): self.items, self.queries = items, []
+    def query(self, IndexName, KeyConditionExpression, **kw):
+        assert IndexName == 'LSI_DoctorDate'
+        doctor, dates = KeyConditionExpression._values
+        assert doctor._values[0].name == 'doctor_id' and dates._values[0].name == 'local_date'
+        first, last = dates._values[1], dates._values[-1]
+        self.queries.append((doctor._values[1], first, last))
+        return {'Items': [dict(i) for i in self.items
+                          if i['doctor_id'] == doctor._values[1] and first <= i['local_date'] <= last]}
+
+
+def sample_day(day):
+    base = {'doctor_id': '5', 'consultation_type_id': '30', 'capacity': 1, 'held_count': 0, 'local_date': day.isoformat()}
+    return [
+        dict(base, slot_id='a', start_at=f'{day}T03:30:00Z', end_at=f'{day}T04:00:00Z', booked_count=0, status='OPEN'),
+        dict(base, slot_id='b', start_at=f'{day}T04:00:00Z', end_at=f'{day}T04:30:00Z', booked_count=1, status='FULL'),
+        dict(base, slot_id='c', start_at=f'{day}T04:30:00Z', end_at=f'{day}T05:00:00Z', booked_count=0, status='CLOSED',
+             manual_block=True),
+    ]
+
+
 def test_slots_grouped_by_day_with_free_seat_totals(monkeypatch):
     tomorrow = datetime.now(pl.zone('Asia/Kolkata')).date() + timedelta(days=1)
-
-    class Table:
-        def query(self, IndexName, KeyConditionExpression, **kw):
-            assert IndexName == 'GSI_DoctorDate'
-            if KeyConditionExpression._values[1] != f'5#{tomorrow.isoformat()}':
-                return {'Items': []}
-            base = {'consultation_type_id': '30', 'capacity': 1, 'held_count': 0}
-            return {'Items': [
-                dict(base, slot_id='a', start_at=f'{tomorrow}T03:30:00Z', end_at=f'{tomorrow}T04:00:00Z', booked_count=0, status='OPEN'),
-                dict(base, slot_id='b', start_at=f'{tomorrow}T04:00:00Z', end_at=f'{tomorrow}T04:30:00Z', booked_count=1, status='FULL'),
-                dict(base, slot_id='c', start_at=f'{tomorrow}T04:30:00Z', end_at=f'{tomorrow}T05:00:00Z', booked_count=0, status='CLOSED'),
-            ]}
-    monkeypatch.setattr(pl, 'slots_table', lambda: Table())
+    table = SlotsTable(sample_day(tomorrow) + [dict(i, doctor_id='6') for i in sample_day(tomorrow)])
+    monkeypatch.setattr(pl, 'slots_table', lambda: table)
     status, out, _, _ = run(monkeypatch, 'GET', '/doctors/5/slots', cur=SlotCur(), role=None,
                             query={'from': tomorrow.isoformat(), 'to': tomorrow.isoformat()})
     day = out['days'][0]
-    assert status == 200 and [s['slotId'] for s in day['slots']] == ['a', 'b']      # CLOSED is hidden
+    assert status == 200 and out['view'] == 'public'
+    assert [s['slotId'] for s in day['slots']] == ['a', 'b']      # CLOSED is hidden, doctor 6 is not mixed in
+    assert 'manualBlock' not in day['slots'][0]                      # owner-only fields stay private
     assert day['openSlots'] == 1 and day['freeSeats'] == 1 and out['summary']['bookableSlots'] == 1
     status, out, _, _ = run(monkeypatch, 'GET', '/doctors/5/slots', cur=SlotCur(), role=None,
                             query={'from': tomorrow.isoformat(), 'to': tomorrow.isoformat(), 'includeFull': 'false'})
     assert [s['slotId'] for s in out['days'][0]['slots']] == ['a']
+
+
+def test_a_week_of_slots_is_one_dynamodb_query(monkeypatch):
+    today = datetime.now(pl.zone('Asia/Kolkata')).date()
+    table = SlotsTable([])
+    monkeypatch.setattr(pl, 'slots_table', lambda: table)
+    status, out, _, _ = run(monkeypatch, 'GET', '/doctors/5/slots', cur=SlotCur(), role=None,
+                            query={'from': today.isoformat(), 'to': (today + timedelta(days=6)).isoformat()})
+    assert status == 200 and len(out['days']) == 7
+    assert table.queries == [('5', today.isoformat(), (today + timedelta(days=6)).isoformat())]
+
+
+def test_doctor_gets_owner_view_of_their_own_slots(monkeypatch):
+    yesterday = datetime.now(pl.zone('Asia/Kolkata')).date() - timedelta(days=1)
+    table = SlotsTable(sample_day(yesterday))
+    monkeypatch.setattr(pl, 'slots_table', lambda: table)
+    query = {'from': yesterday.isoformat(), 'to': yesterday.isoformat()}
+    # The same endpoint and query a patient uses; the doctor's own identity switches it to the full view.
+    status, out, _, _ = run(monkeypatch, 'GET', '/doctors/5/slots', cur=SlotCur(), role='doctor', user='5', query=query)
+    assert status == 200 and out['view'] == 'owner' and out['from'] == yesterday.isoformat()   # past allowed
+    slots = out['days'][0]['slots']
+    assert [s['slotId'] for s in slots] == ['a', 'b', 'c']          # closed and already-started slots included
+    closed = slots[2]
+    assert closed['status'] == 'CLOSED' and closed['manualBlock'] is True and closed['localDate'] == yesterday.isoformat()
+    assert all(s['started'] for s in slots) and out['summary']['bookableSlots'] == 0
+    # Another doctor, or a patient, asking about doctor 5 gets the public view (and here: the past is rejected).
+    for role, user in (('doctor', '6'), ('patient', '21')):
+        status, out, _, _ = run(monkeypatch, 'GET', '/doctors/5/slots', cur=SlotCur(), role=role, user=user, query=query)
+        assert status == 400 and 'past' in out['message']
+
+
+def test_owner_view_from_a_bearer_token_and_bad_tokens_get_401(monkeypatch):
+    tomorrow = datetime.now(pl.zone('Asia/Kolkata')).date() + timedelta(days=1)
+    monkeypatch.setattr(pl, 'slots_table', lambda: SlotsTable(sample_day(tomorrow)))
+    query = {'from': tomorrow.isoformat(), 'to': tomorrow.isoformat()}
+
+    def verify(token, secret):
+        if token == 'doctor-5':
+            return {'sub': '5', 'role': 'doctor'}
+        if token == 'patient-21':
+            return {'sub': '21', 'role': 'patient'}
+        raise ValueError('expired')
+    monkeypatch.setattr(pl, 'verify_access_token', verify)
+    hdr = lambda t: {'Authorization': 'Bearer ' + t}
+    status, out, _, _ = run(monkeypatch, 'GET', '/doctors/5/slots', cur=SlotCur(), role=None, query=query,
+                            headers=hdr('doctor-5'))
+    assert status == 200 and out['view'] == 'owner' and len(out['days'][0]['slots']) == 3
+    status, out, _, _ = run(monkeypatch, 'GET', '/doctors/5/slots', cur=SlotCur(), role=None, query=query,
+                            headers=hdr('patient-21'))
+    assert status == 200 and out['view'] == 'public' and len(out['days'][0]['slots']) == 2
+    status, out, _, _ = run(monkeypatch, 'GET', '/doctors/5/slots', cur=SlotCur(), role=None, query=query,
+                            headers=hdr('stale'))
+    assert status == 401
 
 
 def test_unknown_doctor_is_404(monkeypatch):

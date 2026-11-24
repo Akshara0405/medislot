@@ -1,4 +1,7 @@
-"""Doctor Lambda: profile, photo, consultation types, weekly availability, blackouts, single-slot blocks, schedule.
+"""Doctor Lambda: profile, photo, consultation types, weekly availability, blackouts, single-slot blocks.
+
+Reading slots is NOT done here any more: doctors and patients share GET /doctors/{doctorId}/slots (patient
+Lambda). A doctor who sends their own token to that endpoint gets the full owner view of their schedule.
 
 Every route needs a doctor token (the authorizer checks it; this Lambda re-checks the role).
 All ids are integers (AUTO_INCREMENT). Consultation kinds (Quick, Standard, ...) come from the
@@ -14,8 +17,8 @@ import boto3
 import pymysql
 from botocore.config import Config
 
-from common import body, config, dbconn, emit, logged, release, response
-from slots import WINDOW_DAYS, find_booking_conflicts, query_schedule_window, resync_slots, slots_table
+from common import body, config, dbconn, emit, logged, release, response, slot_key
+from slots import WINDOW_DAYS, find_booking_conflicts, resync_slots, slots_table
 
 WEEKDAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
 
@@ -128,8 +131,6 @@ def handler(event, context):
                 return blackouts(conn, cur, doctor_id, method, ident, data)
             if path.endswith('/doctor/me/slot-blocks') and method == 'POST':
                 return slot_block(cur, doctor_id, data)
-            if path.endswith('/doctor/me/schedule') and method == 'GET':
-                return schedule(doctor_id, event.get('queryStringParameters') or {})
             return fail(404, 'Unknown doctor endpoint')
     except ApiError as exc:
         conn.rollback()
@@ -388,7 +389,7 @@ def _hm(value):
     return f'{int(parts[0]):02d}:{int(parts[1]):02d}'
 
 
-# --------------------------------------------------------------------------- blackouts, slot blocks, schedule
+# --------------------------------------------------------------------------- blackouts, slot blocks
 
 def blackouts(conn, cur, doctor_id, method, ident, data):
     if method == 'GET' and ident is None:
@@ -418,50 +419,24 @@ def blackouts(conn, cur, doctor_id, method, ident, data):
 
 
 def slot_block(cur, doctor_id, data):
-    """Close (blocked=true) or re-open (blocked=false) ONE slot. A booking on it is never cancelled.
-
-    Milestone 5: both writes bump the slot's `version`, so a booking racing this change retries against the
-    new state instead of overwriting it. Re-opening also clears a doctor cancellation (cancelled_by_doctor).
-    """
+    """Close (blocked=true) or re-open (blocked=false) ONE slot. A booking on it is never cancelled."""
     slot_id, blocked = data.get('slot_id'), data.get('blocked', True)
     if (not isinstance(slot_id, str) or not slot_id.startswith(f'{doctor_id}#') or len(slot_id) > 190
             or type(blocked) is not bool):
         return fail(400, 'Invalid slot')
     table = slots_table()
-    slot = table.get_item(Key={'slot_id': slot_id}).get('Item')
+    slot = table.get_item(Key=slot_key(doctor_id, slot_id)).get('Item')
     if not slot or str(slot.get('doctor_id')) != str(doctor_id):
         return fail(404, 'Slot not found')
     cur.execute('SELECT 1 FROM blackout_dates WHERE doctor_id = %s AND blackout_date = %s', (doctor_id, slot.get('local_date')))
     if cur.fetchone():
         return fail(409, f"{slot.get('local_date')} is a blackout day, so every slot that day stays closed. "
                          f"Remove the blackout date first (Blackouts tab), then open or close single slots.")
-    bump = {':one': 1, ':zero': 0}
     if blocked:
-        table.update_item(Key={'slot_id': slot_id},
-                          UpdateExpression='SET manual_block = :t, version = if_not_exists(version, :zero) + :one',
-                          ExpressionAttributeValues={':t': True, **bump})
+        table.update_item(Key=slot_key(doctor_id, slot_id), UpdateExpression='SET manual_block = :t',
+                          ExpressionAttributeValues={':t': True})
     else:
-        table.update_item(Key={'slot_id': slot_id},
-                          UpdateExpression='SET version = if_not_exists(version, :zero) + :one '
-                                           'REMOVE manual_block, cancelled_by_doctor, cancelled_at',
-                          ExpressionAttributeValues=bump)
+        table.update_item(Key=slot_key(doctor_id, slot_id), UpdateExpression='REMOVE manual_block')
     return response(200, {'slotId': slot_id, 'blocked': blocked,
                           'hasBooking': int(slot.get('booked_count', 0) or 0) > 0, **sync(cur, doctor_id)})
 
-
-def schedule(doctor_id, params):
-    start_value = params.get('start_date') or params.get('date')
-    try:
-        first_day = date.fromisoformat(start_value)
-    except (ValueError, TypeError):
-        return fail(400, 'date or start_date must be YYYY-MM-DD')
-    try:
-        days = int(params.get('days', '1' if params.get('date') else '30'))
-    except (TypeError, ValueError):
-        return fail(400, 'days must be an integer between 1 and 30')
-    if not 1 <= days <= 30:
-        return fail(400, 'days must be between 1 and 30')
-    items = query_schedule_window(slots_table(), doctor_id, first_day, days)
-    # booking_refs (Milestone 5) is the engine's internal seat ledger: count only, never the refs themselves.
-    return response(200, {'startDate': first_day.isoformat(), 'days': days,
-                          'slots': [jsonable({k: v for k, v in x.items() if k != 'booking_refs'}) for x in items]})

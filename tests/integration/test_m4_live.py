@@ -230,6 +230,19 @@ def test_slots_show_free_seats_for_a_date_range(probe_doctors):
     assert data['summary']['freeSeats'] == sum(d['freeSeats'] for d in data['days'])
 
 
+def test_same_slots_endpoint_gives_the_doctor_the_owner_view(probe_doctors):
+    doc, other = probe_doctors[0], probe_doctors[1]
+    start = date.today() + timedelta(days=1)
+    params = {'from': start.isoformat(), 'to': (start + timedelta(days=6)).isoformat()}
+    own = call('GET', f"/doctors/{doc['id']}/slots", doc['token'], params=params)
+    assert own.status_code == 200, own.text
+    assert own.json()['view'] == 'owner'
+    assert all('manualBlock' in s for d in own.json()['days'] for s in d['slots'])
+    assert call('GET', f"/doctors/{doc['id']}/slots", other['token'], params=params).json()['view'] == 'public'
+    assert call('GET', f"/doctors/{doc['id']}/slots", 'not-a-token', params=params).status_code == 401
+    assert call('GET', '/doctor/me/schedule', doc['token']).status_code in (403, 404)    # old route is gone
+
+
 @pytest.mark.parametrize('params', [{'from': 'yesterday'}, {'from': '2030-01-10', 'to': '2030-01-01'},
                                     {'from': date.today().isoformat(),
                                      'to': (date.today() + timedelta(days=45)).isoformat()},

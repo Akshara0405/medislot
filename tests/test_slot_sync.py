@@ -1,29 +1,42 @@
 import os, sys
 from datetime import date, timedelta, time
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lambdas'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lambdas', 'doctor'))
+import common
 import slots
 
 DOC = 7
 T30, T15, T60 = 'type-30', 'type-15', 'type-60'
 
 
+def parse_key_condition(cond):
+    """(doctor_id, first_date, last_date) from Key('doctor_id').eq(..) & Key('local_date').eq/between(..)."""
+    doctor, dates = cond._values
+    assert doctor._values[0].name == 'doctor_id' and dates._values[0].name == 'local_date'
+    values = dates._values[1:]
+    return doctor._values[1], values[0], values[-1]
+
+
 class FakeTable:
-    def __init__(self): self.items = {}
-    def update_item(self, Key, ExpressionAttributeValues, **kw): self.items[Key['slot_id']]['status'] = ExpressionAttributeValues[':s']
-    # Milestone 5: resync writes one conditional item at a time (conditions always hold in these single-threaded tests).
-    def put_item(self, Item, **kw): self.items[Item['slot_id']] = dict(Item)
-    def delete_item(self, Key, **kw): self.items.pop(Key['slot_id'], None)
-    def get_item(self, Key, **kw): return {'Item': dict(self.items[Key['slot_id']])} if Key['slot_id'] in self.items else {}
+    """Slots table keyed by (doctor_id, slot_id) with the LSI_DoctorDate index on (doctor_id, local_date)."""
+    def __init__(self): self.items = {}; self.queries = []
+    def _check_key(self, Key):
+        assert set(Key) == {'doctor_id', 'slot_id'} and Key['slot_id'].startswith(Key['doctor_id'] + '#')
+    def update_item(self, Key, ExpressionAttributeValues, **kw):
+        self._check_key(Key); self.items[Key['slot_id']]['status'] = ExpressionAttributeValues[':s']
     def query(self, IndexName, KeyConditionExpression, **kw):
-        key = KeyConditionExpression._values[1]
-        return {'Items': sorted((dict(i) for i in self.items.values() if i['doctor_date'] == key), key=lambda i: i['start_at'])}
+        assert IndexName == 'LSI_DoctorDate'
+        doctor, first, last = parse_key_condition(KeyConditionExpression)
+        self.queries.append((doctor, first, last))
+        rows = [dict(i) for i in self.items.values() if i['doctor_id'] == doctor and first <= i['local_date'] <= last]
+        return {'Items': sorted(rows, key=lambda i: i['start_at'])}
     def batch_writer(self):
         t = self
         class W:
             def __enter__(s): return s
             def __exit__(s, *a): return False
             def put_item(s, Item): t.items[Item['slot_id']] = dict(Item)
-            def delete_item(s, Key): t.items.pop(Key['slot_id'], None)
+            def delete_item(s, Key): t._check_key(Key); t.items.pop(Key['slot_id'], None)
         return W()
 
 
@@ -178,37 +191,39 @@ def test_materializer_will_not_create_slots_over_a_booked_one():
     assert skipped == 2 and [c['start_at'] for c in create] == ['2026-11-09T04:00:00Z', '2026-11-09T04:15:00Z']
 
 
-class FakeScheduleTable:
-    def __init__(self, items): self.items = items; self.queries = []
-    def query(self, IndexName, KeyConditionExpression, **kwargs):
-        doctor_date = KeyConditionExpression._values[1]
-        self.queries.append(doctor_date)
-        rows = [dict(item) for item in self.items if item['doctor_date'] == doctor_date]
-        return {'Items': rows}
+def test_items_are_partitioned_by_doctor():
+    item = next(slots.generate_slots(DOC, T30, date(2026, 11, 2), 'Asia/Kolkata', time(9), time(10), 30, 1))
+    assert item['doctor_id'] == str(DOC) and item['slot_id'] == f'{DOC}#{T30}#2026-11-02T03:30:00Z'
+    assert 'doctor_date' not in item and item['local_date'] == '2026-11-02'
 
 
-def test_schedule_window_reads_all_30_days_and_sorts_slots():
-    from datetime import date
+class PagedTable:
+    """Returns the doctor's rows two per page, newest first, to prove query_slots follows pages and sorts."""
+    def __init__(self, items): self.items = items; self.calls = []
+    def query(self, IndexName, KeyConditionExpression, ExclusiveStartKey=None, **kw):
+        assert IndexName == common.SLOTS_DATE_INDEX
+        doctor, first, last = parse_key_condition(KeyConditionExpression)
+        self.calls.append((doctor, first, last))
+        rows = sorted((i for i in self.items if i['doctor_id'] == doctor and first <= i['local_date'] <= last),
+                      key=lambda i: i['start_at'], reverse=True)
+        start = ExclusiveStartKey or 0
+        page = {'Items': [dict(r) for r in rows[start:start + 2]]}
+        if start + 2 < len(rows):
+            page['LastEvaluatedKey'] = start + 2
+        return page
+
+
+def test_query_slots_reads_a_30_day_range_in_one_paginated_query():
     first = date(2026, 11, 3)
-    source = [
-        {'doctor_date': f'7#{(first + timedelta(days=i)).isoformat()}',
-         'local_date': (first + timedelta(days=i)).isoformat(),
-         'start_at': f'{(first + timedelta(days=i)).isoformat()}T04:00:00Z'}
-        for i in range(30)
-    ]
-    table = FakeScheduleTable(source)
-    result = slots.query_schedule_window(table, DOC, first, 30)
-    assert len(table.queries) == 30
-    assert len(result) == 30
-    assert result[0]['local_date'] == '2026-11-03'
-    assert result[-1]['local_date'] == '2026-12-02'
-
-
-def test_schedule_window_rejects_more_than_30_days():
-    from datetime import date
-    import pytest
-    with pytest.raises(ValueError):
-        slots.query_schedule_window(FakeScheduleTable([]), DOC, date(2026, 11, 3), 31)
+    source = [{'doctor_id': '7', 'local_date': (first + timedelta(days=i)).isoformat(),
+               'start_at': f'{(first + timedelta(days=i)).isoformat()}T04:00:00Z'} for i in range(30)]
+    source.append({'doctor_id': '8', 'local_date': '2026-11-05', 'start_at': '2026-11-05T04:00:00Z'})  # other doctor
+    table = PagedTable(source)
+    result = common.query_slots(table, DOC, first, first + timedelta(days=29))
+    assert {c for c in table.calls} == {('7', '2026-11-03', '2026-12-02')} and len(table.calls) == 15    # pages
+    assert len(result) == 30 and result[0]['local_date'] == '2026-11-03' and result[-1]['local_date'] == '2026-12-02'
+    one_day = common.query_slots(PagedTable(source), DOC, '2026-11-05')
+    assert [i['local_date'] for i in one_day] == ['2026-11-05']
 
 
 def test_single_slot_can_be_closed_and_reopened_without_touching_the_rest_of_the_day():

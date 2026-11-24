@@ -88,3 +88,45 @@ def test_signup_with_failed_photo_still_goes_to_login_and_revokes_tokens(monkeyp
     assert calls[-1] == '/auth/logout'
     with client.session_transaction() as s:
         assert 'token' not in s
+
+def test_schedule_tab_reads_the_shared_slots_endpoint_with_the_doctor_token(monkeypatch):
+    """The doctor dashboard no longer has its own schedule API: it calls GET /doctors/{id}/slots like patients do."""
+    seen = {}
+
+    def request(method, url, headers=None, json=None, params=None, timeout=None):
+        path = url.split('/dev', 1)[1]
+        if path == '/doctor/me':
+            return Res(200, {'user_id': 7, 'timezone': 'Asia/Kolkata', 'first_name': 'Asha', 'last_name': 'Rao'})
+        if path in ('/doctor/me/availability', '/doctor/me/blackouts'):
+            return Res(200, {'items': []})
+        if path == '/doctor/me/consultation-types':
+            return Res(200, {'items': [{'consultation_type_id': 30, 'consultation_id': 2, 'name': 'STANDARD',
+                                        'label': 'Standard consult', 'duration_min': 30, 'fee_amount': '450.00',
+                                        'capacity': 1, 'min_capacity': 1, 'max_capacity': 1, 'is_active': 1}],
+                             'catalog': []})
+        if path == '/doctors/7/slots':
+            seen.update(params=params, auth=headers.get('Authorization'))
+            return Res(200, {'view': 'owner', 'days': [{'date': params['from'], 'slots': [
+                {'slotId': '7#30#x', 'localDate': params['from'], 'consultationTypeId': 30, 'status': 'CLOSED',
+                 'booked': 0, 'held': 0, 'capacity': 1, 'manualBlock': True, 'localStart': '09:00',
+                 'localEnd': '09:30', 'label': 'Standard consult'}]}]})
+        raise AssertionError(path)
+
+    monkeypatch.setattr(dashboard.requests, 'request', request)
+    monkeypatch.setattr(dashboard.requests, 'get', lambda *a, **k: Res(200, {'items': []}))
+    dashboard._hospital_cache.update(at=0.0, items=[])
+    client = dashboard.app.test_client()
+    with client.session_transaction() as s:
+        s.update(token='a1', role='doctor', user_id='7', token_exp=9999999999)
+    page = client.get('/doctor/dashboard?tab=schedule&date=2026-12-01').get_data(as_text=True)
+    assert seen == {'params': {'from': '2026-12-01', 'to': '2026-12-30'}, 'auth': 'Bearer a1'}
+    assert '9:00 AM' in page and 'Re-open' in page and '7#30#x' in page
+
+
+def test_doctor_id_falls_back_to_the_token_subject_for_older_sessions():
+    import base64 as b64
+    import json as js
+    payload = b64.urlsafe_b64encode(js.dumps({'sub': '42'}).encode()).decode().rstrip('=')
+    with dashboard.app.test_request_context():
+        dashboard.session['token'] = 'h.' + payload + '.s'
+        assert dashboard.session_user_id() == '42'

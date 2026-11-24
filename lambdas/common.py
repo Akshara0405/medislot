@@ -16,6 +16,7 @@ from functools import lru_cache
 
 import boto3
 import pymysql
+from boto3.dynamodb.conditions import Key
 
 log = logging.getLogger()
 log.setLevel(logging.INFO)
@@ -54,6 +55,70 @@ def config():
             'dbhost': get_param(f'{p}/db/host'), 'dbport': int(get_param(f'{p}/db/port')),
             'dbname': get_param(f'{p}/db/name'), 'dbuser': get_param(f'{p}/db/username'),
             'dbpass': get_param(f'{p}/db/password', True)}
+
+
+# --------------------------------------------------------------------------- DynamoDB Slots table (shared)
+#
+# Partition key: doctor_id (S)   Sort key: slot_id (S, "<doctor>#<type>#<start UTC>")
+# LSI_DoctorDate: doctor_id + local_date, so one Query returns a doctor's slots for any date range.
+# The doctor Lambda, the materializer and the shared GET /doctors/{doctorId}/slots endpoint all read it
+# through query_slots(), so there is exactly one way to fetch slots.
+
+SLOTS_DATE_INDEX = 'LSI_DoctorDate'
+
+
+def slot_key(doctor_id, slot_id):
+    """Primary key of one item in the Slots table."""
+    return {'doctor_id': str(doctor_id), 'slot_id': str(slot_id)}
+
+
+def query_slots(table, doctor_id, first_day, last_day=None):
+    """Every slot of one doctor whose local date is in [first_day, last_day] (one day when last_day is None).
+
+    One Query on the doctor's partition (LSI on local_date), following pagination.
+    Sorted by local date, then start time.
+    """
+    first = first_day if isinstance(first_day, str) else first_day.isoformat()
+    last = first if last_day is None else (last_day if isinstance(last_day, str) else last_day.isoformat())
+    date_cond = Key('local_date').eq(first) if first == last else Key('local_date').between(first, last)
+    kwargs = {'IndexName': SLOTS_DATE_INDEX,
+              'KeyConditionExpression': Key('doctor_id').eq(str(doctor_id)) & date_cond}
+    items = []
+    while True:
+        page = table.query(**kwargs)
+        items.extend(page.get('Items', []))
+        if not page.get('LastEvaluatedKey'):
+            break
+        kwargs['ExclusiveStartKey'] = page['LastEvaluatedKey']
+    return sorted(items, key=lambda i: (str(i.get('local_date', '')), str(i.get('start_at', ''))))
+
+
+# --------------------------------------------------------------------------- optional bearer token (public routes)
+
+def bearer_token(event):
+    headers = {str(k).lower(): v for k, v in ((event or {}).get('headers') or {}).items()}
+    raw = str(headers.get('authorization') or '').strip()
+    return raw[7:].strip() if raw.lower().startswith('bearer ') else (raw or None)
+
+
+def verify_access_token(token, secret):
+    """Same checks as the API authorizer (signature, expiry, role, logout denylist). Returns the claims.
+
+    Used by public routes that answer differently for a signed-in caller. Raises ValueError when the token is bad.
+    """
+    import jwt                       # only the Lambdas that verify tokens ship PyJWT
+    try:
+        claims = jwt.decode(token, secret, algorithms=['HS256'],
+                            options={'require': ['exp', 'iat', 'sub', 'jti', 'role']})
+    except jwt.PyJWTError as exc:
+        raise ValueError(f'invalid token: {type(exc).__name__}')
+    if claims['role'] not in ('patient', 'doctor'):
+        raise ValueError('unknown role')
+    now = int(time.time())
+    item = auth_table().get_item(Key={'token_key': 'JTI#' + str(claims['jti']), 'token_type': 'DENYLIST'}).get('Item')
+    if item and int(item.get('expires_at', 0)) > now:
+        raise ValueError('token revoked (logged out)')
+    return claims
 
 
 # --------------------------------------------------------------------------- MySQL
