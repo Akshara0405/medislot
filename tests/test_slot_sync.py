@@ -24,6 +24,12 @@ class FakeTable:
         assert set(Key) == {'doctor_id', 'slot_id'} and Key['slot_id'].startswith(Key['doctor_id'] + '#')
     def update_item(self, Key, ExpressionAttributeValues, **kw):
         self._check_key(Key); self.items[Key['slot_id']]['status'] = ExpressionAttributeValues[':s']
+    # Milestone 5: resync writes one conditional item at a time (conditions always hold in these single-threaded tests).
+    def put_item(self, Item, **kw): self.items[Item['slot_id']] = dict(Item)
+    def delete_item(self, Key, **kw): self._check_key(Key); self.items.pop(Key['slot_id'], None)
+    def get_item(self, Key, **kw):
+        self._check_key(Key)
+        return {'Item': dict(self.items[Key['slot_id']])} if Key['slot_id'] in self.items else {}
     def query(self, IndexName, KeyConditionExpression, **kw):
         assert IndexName == 'LSI_DoctorDate'
         doctor, first, last = parse_key_condition(KeyConditionExpression)

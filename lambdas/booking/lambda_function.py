@@ -49,7 +49,7 @@ import boto3
 import pymysql
 from botocore.exceptions import ClientError
 
-from common import body, client, config, correlation, dbconn, emit, logged, release, response
+from common import body, client, config, correlation, dbconn, emit, logged, release, response, slot_key_for
 
 log = logging.getLogger()
 
@@ -377,7 +377,12 @@ def seat_problem(item, now, min_lead_minutes=0):
 
 
 def read_slot(table, slot_id):
-    return table.get_item(Key={'slot_id': slot_id}, ConsistentRead=True).get('Item')
+    """Strongly consistent read of one slot. The table is partitioned by doctor, so the key is (doctor_id, slot_id)."""
+    try:
+        key = slot_key_for(slot_id)
+    except ValueError:
+        return None                                   # not a real slot id: same answer as a missing slot
+    return table.get_item(Key=key, ConsistentRead=True).get('Item')
 
 
 def reserve_seat(table, slot_id, ref, now, lim, stats, sleep=None, rng=None):
@@ -412,7 +417,7 @@ def reserve_seat(table, slot_id, ref, now, lim, stats, sleep=None, rng=None):
             values[':seen'] = seen
         try:
             table.update_item(
-                Key={'slot_id': slot_id},
+                Key=slot_key_for(slot_id),
                 UpdateExpression='SET booked_count = if_not_exists(booked_count, :zero) + :one, version = :next, '
                                  '#s = :status, last_booked_at = :now ADD booking_refs :refset',
                 ConditionExpression=('version = :seen' if has_version else 'attribute_not_exists(version)') +
@@ -449,7 +454,7 @@ def release_seat(table, slot_id, ref, max_attempts=8, sleep=None):
             values[':seen'], guard = seen, 'version = :seen'
         try:
             table.update_item(
-                Key={'slot_id': slot_id},
+                Key=slot_key_for(slot_id),
                 UpdateExpression='SET booked_count = if_not_exists(booked_count, :one) - :one, version = :next, '
                                  '#s = :status DELETE booking_refs :refset',
                 ConditionExpression=guard + ' AND contains(booking_refs, :ref)',
@@ -477,7 +482,7 @@ def close_slot(table, slot_id, now, max_attempts=8, sleep=None):
             values[':seen'], guard = seen, 'version = :seen'
         try:
             table.update_item(
-                Key={'slot_id': slot_id},
+                Key=slot_key_for(slot_id),
                 UpdateExpression='SET #s = :closed, manual_block = :t, cancelled_by_doctor = :t, cancelled_at = :now, '
                                  'version = :next',
                 ConditionExpression=guard, ExpressionAttributeNames={'#s': 'status'}, ExpressionAttributeValues=values)

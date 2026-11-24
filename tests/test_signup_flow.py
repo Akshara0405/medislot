@@ -99,6 +99,8 @@ def test_schedule_tab_reads_the_shared_slots_endpoint_with_the_doctor_token(monk
             return Res(200, {'user_id': 7, 'timezone': 'Asia/Kolkata', 'first_name': 'Asha', 'last_name': 'Rao'})
         if path in ('/doctor/me/availability', '/doctor/me/blackouts'):
             return Res(200, {'items': []})
+        if path == '/doctor/me/appointments':
+            return Res(200, {'items': [], 'bySlot': {'7#30#x': ['Meera Iyer']}})
         if path == '/doctor/me/consultation-types':
             return Res(200, {'items': [{'consultation_type_id': 30, 'consultation_id': 2, 'name': 'STANDARD',
                                         'label': 'Standard consult', 'duration_min': 30, 'fee_amount': '450.00',
@@ -120,7 +122,7 @@ def test_schedule_tab_reads_the_shared_slots_endpoint_with_the_doctor_token(monk
         s.update(token='a1', role='doctor', user_id='7', token_exp=9999999999)
     page = client.get('/doctor/dashboard?tab=schedule&date=2026-12-01').get_data(as_text=True)
     assert seen == {'params': {'from': '2026-12-01', 'to': '2026-12-30'}, 'auth': 'Bearer a1'}
-    assert '9:00 AM' in page and 'Re-open' in page and '7#30#x' in page
+    assert '9:00 AM' in page and 'Re-open' in page and '7#30#x' in page and 'Meera Iyer' in page
 
 
 def test_doctor_id_falls_back_to_the_token_subject_for_older_sessions():

@@ -72,6 +72,14 @@ def slot_key(doctor_id, slot_id):
     return {'doctor_id': str(doctor_id), 'slot_id': str(slot_id)}
 
 
+def slot_key_for(slot_id):
+    """Primary key from a slot id alone: every slot id starts with its doctor ("<doctor>#<type>#<start>")."""
+    doctor_id = str(slot_id).split('#', 1)[0]
+    if not doctor_id.isdigit():
+        raise ValueError(f'slot id does not start with a doctor id: {slot_id!r}')
+    return slot_key(doctor_id, slot_id)
+
+
 def query_slots(table, doctor_id, first_day, last_day=None):
     """Every slot of one doctor whose local date is in [first_day, last_day] (one day when last_day is None).
 

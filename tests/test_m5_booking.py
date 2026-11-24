@@ -214,9 +214,16 @@ class FakeTable:
     def _copy(self, item):
         return {k: (set(v) if isinstance(v, set) else v) for k, v in item.items()}
 
+    def _k(self, Key):
+        """The Slots table is partitioned by doctor: every key must be exactly {doctor_id, slot_id}."""
+        if self.key == 'slot_id':
+            assert set(Key) == {'doctor_id', 'slot_id'}, f'Slots key must be (doctor_id, slot_id), got {Key}'
+            assert Key['slot_id'].startswith(Key['doctor_id'] + '#'), Key
+        return Key[self.key]
+
     def get_item(self, Key, ConsistentRead=False, **kw):
         with self.lock:
-            item = self.items.get(Key[self.key])
+            item = self.items.get(self._k(Key))
             out = {'Item': self._copy(item)} if item else {}
         if self.read_pause:
             time.sleep(random.uniform(0, self.read_pause))       # let other threads read the same version
@@ -238,18 +245,18 @@ class FakeTable:
         validate_placeholders(UpdateExpression, ConditionExpression, names=ExpressionAttributeNames,
                               values=ExpressionAttributeValues)
         with self.lock:
-            current = self.items.get(Key[self.key])
+            current = self.items.get(self._k(Key))
             self._check(current, ConditionExpression, ExpressionAttributeNames, ExpressionAttributeValues)
             item = self._copy(current) if current else dict(Key)
             apply_update(item, UpdateExpression, ExpressionAttributeNames, ExpressionAttributeValues)
-            self.items[Key[self.key]] = item
+            self.items[self._k(Key)] = item
             self.updates += 1
 
     def delete_item(self, Key, ConditionExpression=None, ExpressionAttributeNames=None, ExpressionAttributeValues=None):
         validate_placeholders(ConditionExpression, names=ExpressionAttributeNames, values=ExpressionAttributeValues)
         with self.lock:
-            self._check(self.items.get(Key[self.key]), ConditionExpression, ExpressionAttributeNames, ExpressionAttributeValues)
-            self.items.pop(Key[self.key], None)
+            self._check(self.items.get(self._k(Key)), ConditionExpression, ExpressionAttributeNames, ExpressionAttributeValues)
+            self.items.pop(self._k(Key), None)
 
 
 # =============================================================================================== in-memory RDS
@@ -466,7 +473,7 @@ def zulu(dt): return dt.astimezone(UTC).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 def make_slot(doctor, type_id, start, capacity=1, minutes=30, status='OPEN'):
     sid = f'{doctor}#{type_id}#{zulu(start)}'
-    return sid, {'slot_id': sid, 'doctor_date': f'{doctor}#{start.date().isoformat()}', 'doctor_id': str(doctor),
+    return sid, {'doctor_id': str(doctor), 'slot_id': sid,
                  'consultation_type_id': str(type_id), 'start_at': zulu(start),
                  'end_at': zulu(start + timedelta(minutes=minutes)), 'timezone': 'Asia/Kolkata',
                  'local_date': start.date().isoformat(), 'capacity': capacity, 'booked_count': 0, 'held_count': 0,
@@ -830,7 +837,7 @@ def test_one_per_doctor_per_day_uses_the_doctors_local_day(env):
     env.add_slot(DOCTOR, STD, late)
     assert env.book(env.add_slot(DOCTOR, STD, late))[0] == 201
     sid, item = make_slot(DOCTOR, STD, after_midnight)
-    item['local_date'], item['doctor_date'] = '2026-11-22', f'{DOCTOR}#2026-11-22'
+    item['local_date'] = '2026-11-22'
     env.slots.items[sid] = item
     assert env.book(sid)[0] == 201
 
@@ -1187,7 +1194,7 @@ def test_schedule_resync_never_overwrites_a_slot_booked_after_it_was_read():
 def test_manual_close_bumps_the_version_so_an_inflight_booking_retries(env):
     slot = env.add_slot(DOCTOR, STD, TOMORROW_9)
     seen = env.slots.items[slot]['version']
-    env.slots.update_item(Key={'slot_id': slot},
+    env.slots.update_item(Key={'doctor_id': str(DOCTOR), 'slot_id': slot},
                           UpdateExpression='SET manual_block = :t, version = if_not_exists(version, :zero) + :one',
                           ExpressionAttributeValues={':t': True, ':one': 1, ':zero': 0})
     assert env.slots.items[slot]['version'] == seen + 1

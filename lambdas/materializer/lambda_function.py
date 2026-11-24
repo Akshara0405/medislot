@@ -80,8 +80,17 @@ def handler(event, context):
             stored = []
             for item in stored_slots(table, doctor_id, day.isoformat()):
                 if not in_use(item) and str(item.get('consultation_type_id')) not in active_types[doctor_id]:
-                    table.delete_item(Key=slot_key(doctor_id, item['slot_id']))
-                    removed_stale += 1
+                    try:
+                        # Milestone 5: only delete if nobody booked it since we read it (booking refs / version).
+                        table.delete_item(Key=slot_key(doctor_id, item['slot_id']),
+                                          ConditionExpression='attribute_not_exists(booking_refs) AND '
+                                                              '(attribute_not_exists(booked_count) OR booked_count = :zero)',
+                                          ExpressionAttributeValues={':zero': 0})
+                        removed_stale += 1
+                    except ClientError as exc:
+                        if exc.response['Error']['Code'] != 'ConditionalCheckFailedException':
+                            raise
+                        stored.append(item)
                 else:
                     stored.append(item)
             # Never create a slot that overlaps an existing one (e.g. a booked slot whose pattern was removed).
