@@ -108,12 +108,12 @@
         <div class="appt-row">
           <span class="slot-note">👤 {{ a.name }} <small class="muted">{{ a.reference }}</small></span>
           {% if a.cancelled %}<span class="status-pill cancelled">{{ a.status_label }}</span>
-          {% else %}<form method="post" class="status-form" onsubmit="var v=this.status.value;if(v==='{{ a.choice }}')return false;return confirm(v==='CANCELLED'?'Cancel this appointment? The patient is refunded in full. This cannot be undone.':'Mark this appointment '+v.toLowerCase()+'?')">
+          {% else %}<form method="post" class="status-form" onsubmit="var v=this.status.value;if(v==='{{ a.choice }}')return false;return confirm(v==='CANCELLED'?'Cancel this appointment? The patient is refunded in full. This cannot be undone.':(v==='NO_SHOW'?'Mark this patient as a no-show? No refund is given.':'Mark this appointment '+v.toLowerCase()+'?'))">
             <input type="hidden" name="action" value="set_status"><input type="hidden" name="appointment_id" value="{{ a.id }}">
             {% for k, v in back.items() %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
             <select name="status" aria-label="Status of {{ a.name }}'s appointment">
               {% for value, label in status_choices.items() %}
-              {% set blocked = (value == 'COMPLETED' and s.future) or (value == 'CANCELLED' and not s.future) or (value == 'CANCELLED' and a.status != 'CONFIRMED') %}
+              {% set blocked = (value in ('COMPLETED', 'NO_SHOW') and s.future) or (value == 'CANCELLED' and not s.future) or (value == 'CANCELLED' and a.status != 'CONFIRMED') %}
               <option value="{{ value }}" {{ 'selected' if value == a.choice else '' }} {{ 'disabled' if blocked and value != a.choice else '' }}>{{ label }}</option>{% endfor %}
             </select><button class="slot-btn" type="submit">Update</button></form>{% endif %}
         </div>{% endfor %}

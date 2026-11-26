@@ -343,3 +343,4 @@ td,th{text-align:left;padding:10px;border-bottom:1px solid var(--line)}
 .status-form{flex-wrap:wrap;width:100%}
 .status-form select{flex:1 1 90px;min-width:0;max-width:100%}
 .status-form .slot-btn{flex:0 0 auto}
+.status-pill.no_show{background:#fff4e0;color:#8a5a00}

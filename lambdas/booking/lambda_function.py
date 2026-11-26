@@ -14,7 +14,7 @@ consultation_types, consultations). DynamoDB tables used: Slots, Idempotency.
 
   Doctor (JWT authorizer; /doctor/* only accepts doctor tokens)
     GET    /doctor/me/appointments?from=YYYY-MM-DD&days=1..30&includeCancelled=true|false
-    POST   /doctor/me/appointments/{appointmentId}/status   {"status": CONFIRMED|COMPLETED|CANCELLED}
+    POST   /doctor/me/appointments/{appointmentId}/status   {"status": CONFIRMED|COMPLETED|NO_SHOW|CANCELLED}
     POST   /doctor/me/slot-cancellations                    cancel a slot: every patient refunded in full
     POST   /doctor/me/day-cancellations                     {"date"}: cancel every booked slot that day (blackouts)
 
@@ -57,10 +57,10 @@ log = logging.getLogger()
 
 OPEN, CLOSED, FULL = 'OPEN', 'CLOSED', 'FULL'
 CONFIRMED, CANCELLED_BY_PATIENT, CANCELLED_BY_DOCTOR = 'CONFIRMED', 'CANCELLED_BY_PATIENT', 'CANCELLED_BY_DOCTOR'
-COMPLETED = 'COMPLETED'
+COMPLETED, NO_SHOW = 'COMPLETED', 'NO_SHOW'
 # What the doctor may send to POST /doctor/me/appointments/{id}/status -> the stored status.
-DOCTOR_STATUS_TARGETS = {'CONFIRMED': CONFIRMED, 'COMPLETED': COMPLETED, 'CANCELLED': CANCELLED_BY_DOCTOR,
-                         'CANCELLED_BY_DOCTOR': CANCELLED_BY_DOCTOR}
+DOCTOR_STATUS_TARGETS = {'CONFIRMED': CONFIRMED, 'COMPLETED': COMPLETED, 'NO_SHOW': NO_SHOW,
+                         'CANCELLED': CANCELLED_BY_DOCTOR, 'CANCELLED_BY_DOCTOR': CANCELLED_BY_DOCTOR}
 EVENT_SOURCE = 'medislot.booking'
 METRIC_NAMESPACE = 'MediSlot/Booking'
 IDEMPOTENCY_TTL_SECONDS = 24 * 3600
@@ -392,8 +392,9 @@ def doctor_status_problem(row, target, now):
     if current in (CANCELLED_BY_PATIENT, CANCELLED_BY_DOCTOR):
         return ApiError(409, 'APPOINTMENT_CANCELLED', 'This appointment is cancelled and the patient has been refunded, '
                                                       'so its status can no longer be changed.')
-    if target == COMPLETED and not started:
-        return ApiError(422, 'APPOINTMENT_NOT_STARTED', 'An appointment can be marked completed once it has started.')
+    if target in (COMPLETED, NO_SHOW) and not started:
+        word = 'completed' if target == COMPLETED else 'a no-show'
+        return ApiError(422, 'APPOINTMENT_NOT_STARTED', f'An appointment can be marked {word} once it has started.')
     if target == CANCELLED_BY_DOCTOR:
         if current != CONFIRMED:
             return ApiError(409, 'NOT_CANCELLABLE', 'Only a confirmed appointment can be cancelled.')
@@ -861,8 +862,8 @@ class Store:
     def set_status_by_doctor(self, doctor_id, appointment_id, target, now):
         """Doctor changes one appointment's status. Returns (row_before, refund dict or None, changed).
 
-        CONFIRMED -> COMPLETED            only once the appointment has started
-        COMPLETED -> CONFIRMED            undo a mistaken "completed"
+        CONFIRMED -> COMPLETED / NO_SHOW  only once the appointment has started (no-show: no refund, seat kept)
+        COMPLETED / NO_SHOW -> any of CONFIRMED, COMPLETED, NO_SHOW   to fix a mistaken choice
         CONFIRMED -> CANCELLED_BY_DOCTOR  only before it starts; the patient is refunded 100%
         Cancelled appointments are final (the refund is already in the ledger).
         """
@@ -880,9 +881,9 @@ class Store:
             if current == target:
                 self.conn.rollback()
                 return row, None, False
-            if target == COMPLETED:
-                cur.execute("UPDATE appointments SET status = 'COMPLETED', active_flag = NULL "
-                            "WHERE appointment_id = %s AND status = %s", (appointment_id, current))
+            if target in (COMPLETED, NO_SHOW):
+                cur.execute("UPDATE appointments SET status = %s, active_flag = NULL "
+                            "WHERE appointment_id = %s AND status = %s", (target, appointment_id, current))
             elif target == CONFIRMED:
                 cur.execute("UPDATE appointments SET status = 'CONFIRMED', active_flag = 1 "
                             "WHERE appointment_id = %s AND status = %s", (appointment_id, current))
@@ -1439,7 +1440,7 @@ def doctor_set_status(store, event, params, cid):
     data = json_body(event)
     wanted = str(data.get('status') or '').strip().upper()
     if wanted not in DOCTOR_STATUS_TARGETS:
-        raise ApiError(400, 'VALIDATION', 'status must be CONFIRMED, COMPLETED or CANCELLED')
+        raise ApiError(400, 'VALIDATION', 'status must be CONFIRMED, COMPLETED, NO_SHOW or CANCELLED')
     target = DOCTOR_STATUS_TARGETS[wanted]
     reason = text_field(data, 'reason', 300) or ('Cancelled by the doctor' if target == CANCELLED_BY_DOCTOR else None)
     now = clock()
@@ -1461,7 +1462,7 @@ def doctor_set_status(store, event, params, cid):
              toStatus=target, doctorId=str(doctor_id))
     payload = appointment_payload(store.doctor_appointment(doctor_id, appointment_id))
     payload['changed'] = changed
-    labels = {CONFIRMED: 'confirmed', COMPLETED: 'completed', CANCELLED_BY_DOCTOR: 'cancelled'}
+    labels = {CONFIRMED: 'confirmed', COMPLETED: 'completed', NO_SHOW: 'a no-show', CANCELLED_BY_DOCTOR: 'cancelled'}
     payload['message'] = (f"{payload['reference']} marked {labels[target]}." if changed else
                           f"{payload['reference']} is already {labels[target]}.")
     if refund:
@@ -1588,8 +1589,9 @@ def reconcile_slot(store, slot_id, release_orphans=False):
     if not item:
         return {'slotId': slot_id, 'found': False}
     refs = set(item.get('booking_refs') or set())
-    # A COMPLETED appointment keeps its seat (the slot is in the past), so it counts as live here too.
-    live = {seat_ref(r['patient_id']) for r in store.slot_rows(slot_id) if r['status'] in (CONFIRMED, COMPLETED)}
+    # COMPLETED and NO_SHOW appointments keep their seat (the slot is in the past), so they count as live here too.
+    live = {seat_ref(r['patient_id']) for r in store.slot_rows(slot_id)
+            if r['status'] in (CONFIRMED, COMPLETED, NO_SHOW)}
     orphans = sorted(refs - live)
     released = [ref for ref in orphans if release_orphans and release_seat(slots_table(), slot_id, ref)]
     return {'slotId': slot_id, 'found': True, 'bookedCount': int(item.get('booked_count', 0) or 0),

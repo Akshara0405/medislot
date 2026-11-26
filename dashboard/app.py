@@ -333,7 +333,8 @@ def money_total(amounts):
     return f'{total:.2f}'
 ID_PATTERN = re.compile(r'^[1-9][0-9]{0,18}$')     # every database id is an AUTO_INCREMENT integer
 # The status dropdown on each booked appointment in the doctor's Schedule tab.
-APPOINTMENT_STATUS_CHOICES = {'CONFIRMED': 'Confirmed', 'COMPLETED': 'Completed', 'CANCELLED': 'Cancelled'}
+APPOINTMENT_STATUS_CHOICES = {'CONFIRMED': 'Confirmed', 'COMPLETED': 'Completed', 'NO_SHOW': 'No-show',
+                              'CANCELLED': 'Cancelled'}
 APPOINTMENT_STATUS_LABELS = {'CONFIRMED': 'Confirmed', 'COMPLETED': 'Completed', 'NO_SHOW': 'No-show',
                              'CANCELLED_BY_PATIENT': 'Cancelled by patient', 'CANCELLED_BY_DOCTOR': 'Cancelled by you'}
 
@@ -689,7 +690,7 @@ def dashboard():
         slot['ended'] = bool(slot.get('end_at')) and str(slot.get('end_at')) <= now_z
         # A slot that has ended with a patient in it is "completed"; one nobody booked has simply ended.
         slot['completed'] = slot['ended'] and (int(slot.get('booked_count') or 0) > 0 or
-                                               any(a['status'] == 'COMPLETED' for a in slot['appointments']))
+                                               any(a['status'] in ('COMPLETED', 'NO_SHOW') for a in slot['appointments']))
     slots_by_day = {}
     for slot in decorated:
         slots_by_day.setdefault(slot.get('local_date') or day, []).append(slot)

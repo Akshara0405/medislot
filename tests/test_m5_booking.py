@@ -460,8 +460,8 @@ class MemoryStore:
                 if any(b['patient_id'] == a['patient_id'] and b['slot_id'] == a['slot_id'] for b in self._live()):
                     raise pymysql.err.IntegrityError(1062, "Duplicate entry for key 'uq_appt_patient_slot_active'")
                 a.update(status='CONFIRMED', active_flag=1, updated_at=bl.naive(now))
-            elif target == 'COMPLETED':
-                a.update(status='COMPLETED', active_flag=None, updated_at=bl.naive(now))
+            elif target in ('COMPLETED', 'NO_SHOW'):
+                a.update(status=target, active_flag=None, updated_at=bl.naive(now))
             else:
                 amount = bl.refund_amount(a['fee_amount'], 100)
                 a.update(status='CANCELLED_BY_DOCTOR', active_flag=None, updated_at=bl.naive(now))
@@ -1119,6 +1119,24 @@ def test_doctor_marks_an_appointment_completed_after_it_starts_and_can_undo(env)
     s, b, _ = env.call('POST', path, role='doctor', user=DOCTOR, body={'status': 'CANCELLED'})
     assert s == 422 and b['code'] == 'APPOINTMENT_STARTED'                        # too late to cancel
     assert 'AppointmentStatusChanged' in [t for t, *_ in env.events.sent]
+
+
+def test_doctor_marks_a_no_show_without_refund_and_can_correct_it(env):
+    slot = env.add_slot(DOCTOR, STD, START)
+    aid = env.book(slot)[1]['appointmentId']
+    path = f'/doctor/me/appointments/{aid}/status'
+    s, b, _ = env.call('POST', path, role='doctor', user=DOCTOR, body={'status': 'NO_SHOW'})
+    assert s == 422 and b['code'] == 'APPOINTMENT_NOT_STARTED'                  # not before it starts
+    env.now = START + timedelta(minutes=20)
+    s, b, _ = env.call('POST', path, role='doctor', user=DOCTOR, body={'status': 'NO_SHOW'})
+    assert s == 200 and b['status'] == 'NO_SHOW' and 'refund' not in b and env.db.ledger == []
+    assert env.slots.items[slot]['booked_count'] == 1                            # the seat stays taken
+    assert bl.reconcile_slot(MemoryStore(env.db), slot)['consistent']
+    s, b, _ = env.call('POST', path, role='doctor', user=DOCTOR, body={'status': 'COMPLETED'})
+    assert s == 200 and b['status'] == 'COMPLETED'                                # mistake corrected
+    assert env.call('POST', path, role='doctor', user=DOCTOR, body={'status': 'CANCELLED'})[0] == 409
+    s, b, _ = env.call('GET', '/patient/appointments', query={'view': 'past'})
+    assert [i['status'] for i in b['items']] == ['COMPLETED']
 
 
 def test_doctor_cancels_one_appointment_with_full_refund_and_it_is_final(env):
