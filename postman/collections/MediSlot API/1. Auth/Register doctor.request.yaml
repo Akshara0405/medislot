@@ -1,0 +1,28 @@
+$kind: http-request
+description: licenseNumber must match ST-123456. hospitalId must be an active hospital (run 'Get hospitals' first).
+url: "{{baseUrl}}/auth/register/doctor"
+method: POST
+headers:
+  Content-Type: application/json
+body:
+  type: json
+  content: |-
+    {
+      "email": "{{doctorEmail}}",
+      "password": "{{doctorPassword}}",
+      "firstName": "Priya",
+      "lastName": "Sharma",
+      "phone": "+919812345678",
+      "specialization": "Cardiology",
+      "licenseNumber": "TS-123456",
+      "hospitalId": "{{hospitalId}}",
+      "qualification": "MBBS, MD (Cardiology)",
+      "experienceYears": 8
+    }
+auth:
+  type: noauth
+scripts:
+  - type: afterResponse
+    code: pm.test('Status is 201/409', () => pm.expect(pm.response.code).to.be.oneOf([201, 409]));
+    language: text/javascript
+order: 3000

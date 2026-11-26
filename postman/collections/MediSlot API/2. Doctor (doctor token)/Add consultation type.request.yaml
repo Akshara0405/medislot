@@ -1,0 +1,26 @@
+$kind: http-request
+description: Identify the kind by name (code) or consultation_id. Saves consultationTypeId.
+url: "{{baseUrl}}/doctor/me/consultation-types"
+method: POST
+headers:
+  Content-Type: application/json
+body:
+  type: json
+  content: |-
+    {
+      "name": "STANDARD",
+      "fee_amount": "500.00",
+      "capacity": 1
+    }
+auth:
+  type: bearer
+  credentials:
+    token: "{{doctorAccessToken}}"
+scripts:
+  - type: afterResponse
+    code: |-
+      pm.test('Status is 200/201/409', () => pm.expect(pm.response.code).to.be.oneOf([200, 201, 409]));
+      const j = pm.response.json();
+      if (j.consultationTypeId) pm.collectionVariables.set('consultationTypeId', j.consultationTypeId);
+    language: text/javascript
+order: 5000

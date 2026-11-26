@@ -1,0 +1,28 @@
+$kind: http-request
+description: Public view without a token; send the doctor's own token for the owner view. Saves the first free slotId.
+url: "{{baseUrl}}/doctors/{{doctorId}}/slots?from=2026-11-25&to=2026-12-01&includeFull=false"
+method: GET
+queryParams:
+  - key: from
+    value: 2026-11-25
+    description: YYYY-MM-DD
+  - key: to
+    value: 2026-12-01
+    description: YYYY-MM-DD, max 30-day range
+  - key: consultationTypeId
+    value: "{{consultationTypeId}}"
+    disabled: true
+  - key: includeFull
+    value: "false"
+    description: true|false
+auth:
+  type: noauth
+scripts:
+  - type: afterResponse
+    code: |-
+      pm.test('Status is 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));
+      const j = pm.response.json();
+      for (const d of (j.days || [])) { const s = (d.slots || []).find(x => x.slotId && (x.freeSeats === undefined || x.freeSeats > 0));
+        if (s) { pm.collectionVariables.set('slotId', s.slotId); break; } }
+    language: text/javascript
+order: 4000

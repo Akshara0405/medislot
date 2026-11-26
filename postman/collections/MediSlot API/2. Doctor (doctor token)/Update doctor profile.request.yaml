@@ -1,0 +1,26 @@
+$kind: http-request
+description: "Editable (snake_case): first_name, last_name, phone, specialization, license_number, hospital_id, qualification, experience_years, timezone, languages."
+url: "{{baseUrl}}/doctor/me"
+method: PUT
+headers:
+  Content-Type: application/json
+body:
+  type: json
+  content: |-
+    {
+      "phone": "+919812345678",
+      "specialization": "Cardiology",
+      "qualification": "MBBS, MD (Cardiology)",
+      "experience_years": 9,
+      "timezone": "Asia/Kolkata",
+      "languages": "English, Hindi, Telugu"
+    }
+auth:
+  type: bearer
+  credentials:
+    token: "{{doctorAccessToken}}"
+scripts:
+  - type: afterResponse
+    code: pm.test('Status is 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));
+    language: text/javascript
+order: 2000

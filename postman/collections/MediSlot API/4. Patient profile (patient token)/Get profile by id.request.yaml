@@ -1,0 +1,13 @@
+$kind: http-request
+description: Only your own id works (403 otherwise).
+url: "{{baseUrl}}/patient/profiles/{{patientId}}"
+method: GET
+auth:
+  type: bearer
+  credentials:
+    token: "{{patientAccessToken}}"
+scripts:
+  - type: afterResponse
+    code: pm.test('Status is 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));
+    language: text/javascript
+order: 4000

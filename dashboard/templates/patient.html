@@ -145,13 +145,21 @@
   </article>
 {% else %}<div class="empty-state"><h3>No upcoming appointments.</h3><p><a class="primary" href="{{ url_for('patient_dashboard', tab='find') }}">Find a doctor ↗</a></p></div>{% endfor %}
 </section>
+{% set hf = booking.get('filter', 'all') %}{% set counts = booking.get('counts') or {} %}
+{% if counts.get('all') or hf != 'all' %}
+<section class="dash-card"><h2 class="mt-0">History</h2>
+<nav class="history-filter" aria-label="Filter appointment history">{% for key, label in booking.get('filters', []) %}
+  <a class="{{ 'on' if key == hf else '' }}" href="{{ url_for('patient_dashboard', tab='appointments', history=key) }}" {{ 'aria-current="page"' if key == hf else '' }}>{{ label }}<small>{{ counts.get(key, 0) }}</small></a>{% endfor %}
+</nav>
 {% if booking.history %}
-<section class="dash-card"><h2 class="mt-0">Past &amp; cancelled</h2>
 <table><thead><tr><th>When</th><th>Doctor</th><th>Status</th><th>Refund</th></tr></thead><tbody>
 {% for a in booking.history %}<tr><td>{{ a.when }}</td><td>{{ a.doctor.name }}<br><small class="muted">{{ a.consultation.label }} · {{ a.reference }}</small></td>
-  <td><span class="status-pill {{ a.status|lower }}">{{ {'CONFIRMED': 'Confirmed', 'COMPLETED': 'Completed', 'NO_SHOW': 'No-show', 'CANCELLED_BY_PATIENT': 'Cancelled by you', 'CANCELLED_BY_DOCTOR': 'Cancelled by doctor'}.get(a.status, a.status) }}</span></td>
+  <td><span class="status-pill {{ a.status|lower }}">{{ {'CONFIRMED': 'Confirmed', 'COMPLETED': 'Completed', 'NO_SHOW': 'No-show', 'CANCELLED_BY_PATIENT': 'Cancelled by you', 'CANCELLED_BY_DOCTOR': 'Cancelled by doctor'}.get(a.status, a.status) }}</span>
+    {% if a.status.startswith('CANCELLED') and a.updatedAt %}<br><small class="muted">on {{ a.updatedAt[:10] }}</small>{% endif %}</td>
   <td>{% if a.refund %}₹{{ a.refund.refundAmount }} <small class="muted">({{ a.refund.refundPercent }}%)</small>{% else %}—{% endif %}</td></tr>{% endfor %}
-</tbody></table></section>{% endif %}
+</tbody></table>
+{% else %}<p class="empty">{{ 'You have no cancelled appointments.' if hf == 'cancelled' else 'Nothing here yet.' }}</p>{% endif %}
+</section>{% endif %}
 
 {% elif active == 'refunds' %}
 {# ===================================================================== Refund ledger (Milestone 5) #}

@@ -1,0 +1,35 @@
+$kind: http-request
+url: "{{baseUrl}}/doctors?name=Priya&specialization=Cardiology&city=Hyderabad&limit=10"
+method: GET
+queryParams:
+  - key: name
+    value: Priya
+    description: Up to 3 words; 'Dr' prefix ignored
+  - key: specialization
+    value: Cardiology
+  - key: city
+    value: Hyderabad
+  - key: hospitalId
+    value: "{{hospitalId}}"
+    disabled: true
+  - key: hospital
+    value: Apollo
+    disabled: true
+  - key: limit
+    value: "10"
+    description: 1..50
+  - key: cursor
+    value: ""
+    disabled: true
+    description: nextCursor from the previous page
+auth:
+  type: noauth
+scripts:
+  - type: afterResponse
+    code: |-
+      pm.test('Status is 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));
+      const j = pm.response.json();
+      const it = j.items || j.doctors || [];
+      if (it.length && it[0].doctorId) pm.collectionVariables.set('doctorId', it[0].doctorId);
+    language: text/javascript
+order: 1000

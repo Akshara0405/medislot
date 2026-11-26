@@ -750,6 +750,15 @@ Resources:
   DoctorSlotCancellationsResource:
     Type: AWS::ApiGateway::Resource
     Properties: {RestApiId: !Ref RestApi, ParentId: !Ref DoctorMeResource, PathPart: 'slot-cancellations'}
+  DoctorDayCancellationsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref DoctorMeResource, PathPart: 'day-cancellations'}
+  DoctorAppointmentItemResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref DoctorAppointmentsResource, PathPart: '{appointmentId}'}
+  DoctorAppointmentStatusResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref DoctorAppointmentItemResource, PathPart: 'status'}
   BookingAppointmentsPostMethod:
     Type: AWS::ApiGateway::Method
     Properties:
@@ -822,6 +831,24 @@ Resources:
       AuthorizationType: CUSTOM
       AuthorizerId: !Ref ApiAuthorizer
       Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'}
+  BookingDayCancellationsPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorDayCancellationsResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'}
+  BookingAppointmentStatusPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DoctorAppointmentStatusResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'}
   BookingRetriesExhaustedAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -876,13 +903,14 @@ Resources:
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*/*'
   # A NEW logical id per change makes CloudFormation create a fresh deployment that includes the new routes
-  # (Milestone 5 booking engine + shared doctor/patient slots endpoint, /doctor/me/schedule removed).
-  ApiDeploymentSharedSlots:
+  # (Milestone 5 booking engine + shared doctor/patient slots endpoint, /doctor/me/schedule removed;
+  #  then doctor appointment status + day cancellations for blackouts).
+  ApiDeploymentDoctorStatus:
     Type: AWS::ApiGateway::Deployment
-    DependsOn: [BookingAppointmentsPostMethod, BookingAppointmentsGetMethod, BookingAppointmentItemGetMethod, BookingRefundQuoteGetMethod, BookingCancelPostMethod, BookingRefundsGetMethod, BookingDoctorAppointmentsGetMethod, BookingSlotCancellationsPostMethod, PatientMePostMethod, PatientMePutMethod, PatientMeDeleteMethod, PatientProfileItemGetMethod, DirectorySearchGetMethod, DirectoryFiltersGetMethod, DirectoryDoctorGetMethod, DirectoryDoctorSlotsGetMethod, DoctorSlotBlocksPostMethod, HospitalsGetMethod, RegisterPatientMethod, RegisterDoctorMethod, LoginMethod, RefreshMethod, LogoutMethod, PatientMeMethod, DoctorMeMethod, DoctorMePutMethod, DoctorPhotoPostMethod, DoctorAvailabilityGetMethod, DoctorAvailabilityPutMethod, DoctorTypesGetMethod, DoctorTypesPostMethod, DoctorTypeItemPutMethod, DoctorTypeItemDeleteMethod, DoctorBlackoutsGetMethod, DoctorBlackoutsPostMethod, DoctorBlackoutItemDeleteMethod]
+    DependsOn: [BookingAppointmentsPostMethod, BookingAppointmentsGetMethod, BookingAppointmentItemGetMethod, BookingRefundQuoteGetMethod, BookingCancelPostMethod, BookingRefundsGetMethod, BookingDoctorAppointmentsGetMethod, BookingSlotCancellationsPostMethod, BookingDayCancellationsPostMethod, BookingAppointmentStatusPostMethod, PatientMePostMethod, PatientMePutMethod, PatientMeDeleteMethod, PatientProfileItemGetMethod, DirectorySearchGetMethod, DirectoryFiltersGetMethod, DirectoryDoctorGetMethod, DirectoryDoctorSlotsGetMethod, DoctorSlotBlocksPostMethod, HospitalsGetMethod, RegisterPatientMethod, RegisterDoctorMethod, LoginMethod, RefreshMethod, LogoutMethod, PatientMeMethod, DoctorMeMethod, DoctorMePutMethod, DoctorPhotoPostMethod, DoctorAvailabilityGetMethod, DoctorAvailabilityPutMethod, DoctorTypesGetMethod, DoctorTypesPostMethod, DoctorTypeItemPutMethod, DoctorTypeItemDeleteMethod, DoctorBlackoutsGetMethod, DoctorBlackoutsPostMethod, DoctorBlackoutItemDeleteMethod]
     Properties:
       RestApiId: !Ref RestApi
-      Description: !Sub 'MediSlot ${Environment} API deployment - Milestone 5 booking engine + shared slots endpoint'
+      Description: !Sub 'MediSlot ${Environment} API deployment - doctor appointment status + blackout day cancellations'
   # One JSON line per API call (success or failure), with total latency, Lambda latency and authorizer latency.
   ApiAccessLogGroup:
     Type: AWS::Logs::LogGroup
@@ -893,7 +921,7 @@ Resources:
     Type: AWS::ApiGateway::Stage
     Properties:
       RestApiId: !Ref RestApi
-      DeploymentId: !Ref ApiDeploymentSharedSlots
+      DeploymentId: !Ref ApiDeploymentDoctorStatus
       StageName: !Ref Environment
       AccessLogSetting:
         DestinationArn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ApiAccessLogGroup}'

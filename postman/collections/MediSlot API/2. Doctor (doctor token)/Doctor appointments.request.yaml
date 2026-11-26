@@ -1,0 +1,22 @@
+$kind: http-request
+url: "{{baseUrl}}/doctor/me/appointments?from=2026-11-25&days=30&includeCancelled=false"
+method: GET
+queryParams:
+  - key: from
+    value: 2026-11-25
+    description: YYYY-MM-DD (default today)
+  - key: days
+    value: "30"
+    description: 1..30
+  - key: includeCancelled
+    value: "false"
+    description: true|false
+auth:
+  type: bearer
+  credentials:
+    token: "{{doctorAccessToken}}"
+scripts:
+  - type: afterResponse
+    code: pm.test('Status is 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));
+    language: text/javascript
+order: 16000

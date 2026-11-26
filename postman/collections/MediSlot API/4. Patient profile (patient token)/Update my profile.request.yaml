@@ -1,0 +1,31 @@
+$kind: http-request
+description: "Partial update. Fields: firstName, lastName, phone, dateOfBirth, gender, address, city, bloodGroup, emergencyContactName, emergencyContactPhone."
+url: "{{baseUrl}}/patient/me"
+method: PUT
+headers:
+  - key: Content-Type
+    value: application/json
+  - key: If-Match
+    value: '"v{{profileVersion}}"'
+    description: Optional optimistic lock; 412 if stale
+body:
+  type: json
+  content: |-
+    {
+      "city": "Hyderabad",
+      "bloodGroup": "B+",
+      "emergencyContactName": "Meena Kumar",
+      "emergencyContactPhone": "+919800011122"
+    }
+auth:
+  type: bearer
+  credentials:
+    token: "{{patientAccessToken}}"
+scripts:
+  - type: afterResponse
+    code: |-
+      pm.test('Status is 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));
+      const j = pm.response.json();
+      if (j.version !== undefined) pm.collectionVariables.set('profileVersion', j.version);
+    language: text/javascript
+order: 3000

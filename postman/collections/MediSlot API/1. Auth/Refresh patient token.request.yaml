@@ -1,0 +1,22 @@
+$kind: http-request
+description: Issues a new access token; the refresh token stays the same.
+url: "{{baseUrl}}/auth/refresh"
+method: POST
+headers:
+  Content-Type: application/json
+body:
+  type: json
+  content: |-
+    {
+      "refreshToken": "{{patientRefreshToken}}"
+    }
+auth:
+  type: noauth
+scripts:
+  - type: afterResponse
+    code: |-
+      pm.test('Status is 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));
+      const j = pm.response.json();
+      if (j.accessToken) pm.collectionVariables.set('patientAccessToken', j.accessToken);
+    language: text/javascript
+order: 6000

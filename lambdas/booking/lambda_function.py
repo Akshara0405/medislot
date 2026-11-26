@@ -13,8 +13,10 @@ consultation_types, consultations). DynamoDB tables used: Slots, Idempotency.
     GET    /patient/refunds                                 the caller's refund ledger
 
   Doctor (JWT authorizer; /doctor/* only accepts doctor tokens)
-    GET    /doctor/me/appointments?from=YYYY-MM-DD&days=1..30
+    GET    /doctor/me/appointments?from=YYYY-MM-DD&days=1..30&includeCancelled=true|false
+    POST   /doctor/me/appointments/{appointmentId}/status   {"status": CONFIRMED|COMPLETED|CANCELLED}
     POST   /doctor/me/slot-cancellations                    cancel a slot: every patient refunded in full
+    POST   /doctor/me/day-cancellations                     {"date"}: cancel every booked slot that day (blackouts)
 
   Direct invocation only (never reachable through API Gateway)
     {"action": "release-pending"}                 EventBridge schedule (5 min): free seats a cancellation missed
@@ -55,6 +57,10 @@ log = logging.getLogger()
 
 OPEN, CLOSED, FULL = 'OPEN', 'CLOSED', 'FULL'
 CONFIRMED, CANCELLED_BY_PATIENT, CANCELLED_BY_DOCTOR = 'CONFIRMED', 'CANCELLED_BY_PATIENT', 'CANCELLED_BY_DOCTOR'
+COMPLETED = 'COMPLETED'
+# What the doctor may send to POST /doctor/me/appointments/{id}/status -> the stored status.
+DOCTOR_STATUS_TARGETS = {'CONFIRMED': CONFIRMED, 'COMPLETED': COMPLETED, 'CANCELLED': CANCELLED_BY_DOCTOR,
+                         'CANCELLED_BY_DOCTOR': CANCELLED_BY_DOCTOR}
 EVENT_SOURCE = 'medislot.booking'
 METRIC_NAMESPACE = 'MediSlot/Booking'
 IDEMPOTENCY_TTL_SECONDS = 24 * 3600
@@ -373,6 +379,27 @@ def seat_problem(item, now, min_lead_minutes=0):
     taken = int(item.get('booked_count', 0) or 0) + int(item.get('held_count', 0) or 0)
     if taken >= capacity or item.get('status') == FULL:
         return ApiError(409, 'SLOT_FULL', 'This slot is fully booked.', capacity=capacity, booked=taken)
+    return None
+
+
+def doctor_status_problem(row, target, now):
+    """ApiError when the doctor may not move this appointment (a dict with status + slot_start_utc) to `target`."""
+    if not row:
+        return ApiError(404, 'APPOINTMENT_NOT_FOUND', 'Appointment not found.')
+    current, started = row['status'], utc(row['slot_start_utc']) <= now
+    if current == target:
+        return None
+    if current in (CANCELLED_BY_PATIENT, CANCELLED_BY_DOCTOR):
+        return ApiError(409, 'APPOINTMENT_CANCELLED', 'This appointment is cancelled and the patient has been refunded, '
+                                                      'so its status can no longer be changed.')
+    if target == COMPLETED and not started:
+        return ApiError(422, 'APPOINTMENT_NOT_STARTED', 'An appointment can be marked completed once it has started.')
+    if target == CANCELLED_BY_DOCTOR:
+        if current != CONFIRMED:
+            return ApiError(409, 'NOT_CANCELLABLE', 'Only a confirmed appointment can be cancelled.')
+        if started:
+            return ApiError(422, 'APPOINTMENT_STARTED', 'This appointment has already started and can no longer be '
+                                                        'cancelled. Mark it completed instead.')
     return None
 
 
@@ -813,6 +840,66 @@ class Store:
             metric('CancellationsByTier', len(rows), Tier=DOCTOR_CANCEL_TIER)
         return rows
 
+    def doctor_appointment(self, doctor_id, appointment_id):
+        with self.conn.cursor() as cur:
+            cur.execute(APPOINTMENT_SELECT + 'WHERE a.appointment_id = %s AND a.doctor_id = %s',
+                        (appointment_id, doctor_id))
+            row = cur.fetchone()
+        self.conn.rollback()
+        return row
+
+    def doctor_booked_slots(self, doctor_id, start_utc, end_utc):
+        """Distinct slots of this doctor in [start, end) that still hold at least one CONFIRMED appointment."""
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT slot_id, MIN(slot_start_utc) AS slot_start_utc FROM appointments "
+                        "WHERE doctor_id = %s AND status = 'CONFIRMED' AND slot_start_utc >= %s AND slot_start_utc < %s "
+                        "GROUP BY slot_id ORDER BY MIN(slot_start_utc)", (doctor_id, naive(start_utc), naive(end_utc)))
+            rows = cur.fetchall()
+        self.conn.rollback()
+        return rows
+
+    def set_status_by_doctor(self, doctor_id, appointment_id, target, now):
+        """Doctor changes one appointment's status. Returns (row_before, refund dict or None, changed).
+
+        CONFIRMED -> COMPLETED            only once the appointment has started
+        COMPLETED -> CONFIRMED            undo a mistaken "completed"
+        CONFIRMED -> CANCELLED_BY_DOCTOR  only before it starts; the patient is refunded 100%
+        Cancelled appointments are final (the refund is already in the ledger).
+        """
+        self.conn.rollback()
+        with self.conn.cursor() as cur:
+            cur.execute('SELECT appointment_id, patient_id, doctor_id, status, slot_id, slot_start_utc, fee_amount '
+                        'FROM appointments WHERE appointment_id = %s AND doctor_id = %s FOR UPDATE',
+                        (appointment_id, doctor_id))
+            row = cur.fetchone()
+            current, refund = (row or {}).get('status'), None
+            problem = doctor_status_problem(row, target, now)
+            if problem:
+                self.conn.rollback()
+                raise problem
+            if current == target:
+                self.conn.rollback()
+                return row, None, False
+            if target == COMPLETED:
+                cur.execute("UPDATE appointments SET status = 'COMPLETED', active_flag = NULL "
+                            "WHERE appointment_id = %s AND status = %s", (appointment_id, current))
+            elif target == CONFIRMED:
+                cur.execute("UPDATE appointments SET status = 'CONFIRMED', active_flag = 1 "
+                            "WHERE appointment_id = %s AND status = %s", (appointment_id, current))
+            else:
+                amount = refund_amount(row['fee_amount'], 100)
+                cur.execute("UPDATE appointments SET status = 'CANCELLED_BY_DOCTOR', active_flag = NULL "
+                            "WHERE appointment_id = %s AND status = 'CONFIRMED'", (appointment_id,))
+                cur.execute("INSERT INTO refund_ledger (appointment_id, patient_id, reason, tier, refund_percent, "
+                            "fee_amount, refund_amount) VALUES (%s, %s, 'DOCTOR_CANCEL', %s, 100, %s, %s)",
+                            (appointment_id, row['patient_id'], DOCTOR_CANCEL_TIER, str(row['fee_amount']), str(amount)))
+                refund = {'tier': DOCTOR_CANCEL_TIER, 'refundPercent': 100, 'refundAmount': money(amount)}
+        self.conn.commit()
+        if refund:
+            metric('CancellationsByTier', 1, Tier=DOCTOR_CANCEL_TIER)
+            metric('RefundAmount', float(refund['refundAmount']), 'None', Tier=DOCTOR_CANCEL_TIER)
+        return row, refund, True
+
     def unreleased_cancellations(self, now, limit=200):
         """Cancelled appointments of future slots, where the patient holds no newer live booking of that slot."""
         with self.conn.cursor() as cur:
@@ -936,7 +1023,9 @@ ROUTES = {
     ('POST', '/patient/appointments/{appointmentId}/cancel'): 'cancel_appointment',
     ('GET', '/patient/refunds'): 'list_refunds',
     ('GET', '/doctor/me/appointments'): 'doctor_appointments',
+    ('POST', '/doctor/me/appointments/{appointmentId}/status'): 'doctor_set_status',
     ('POST', '/doctor/me/slot-cancellations'): 'doctor_cancel_slot',
+    ('POST', '/doctor/me/day-cancellations'): 'doctor_cancel_day',
 }
 
 
@@ -958,8 +1047,12 @@ def resolve(event):
             return '/patient/appointments/{appointmentId}/' + parts[3], params
     elif parts == ['patient', 'refunds']:
         return '/patient/refunds', params
-    elif parts in (['doctor', 'me', 'appointments'], ['doctor', 'me', 'slot-cancellations']):
+    elif parts in (['doctor', 'me', 'appointments'], ['doctor', 'me', 'slot-cancellations'],
+                   ['doctor', 'me', 'day-cancellations']):
         return '/' + '/'.join(parts), params
+    elif len(parts) == 5 and parts[:3] == ['doctor', 'me', 'appointments'] and parts[4] == 'status':
+        params['appointmentId'] = parts[3]
+        return '/doctor/me/appointments/{appointmentId}/status', params
     return None, params
 
 
@@ -1324,6 +1417,97 @@ def doctor_appointments(store, event, params, cid):
     return 200, {'from': first.isoformat(), 'days': days, 'items': items, 'bySlot': by_slot}
 
 
+def cancel_slot_core(store, table, doctor_id, slot_id, reason, now, cause='SLOT_CANCELLED_BY_DOCTOR'):
+    """Close one slot and cancel + fully refund every live booking on it. Returns (rows, events to publish)."""
+    close_slot(table, slot_id, now)                   # 1. CLOSED + cancelled_by_doctor: no new seat from here on
+    rows = store.cancel_slot(doctor_id, slot_id, now)  # 2. every live booking -> cancelled + 100% refund
+    events = []
+    for row in rows:                                  # 3. seats back, then events
+        events.append(appointment_event('AppointmentCancelled', row, cancelledBy='DOCTOR', reason=reason,
+                                        refund={'tier': DOCTOR_CANCEL_TIER, 'refundPercent': 100,
+                                                'refundAmount': row['refundAmount'], 'currency': 'INR'}))
+        events += free_seat(row, bookable=False, cause=cause)
+    events.append(('SlotCancelled', {'slotId': slot_id, 'doctorId': doctor_id, 'appointmentsCancelled': len(rows),
+                                     'reason': reason, 'occurredAt': iso(now)}))
+    return rows, events
+
+
+def doctor_set_status(store, event, params, cid):
+    """POST /doctor/me/appointments/{appointmentId}/status  {"status": "CONFIRMED"|"COMPLETED"|"CANCELLED", "reason"}"""
+    doctor_id = caller(event, 'doctor')
+    appointment_id = positive_id(params.get('appointmentId'), 'appointmentId')
+    data = json_body(event)
+    wanted = str(data.get('status') or '').strip().upper()
+    if wanted not in DOCTOR_STATUS_TARGETS:
+        raise ApiError(400, 'VALIDATION', 'status must be CONFIRMED, COMPLETED or CANCELLED')
+    target = DOCTOR_STATUS_TARGETS[wanted]
+    reason = text_field(data, 'reason', 300) or ('Cancelled by the doctor' if target == CANCELLED_BY_DOCTOR else None)
+    now = clock()
+    try:
+        row, refund, changed = store.set_status_by_doctor(doctor_id, appointment_id, target, now)
+    except pymysql.err.IntegrityError:
+        rollback(store.conn)
+        raise ApiError(409, 'ALREADY_BOOKED', 'The patient already holds another live booking for this slot, so this '
+                                              'appointment cannot be confirmed again.')
+    if changed:
+        events = [appointment_event('AppointmentStatusChanged', row, fromStatus=row['status'], toStatus=target,
+                                    changedBy='DOCTOR')]
+        if target == CANCELLED_BY_DOCTOR:
+            events.append(appointment_event('AppointmentCancelled', row, cancelledBy='DOCTOR', reason=reason,
+                                            refund=dict(refund, currency='INR')))
+            events += free_seat(row, bookable=True, cause='APPOINTMENT_CANCELLED_BY_DOCTOR')
+        publish(events)
+        emit('info', 'appointment_status_changed', cid, appointmentId=appointment_id, fromStatus=row['status'],
+             toStatus=target, doctorId=str(doctor_id))
+    payload = appointment_payload(store.doctor_appointment(doctor_id, appointment_id))
+    payload['changed'] = changed
+    labels = {CONFIRMED: 'confirmed', COMPLETED: 'completed', CANCELLED_BY_DOCTOR: 'cancelled'}
+    payload['message'] = (f"{payload['reference']} marked {labels[target]}." if changed else
+                          f"{payload['reference']} is already {labels[target]}.")
+    if refund:
+        payload['message'] += f" The patient is refunded ₹{refund['refundAmount']} (100%)."
+    return 200, payload
+
+
+def doctor_cancel_day(store, event, params, cid):
+    """POST /doctor/me/day-cancellations  {"date": "YYYY-MM-DD", "reason": "..."}
+
+    Used right after a blackout date is added: every slot on that local date that still has a booking (and has not
+    started) is cancelled exactly like POST /doctor/me/slot-cancellations, so each patient gets a 100% refund.
+    Safe to repeat: a second call finds no live bookings and changes nothing.
+    """
+    doctor_id = caller(event, 'doctor')
+    data = json_body(event)
+    try:
+        day = date.fromisoformat(str(data.get('date') or ''))
+    except ValueError:
+        raise ApiError(400, 'VALIDATION', 'date must be YYYY-MM-DD')
+    reason = text_field(data, 'reason', 300) or f'The doctor is unavailable on {day.isoformat()}'
+    if len(reason) < 3:
+        reason = f'The doctor is unavailable on {day.isoformat()}'
+    table, now = slots_table(), clock()
+    start, end = local_day_bounds(day, store.doctor_timezone(doctor_id))
+    slots, rows, events, skipped = [], [], [], 0
+    for booked in store.doctor_booked_slots(doctor_id, start, end):
+        if utc(booked['slot_start_utc']) <= now:
+            skipped += 1                              # already started: leave it for the doctor to complete
+            continue
+        slot_rows, slot_events = cancel_slot_core(store, table, doctor_id, booked['slot_id'], reason, now,
+                                                  cause='BLACKOUT_DAY')
+        slots.append(booked['slot_id'])
+        rows += slot_rows
+        events += slot_events
+    published = publish(events)
+    total = sum((Decimal(r['refundAmount']) for r in rows), Decimal('0.00'))
+    emit('info', 'day_cancelled_by_doctor', cid, doctorId=str(doctor_id), date=day.isoformat(), slots=len(slots),
+         cancelled=len(rows), totalRefunded=money(total))
+    return 200, {'date': day.isoformat(), 'slotsCancelled': len(slots), 'slotIds': slots,
+                 'appointmentsCancelled': len(rows), 'totalRefunded': money(total), 'refundPercent': 100,
+                 'skippedStarted': skipped, 'eventsPublished': published,
+                 'message': (f'{len(rows)} booked appointment(s) on {day.isoformat()} cancelled and refunded in full.'
+                             if rows else f'No booked appointments on {day.isoformat()} needed cancelling.')}
+
+
 def doctor_cancel_slot(store, event, params, cid):
     doctor_id = caller(event, 'doctor')
     data = json_body(event)
@@ -1338,16 +1522,7 @@ def doctor_cancel_slot(store, event, params, cid):
         raise ApiError(404, 'SLOT_NOT_FOUND', 'Slot not found.')
     if parse_instant(slot['start_at']) <= now:
         raise ApiError(422, 'SLOT_IN_PAST', 'This slot has already started and cannot be cancelled.')
-    close_slot(table, slot_id, now)                   # 1. CLOSED + cancelled_by_doctor: no new seat from here on
-    rows = store.cancel_slot(doctor_id, slot_id, now)  # 2. every live booking -> cancelled + 100% refund
-    events = []
-    for row in rows:                                  # 3. seats back, then events
-        events.append(appointment_event('AppointmentCancelled', row, cancelledBy='DOCTOR', reason=reason,
-                                        refund={'tier': DOCTOR_CANCEL_TIER, 'refundPercent': 100,
-                                                'refundAmount': row['refundAmount'], 'currency': 'INR'}))
-        events += free_seat(row, bookable=False, cause='SLOT_CANCELLED_BY_DOCTOR')
-    events.append(('SlotCancelled', {'slotId': slot_id, 'doctorId': doctor_id, 'appointmentsCancelled': len(rows),
-                                     'reason': reason, 'occurredAt': iso(now)}))
+    rows, events = cancel_slot_core(store, table, doctor_id, slot_id, reason, now)
     published = publish(events)
     total = sum((Decimal(r['refundAmount']) for r in rows), Decimal('0.00'))
     refunds = [{'appointmentId': int(r['appointment_id']), 'patientId': int(r['patient_id']), 'refundPercent': 100,
@@ -1413,7 +1588,8 @@ def reconcile_slot(store, slot_id, release_orphans=False):
     if not item:
         return {'slotId': slot_id, 'found': False}
     refs = set(item.get('booking_refs') or set())
-    live = {seat_ref(r['patient_id']) for r in store.slot_rows(slot_id) if r['status'] == CONFIRMED}
+    # A COMPLETED appointment keeps its seat (the slot is in the past), so it counts as live here too.
+    live = {seat_ref(r['patient_id']) for r in store.slot_rows(slot_id) if r['status'] in (CONFIRMED, COMPLETED)}
     orphans = sorted(refs - live)
     released = [ref for ref in orphans if release_orphans and release_seat(slots_table(), slot_id, ref)]
     return {'slotId': slot_id, 'found': True, 'bookedCount': int(item.get('booked_count', 0) or 0),

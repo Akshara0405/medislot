@@ -1,0 +1,24 @@
+$kind: http-request
+url: "{{baseUrl}}/doctor/me/blackouts"
+method: POST
+headers:
+  Content-Type: application/json
+body:
+  type: json
+  content: |-
+    {
+      "blackout_date": "2026-12-25",
+      "reason": "Christmas holiday"
+    }
+auth:
+  type: bearer
+  credentials:
+    token: "{{doctorAccessToken}}"
+scripts:
+  - type: afterResponse
+    code: |-
+      pm.test('Status is 201/409', () => pm.expect(pm.response.code).to.be.oneOf([201, 409]));
+      const j = pm.response.json();
+      if (j.blackoutId) pm.collectionVariables.set('blackoutId', j.blackoutId);
+    language: text/javascript
+order: 12000

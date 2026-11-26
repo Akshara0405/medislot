@@ -1,0 +1,13 @@
+$kind: http-request
+description: Soft delete (is_active = 0). Re-adding the same kind reactivates it.
+url: "{{baseUrl}}/doctor/me/consultation-types/{{consultationTypeId}}"
+method: DELETE
+auth:
+  type: bearer
+  credentials:
+    token: "{{doctorAccessToken}}"
+scripts:
+  - type: afterResponse
+    code: pm.test('Status is 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));
+    language: text/javascript
+order: 8000

@@ -1,0 +1,22 @@
+$kind: http-request
+description: Kind cannot change; only fee and capacity.
+url: "{{baseUrl}}/doctor/me/consultation-types/{{consultationTypeId}}"
+method: PUT
+headers:
+  Content-Type: application/json
+body:
+  type: json
+  content: |-
+    {
+      "fee_amount": "600.00",
+      "capacity": 1
+    }
+auth:
+  type: bearer
+  credentials:
+    token: "{{doctorAccessToken}}"
+scripts:
+  - type: afterResponse
+    code: pm.test('Status is 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));
+    language: text/javascript
+order: 7000

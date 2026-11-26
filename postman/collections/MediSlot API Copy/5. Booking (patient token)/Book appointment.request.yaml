@@ -1,0 +1,34 @@
+$kind: http-request
+description: Run 'Get doctor slots' first to fill slotId.
+url: "{{baseUrl}}/patient/appointments"
+method: POST
+headers:
+  - key: Content-Type
+    value: application/json
+  - key: Idempotency-Key
+    value: "{{idempotencyKey}}"
+    description: 8-64 chars; reuse the same key when retrying
+body:
+  type: json
+  content: |-
+    {
+      "slotId": "{{slotId}}"
+    }
+auth:
+  type: bearer
+  credentials:
+    token: "{{patientAccessToken}}"
+scripts:
+  - type: beforeRequest
+    code: |-
+      // New key per send. To test replay, hard-code the header value instead.
+      pm.collectionVariables.set('idempotencyKey', pm.variables.replaceIn('{{$guid}}'));
+    language: text/javascript
+  - type: afterResponse
+    code: |-
+      pm.test('Status is 200/201', () => pm.expect(pm.response.code).to.be.oneOf([200, 201]));
+      const j = pm.response.json();
+      const a = j.appointment || j;
+      if (a.appointmentId) pm.collectionVariables.set('appointmentId', a.appointmentId);
+    language: text/javascript
+order: 1000

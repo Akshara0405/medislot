@@ -321,6 +321,10 @@ TABS = [('profile', 'Profile overview'), ('types', 'Consultation types'), ('avai
         ('schedule', 'Schedule'), ('blackouts', 'Blackouts')]
 TAB_KEYS = {key for key, _ in TABS}
 ID_PATTERN = re.compile(r'^[1-9][0-9]{0,18}$')     # every database id is an AUTO_INCREMENT integer
+# The status dropdown on each booked appointment in the doctor's Schedule tab.
+APPOINTMENT_STATUS_CHOICES = {'CONFIRMED': 'Confirmed', 'COMPLETED': 'Completed', 'CANCELLED': 'Cancelled'}
+APPOINTMENT_STATUS_LABELS = {'CONFIRMED': 'Confirmed', 'COMPLETED': 'Completed', 'NO_SHOW': 'No-show',
+                             'CANCELLED_BY_PATIENT': 'Cancelled by patient', 'CANCELLED_BY_DOCTOR': 'Cancelled by you'}
 
 
 def api_items(response):
@@ -485,17 +489,39 @@ def handle_dashboard_post():
                 else:
                     outcome(result, '', 'Could not cancel the slot.')
 
+        elif action == 'set_status':
+            # Doctor changes one appointment: Confirmed / Completed / Cancelled (cancelled = 100% refund).
+            tab = 'schedule'
+            appointment_id, status = request.form.get('appointment_id', ''), request.form.get('status', '')
+            if not ID_PATTERN.match(appointment_id) or status not in APPOINTMENT_STATUS_CHOICES:
+                flash('Choose a valid appointment status.', 'error')
+            else:
+                result = api_request('POST', f'/doctor/me/appointments/{appointment_id}/status',
+                                     payload={'status': status})
+                if result.ok:
+                    flash(api_message(result, 'Appointment status updated.'), 'success')
+                else:
+                    outcome(result, '', 'Could not change the appointment status.')
+
         elif action == 'add_blackout':
             tab = 'blackouts'
             day = request.form.get('blackout_date', '')
+            reason = request.form.get('reason', '').strip()
             try:
                 date.fromisoformat(day)
             except ValueError:
                 flash('Choose a valid date.', 'error')
             else:
-                outcome(api_request('POST', '/doctor/me/blackouts',
-                                    payload={'blackout_date': day, 'reason': request.form.get('reason', '').strip()}),
-                        'Blackout date added.', 'Could not add the blackout date.')
+                added = api_request('POST', '/doctor/me/blackouts', payload={'blackout_date': day, 'reason': reason})
+                # 409 = the date was already a blackout: still run the cancellation, so adding it again is the retry.
+                if added.ok or added.status_code == 409:
+                    if added.ok:
+                        outcome(added, 'Blackout date added.', 'Could not add the blackout date.')
+                    else:
+                        flash(api_message(added, f'{day} is already a blackout date.'), 'warning')
+                    cancel_bookings_on(day, reason)
+                else:
+                    outcome(added, 'Blackout date added.', 'Could not add the blackout date.')
 
         elif action == 'delete_blackout':
             tab = 'blackouts'
@@ -505,7 +531,35 @@ def handle_dashboard_post():
                         'Blackout date removed.', 'Could not remove the blackout date.')
     except requests.RequestException:
         flash('MediSlot could not reach the API. Please try again.', 'error')
-    return redirect(url_for('dashboard', tab=tab))
+    # Come back to the same schedule view (one chosen date, or the 30-day window) after a change.
+    back = {}
+    for key in ('date', 'start'):
+        value = request.form.get('return_' + key, '')
+        try:
+            back[key] = date.fromisoformat(value).isoformat()
+        except ValueError:
+            pass
+    return redirect(url_for('dashboard', tab=tab, **back))
+
+
+def cancel_bookings_on(day, reason=''):
+    """After a blackout: cancel (100% refund) every booked appointment on that date. Flashes the outcome."""
+    text = re.sub(r'[<>]', '', reason or '').strip()
+    payload = {'date': day, 'reason': ('Doctor unavailable: ' + text)[:300] if text else
+               f'The doctor is unavailable on {day}'}
+    result = api_request('POST', '/doctor/me/day-cancellations', payload=payload)
+    if result.ok:
+        data = result.json()
+        if data.get('appointmentsCancelled'):
+            flash(f"{data['appointmentsCancelled']} booked appointment(s) on {day} were cancelled automatically and "
+                  f"refunded in full (₹{data.get('totalRefunded')}).", 'success')
+        if data.get('skippedStarted'):
+            flash(f"{data['skippedStarted']} slot(s) on {day} had already started and were left as they are.", 'warning')
+    elif result.status_code == 401:
+        outcome(result, '', '')
+    else:
+        flash(api_message(result, 'The blackout is saved, but booked appointments on that date could not be '
+                                  'cancelled.') + ' Add the same date again to retry.', 'warning')
 
 
 def decorate_slots(slots_payload, type_labels):
@@ -538,12 +592,15 @@ def dashboard():
     active = request.args.get('tab', 'profile')
     if active not in TAB_KEYS:
         active = 'profile'
-    day = request.args.get('date') or date.today().isoformat()
+    # Schedule tab: ?date=YYYY-MM-DD shows ONLY that date (the date picker); ?start=YYYY-MM-DD (or nothing) shows
+    # the 30-day window starting there. Past dates work too: their slots are shown as completed / ended.
+    single = bool(request.args.get('date'))
     try:
-        day_obj = date.fromisoformat(day)
+        day_obj = date.fromisoformat(request.args.get('date') or request.args.get('start') or '')
     except ValueError:
-        day_obj = date.today()
-        day = day_obj.isoformat()
+        day_obj, single = date.today(), False
+    day = day_obj.isoformat()
+    span = 1 if single else 30
     try:
         # The five reads do not depend on each other, so they run at the same time (one API round trip, not five).
         if session.get('refresh_token') and time.time() > session.get('token_exp', 0) - 60:
@@ -553,9 +610,10 @@ def dashboard():
         doctor_id = session_user_id() or '0'
         calls = {'profile': ('/doctor/me', None), 'availability': ('/doctor/me/availability', None),
                  'schedule': (f'/doctors/{doctor_id}/slots',
-                              {'from': day, 'to': (day_obj + timedelta(days=29)).isoformat()}),
+                              {'from': day, 'to': (day_obj + timedelta(days=span - 1)).isoformat()}),
                  'types': ('/doctor/me/consultation-types', None), 'blackouts': ('/doctor/me/blackouts', None),
-                 'appointments': ('/doctor/me/appointments', {'from': day, 'days': 30})}
+                 'appointments': ('/doctor/me/appointments',
+                                  {'from': day, 'days': span, 'includeCancelled': 'true'})}
         with ThreadPoolExecutor(max_workers=len(calls)) as pool:
             futures = {k: pool.submit(api_request, 'GET', path, params=params, token=token)
                        for k, (path, params) in calls.items()}
@@ -569,14 +627,21 @@ def dashboard():
         catalog = got['types'].json().get('catalog', []) if got['types'].ok else []
         types = [t for t in all_types if t.get('is_active')]
         blackouts = api_items(got['blackouts'])
-        try:
-            booked_names = got['appointments'].json().get('bySlot', {}) if got['appointments'].ok else {}
-        except ValueError:
-            booked_names = {}
+        appointments = api_items(got['appointments'])
     except requests.RequestException:
         flash('Unable to load your dashboard from the API.', 'error')
         profile = availability = schedule = None
-        all_types, types, blackouts, catalog, booked_names = [], [], [], [], {}
+        all_types, types, blackouts, catalog, appointments = [], [], [], [], []
+    appts_by_slot = {}
+    for a in appointments:            # every appointment of the slot (confirmed, completed and cancelled)
+        if not str(a.get('appointmentId', '')).isdigit():
+            continue
+        status = a.get('status')
+        appts_by_slot.setdefault(a.get('slotId'), []).append({
+            'id': a['appointmentId'], 'reference': a.get('reference'), 'name': a.get('patientName') or 'Patient',
+            'status': status, 'status_label': APPOINTMENT_STATUS_LABELS.get(status, status),
+            'choice': 'CANCELLED' if str(status).startswith('CANCELLED') else status,
+            'cancelled': str(status).startswith('CANCELLED')})
 
     active_ids = {t['consultation_type_id'] for t in types}
     patterns = [{'consultation_type_id': p.get('consultation_type_id'), 'day_of_week': p.get('day_of_week'),
@@ -590,15 +655,20 @@ def dashboard():
     decorated = decorate_slots(schedule.json() if schedule_ok else None, type_labels)
     now_z = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
     for slot in decorated:                       # who booked it (Milestone 5) and whether it can still be cancelled
-        slot['patients'] = booked_names.get(slot.get('slot_id'), [])
+        slot['appointments'] = appts_by_slot.get(slot.get('slot_id'), [])
+        slot['patients'] = [a['name'] for a in slot['appointments'] if not a['cancelled']]
         slot['future'] = str(slot.get('start_at', '')) > now_z
+        slot['ended'] = bool(slot.get('end_at')) and str(slot.get('end_at')) <= now_z
+        # A slot that has ended with a patient in it is "completed"; one nobody booked has simply ended.
+        slot['completed'] = slot['ended'] and (int(slot.get('booked_count') or 0) > 0 or
+                                               any(a['status'] == 'COMPLETED' for a in slot['appointments']))
     slots_by_day = {}
     for slot in decorated:
         slots_by_day.setdefault(slot.get('local_date') or day, []).append(slot)
     blackout_map = {str(b.get('blackout_date')): b.get('reason') for b in blackouts}
     # Only days that actually have slots (or are blackout days) are shown.
     schedule_days = []
-    for offset in range(30):
+    for offset in range(span):
         d = day_obj + timedelta(days=offset)
         iso = d.isoformat()
         schedule_days.append({
@@ -608,15 +678,23 @@ def dashboard():
         })
     slot_total = sum(len(g['slots']) for g in schedule_days)
     open_total = sum(1 for g in schedule_days for s in g['slots']
-                     if s.get('status') != 'CLOSED' and int(s.get('booked_count') or 0) < int(s.get('capacity') or 1))
-    busy_days = [g for g in schedule_days if g['slots'] or g['blocked']]
+                     if s.get('status') != 'CLOSED' and not s['ended']
+                     and int(s.get('booked_count') or 0) < int(s.get('capacity') or 1))
+    completed_total = sum(1 for g in schedule_days for s in g['slots'] if s['completed'])
+    # One chosen date is always shown (even when empty); the 30-day window only lists days with slots.
+    busy_days = schedule_days if single else [g for g in schedule_days if g['slots'] or g['blocked']]
+    step = timedelta(days=span)
+    nav_key = 'date' if single else 'start'
     return render_template(
         'doctor.html',
-        tabs=TABS, active=active, day=day, busy_days=busy_days, slot_total=slot_total, open_total=open_total, types=types, blackouts=blackouts, patterns=patterns,
-        profile=profile_data,
+        tabs=TABS, active=active, day=day, busy_days=busy_days, slot_total=slot_total, open_total=open_total,
+        completed_total=completed_total, types=types, blackouts=blackouts, patterns=patterns,
+        profile=profile_data, single_day=single, is_past_day=day_obj < date.today(),
+        day_label=day_obj.strftime('%A %d %B %Y'), nav_key=nav_key,
+        status_choices=APPOINTMENT_STATUS_CHOICES,
         schedule=decorated, schedule_days=schedule_days,
         schedule_error=(schedule is not None and not schedule_ok),
-        prev_day=(day_obj - timedelta(days=30)).isoformat(), next_day=(day_obj + timedelta(days=30)).isoformat(),
+        prev_day=(day_obj - step).isoformat(), next_day=(day_obj + step).isoformat(),
         catalog=catalog,
         hospitals=get_hospitals(),
         specializations=specialization_options(profile_data.get('specialization', '')),
@@ -854,7 +932,10 @@ def patient_dashboard():
         if state['first_visit'] and profile.get('city'):
             state['city'] = profile['city']
         if tab in ('appointments', 'refunds'):
-            booking = load_booking_tab(tab)
+            history_filter = request.args.get('history', 'all')
+            if history_filter not in {k for k, _ in HISTORY_FILTERS}:
+                history_filter = 'all'
+            booking = load_booking_tab(tab, history_filter)
         else:
             params = {'name': state['name'], 'specialization': state['specialization'],
                       'hospitalId': state['hospital_id'], 'city': state['city'], 'cursor': state['cursor'], 'limit': 8}
@@ -899,17 +980,41 @@ def decorate_appointment(a):
     return a
 
 
-def load_booking_tab(tab):
-    """Data for the My appointments / Refunds tabs. Every read goes through API Gateway."""
-    out = {'upcoming': [], 'history': [], 'refunds': None, 'error': None}
+HISTORY_FILTERS = [('all', 'All history'), ('past', 'Past'), ('cancelled', 'Cancelled')]
+
+
+def load_booking_tab(tab, history_filter='all'):
+    """Data for the My appointments / Refunds tabs. Every read goes through API Gateway.
+
+    history_filter: 'all' (past + cancelled), 'past' (seen / completed) or 'cancelled' (by the patient or doctor).
+    """
+    out = {'upcoming': [], 'history': [], 'refunds': None, 'error': None, 'filter': history_filter,
+           'filters': HISTORY_FILTERS, 'counts': {}}
     if tab == 'appointments':
-        upcoming = api_request('GET', '/patient/appointments', params={'view': 'upcoming', 'limit': 50})
-        history = api_request('GET', '/patient/appointments', params={'view': 'all', 'limit': 50})
+        views = {'upcoming': 'upcoming', 'all': 'all', 'past': 'past', 'cancelled': 'cancelled'}
+        wanted = ['upcoming', 'past', 'cancelled']          # one call each, so every filter chip has its count
+        with ThreadPoolExecutor(max_workers=len(wanted)) as pool:
+            token = session.get('token')
+            futures = {v: pool.submit(api_request, 'GET', '/patient/appointments',
+                                      params={'view': views[v], 'limit': 50}, token=token) for v in wanted}
+            got = {v: f.result() for v, f in futures.items()}
+        upcoming = got['upcoming']
         if upcoming.ok:
             out['upcoming'] = [decorate_appointment(a) for a in upcoming.json().get('items', [])]
             live_ids = {a['appointmentId'] for a in out['upcoming']}
-            out['history'] = [decorate_appointment(a) for a in (history.json().get('items', []) if history.ok else [])
-                              if a['appointmentId'] not in live_ids]
+            lists = {v: [decorate_appointment(a) for a in api_items(got[v]) if a['appointmentId'] not in live_ids]
+                     for v in ('past', 'cancelled')}
+            for v in ('past', 'cancelled'):
+                if not got[v].ok:
+                    out['error'] = api_message(got[v], 'Part of your appointment history could not be loaded.')
+            if history_filter == 'all':
+                merged = lists['past'] + lists['cancelled']
+                merged.sort(key=lambda a: str(a.get('startsAt') or ''), reverse=True)     # newest first
+                out['history'] = merged
+            else:
+                out['history'] = lists[history_filter]
+            out['counts'] = {'past': len(lists['past']), 'cancelled': len(lists['cancelled']),
+                             'all': len(lists['past']) + len(lists['cancelled'])}
         else:
             out['error'] = api_message(upcoming, 'Your appointments could not be loaded.')
     else:

@@ -1,0 +1,21 @@
+$kind: http-request
+description: "Returns a pre-signed S3 PUT URL (5 min). contentType: image/jpeg | image/png | image/webp. Then PUT the image bytes to uploadUrl with the same Content-Type."
+url: "{{baseUrl}}/doctor/me/photo"
+method: POST
+headers:
+  Content-Type: application/json
+body:
+  type: json
+  content: |-
+    {
+      "contentType": "image/jpeg"
+    }
+auth:
+  type: bearer
+  credentials:
+    token: "{{doctorAccessToken}}"
+scripts:
+  - type: afterResponse
+    code: pm.test('Status is 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));
+    language: text/javascript
+order: 3000

@@ -1,0 +1,30 @@
+$kind: http-request
+description: Only when no profile exists yet (registration normally creates it, so expect 409).
+url: "{{baseUrl}}/patient/me"
+method: POST
+headers:
+  Content-Type: application/json
+body:
+  type: json
+  content: |-
+    {
+      "firstName": "Arjun",
+      "lastName": "Kumar",
+      "phone": "+919876543210",
+      "dateOfBirth": "1995-06-15",
+      "gender": "Male",
+      "address": "Banjara Hills, Hyderabad",
+      "city": "Hyderabad",
+      "bloodGroup": "B+",
+      "emergencyContactName": "Meena Kumar",
+      "emergencyContactPhone": "+919800011122"
+    }
+auth:
+  type: bearer
+  credentials:
+    token: "{{patientAccessToken}}"
+scripts:
+  - type: afterResponse
+    code: pm.test('Status is 201/409', () => pm.expect(pm.response.code).to.be.oneOf([201, 409]));
+    language: text/javascript
+order: 2000

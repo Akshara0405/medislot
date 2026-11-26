@@ -1,0 +1,21 @@
+$kind: http-request
+url: "{{baseUrl}}/auth/refresh"
+method: POST
+headers:
+  Content-Type: application/json
+body:
+  type: json
+  content: |-
+    {
+      "refreshToken": "{{doctorRefreshToken}}"
+    }
+auth:
+  type: noauth
+scripts:
+  - type: afterResponse
+    code: |-
+      pm.test('Status is 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));
+      const j = pm.response.json();
+      if (j.accessToken) pm.collectionVariables.set('doctorAccessToken', j.accessToken);
+    language: text/javascript
+order: 7000

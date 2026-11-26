@@ -1,0 +1,24 @@
+$kind: collection
+description: |-
+  MediSlot doctor appointment booking API (API Gateway stage: dev).
+
+  Run order: Auth (hospitals -> register -> login) -> Doctor setup (consultation type -> availability) -> Directory (search -> slots) -> Booking. Login, slot and booking requests save their ids/tokens into collection variables automatically.
+variables:
+  baseUrl: https://3e8vm2fqga.execute-api.ap-south-1.amazonaws.com/dev
+  patientEmail: arjun.patient.20261026@example.com
+  patientPassword: PatientSecure123
+  doctorEmail: priya.doctor.20261026@example.com
+  doctorPassword: DoctorSecure123
+  patientAccessToken: ""
+  patientRefreshToken: ""
+  patientId: ""
+  doctorAccessToken: ""
+  doctorRefreshToken: ""
+  doctorId: ""
+  hospitalId: "1"
+  consultationTypeId: ""
+  blackoutId: ""
+  slotId: ""
+  appointmentId: ""
+  profileVersion: ""
+  idempotencyKey: ""

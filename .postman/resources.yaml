@@ -2,6 +2,13 @@
 workspace:
   id: 2cbe39e2-7a42-42b1-8882-29b726e35ad9
 
+# Each entry here maps a local resource to one or more corresponding objects in Postman Cloud
+
+cloudResources:
+  collections:
+    ../postman/collections/MediSlot API: 4fac7480-dfea-49e5-a0a1-92afdc667213
+    ../postman/collections/MediSlot API Copy: 2a2e4a61-9f17-4546-803d-189eb13207af
+
 # All resources in the `postman/` folder are automatically registered in Local View.
 # Point to additional files outside the `postman/` folder to register them individually. Example:
 #localResources:

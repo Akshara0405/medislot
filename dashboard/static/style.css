@@ -322,3 +322,17 @@ td,th{text-align:left;padding:10px;border-bottom:1px solid var(--line)}
   .nav-right{position:absolute;right:clamp(18px,3vw,40px);top:14px}
   .topbar .shell{position:relative}
 }
+/* ---- Schedule: completed/ended slots, per-appointment status dropdown, patient history filter */
+.lg.done:before{background:#7a8a99}
+.slotpill.done{background:#eef1f6;border-color:#d6dce6;color:#3e4a5c}
+.appt-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:8px}
+.appt-row .slot-note{margin-top:0}
+.status-form{display:flex;align-items:center;gap:6px;margin:0}
+.status-form select{width:auto;padding:4px 8px;font-size:12px;border-radius:12px;margin:0}
+.status-pill.cancelled{background:#fff0ed;color:#a43c2d}
+.status-pill.completed{background:#e7ecf7;color:#33446b}
+.status-pill.confirmed{background:var(--mint);color:#1d6b5f}
+.history-filter{display:flex;flex-wrap:wrap;gap:8px;margin:4px 0 14px}
+.history-filter a{padding:6px 14px;border-radius:20px;border:1px solid #d6e2de;font-size:13px;font-weight:700;color:var(--muted);text-decoration:none;background:#fff}
+.history-filter a.on{background:var(--ink);border-color:var(--ink);color:#fff}
+.history-filter a small{opacity:.75;margin-left:4px}

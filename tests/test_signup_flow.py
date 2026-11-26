@@ -100,7 +100,9 @@ def test_schedule_tab_reads_the_shared_slots_endpoint_with_the_doctor_token(monk
         if path in ('/doctor/me/availability', '/doctor/me/blackouts'):
             return Res(200, {'items': []})
         if path == '/doctor/me/appointments':
-            return Res(200, {'items': [], 'bySlot': {'7#30#x': ['Meera Iyer']}})
+            seen.setdefault('appointments', []).append(params)
+            return Res(200, {'items': [{'appointmentId': 5, 'reference': 'MS-000005', 'status': 'CONFIRMED',
+                                        'patientName': 'Meera Iyer', 'slotId': '7#30#x'}], 'bySlot': {}})
         if path == '/doctor/me/consultation-types':
             return Res(200, {'items': [{'consultation_type_id': 30, 'consultation_id': 2, 'name': 'STANDARD',
                                         'label': 'Standard consult', 'duration_min': 30, 'fee_amount': '450.00',
@@ -120,9 +122,18 @@ def test_schedule_tab_reads_the_shared_slots_endpoint_with_the_doctor_token(monk
     client = dashboard.app.test_client()
     with client.session_transaction() as s:
         s.update(token='a1', role='doctor', user_id='7', token_exp=9999999999)
-    page = client.get('/doctor/dashboard?tab=schedule&date=2026-12-01').get_data(as_text=True)
-    assert seen == {'params': {'from': '2026-12-01', 'to': '2026-12-30'}, 'auth': 'Bearer a1'}
+    # ?start= shows the 30-day window from that date
+    page = client.get('/doctor/dashboard?tab=schedule&start=2026-12-01').get_data(as_text=True)
+    assert {k: seen[k] for k in ('params', 'auth')} == {'params': {'from': '2026-12-01', 'to': '2026-12-30'},
+                                                         'auth': 'Bearer a1'}
+    assert seen['appointments'][-1] == {'from': '2026-12-01', 'days': 30, 'includeCancelled': 'true'}
     assert '9:00 AM' in page and 'Re-open' in page and '7#30#x' in page and 'Meera Iyer' in page
+    assert 'name="status"' in page and 'value="5"' in page                    # status dropdown for the booking
+    # ?date= (the date picker) shows ONLY that date
+    page = client.get('/doctor/dashboard?tab=schedule&date=2026-12-01').get_data(as_text=True)
+    assert seen['params'] == {'from': '2026-12-01', 'to': '2026-12-01'}
+    assert seen['appointments'][-1]['days'] == 1
+    assert 'Only this date is shown' in page and 'Tuesday 01 December 2026' in page
 
 
 def test_doctor_id_falls_back_to_the_token_subject_for_older_sessions():

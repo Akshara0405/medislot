@@ -431,6 +431,44 @@ class MemoryStore:
             bl.metric('CancellationsByTier', len(out), Tier=bl.DOCTOR_CANCEL_TIER)
         return out
 
+    def doctor_appointment(self, doctor_id, appointment_id):
+        with self.db.lock:
+            a = next((a for a in self.db.appointments if a['appointment_id'] == appointment_id
+                      and a['doctor_id'] == doctor_id), None)
+            return self._joined(a) if a else None
+
+    def doctor_booked_slots(self, doctor_id, start, end):
+        with self.db.lock:
+            seen = {}
+            for a in self._live():
+                if a['doctor_id'] == doctor_id and bl.naive(start) <= a['slot_start_utc'] < bl.naive(end):
+                    seen.setdefault(a['slot_id'], a['slot_start_utc'])
+            return [{'slot_id': k, 'slot_start_utc': v} for k, v in sorted(seen.items(), key=lambda kv: kv[1])]
+
+    def set_status_by_doctor(self, doctor_id, appointment_id, target, now):
+        with self.db.lock:
+            a = next((a for a in self.db.appointments if a['appointment_id'] == appointment_id
+                      and a['doctor_id'] == doctor_id), None)
+            problem = bl.doctor_status_problem(a, target, now)
+            if problem:
+                raise problem
+            before = dict(a)
+            if a['status'] == target:
+                return before, None, False
+            refund = None
+            if target == 'CONFIRMED':
+                if any(b['patient_id'] == a['patient_id'] and b['slot_id'] == a['slot_id'] for b in self._live()):
+                    raise pymysql.err.IntegrityError(1062, "Duplicate entry for key 'uq_appt_patient_slot_active'")
+                a.update(status='CONFIRMED', active_flag=1, updated_at=bl.naive(now))
+            elif target == 'COMPLETED':
+                a.update(status='COMPLETED', active_flag=None, updated_at=bl.naive(now))
+            else:
+                amount = bl.refund_amount(a['fee_amount'], 100)
+                a.update(status='CANCELLED_BY_DOCTOR', active_flag=None, updated_at=bl.naive(now))
+                self._refund(a, 'DOCTOR_CANCEL', bl.DOCTOR_CANCEL_TIER, 100, amount, now)
+                refund = {'tier': bl.DOCTOR_CANCEL_TIER, 'refundPercent': 100, 'refundAmount': bl.money(amount)}
+            return before, refund, True
+
     def unreleased_cancellations(self, now, limit=200):
         with self.db.lock:
             return [dict(a) for a in self.db.appointments if a['status'].startswith('CANCELLED')
@@ -1058,6 +1096,77 @@ def test_doctor_cannot_cancel_someone_elses_or_a_started_slot(env):
                     body={'slotId': mine, 'reason': 'late'})[1]['code'] == 'SLOT_IN_PAST'
     assert env.call('POST', '/doctor/me/slot-cancellations', role='doctor', user=DOCTOR,
                     body={'slotId': mine})[0] == 400                              # a reason is required
+
+
+def test_doctor_marks_an_appointment_completed_after_it_starts_and_can_undo(env):
+    slot = env.add_slot(DOCTOR, STD, START)
+    s, booked, _ = env.book(slot)
+    assert s == 201
+    aid = booked['appointmentId']
+    path = f'/doctor/me/appointments/{aid}/status'
+    s, b, _ = env.call('POST', path, role='doctor', user=DOCTOR, body={'status': 'COMPLETED'})
+    assert s == 422 and b['code'] == 'APPOINTMENT_NOT_STARTED'                  # not before it starts
+    env.now = START + timedelta(minutes=40)
+    s, b, _ = env.call('POST', path, role='doctor', user=DOCTOR, body={'status': 'COMPLETED'})
+    assert s == 200 and b['status'] == 'COMPLETED' and b['changed'] is True
+    assert env.db.appointments[0]['active_flag'] is None
+    assert env.slots.items[slot]['booked_count'] == 1                            # a completed visit keeps its seat
+    assert bl.reconcile_slot(MemoryStore(env.db), slot)['consistent']
+    s, b, _ = env.call('POST', path, role='doctor', user=DOCTOR, body={'status': 'CONFIRMED'})
+    assert s == 200 and b['status'] == 'CONFIRMED' and env.db.appointments[0]['active_flag'] == 1
+    s, b, _ = env.call('POST', path, role='doctor', user=DOCTOR, body={'status': 'CONFIRMED'})
+    assert s == 200 and b['changed'] is False                                     # repeat-safe
+    s, b, _ = env.call('POST', path, role='doctor', user=DOCTOR, body={'status': 'CANCELLED'})
+    assert s == 422 and b['code'] == 'APPOINTMENT_STARTED'                        # too late to cancel
+    assert 'AppointmentStatusChanged' in [t for t, *_ in env.events.sent]
+
+
+def test_doctor_cancels_one_appointment_with_full_refund_and_it_is_final(env):
+    slot = env.add_slot(DOCTOR, CAMP, START, capacity=3, minutes=60)
+    env.add_patient(22, 'Ravi', 'K')
+    a1 = env.book(slot)[1]['appointmentId']
+    assert env.book(slot, user=22)[0] == 201
+    path = f'/doctor/me/appointments/{a1}/status'
+    s, b, _ = env.call('POST', path, role='doctor', user=DOCTOR, body={'status': 'CANCELLED'})
+    assert s == 200 and b['status'] == 'CANCELLED_BY_DOCTOR' and b['refund']['refundPercent'] == 100
+    assert b['refund']['refundAmount'] == '300.00' and len(env.db.ledger) == 1
+    item = env.slots.items[slot]
+    assert item['booked_count'] == 1 and item['status'] == 'OPEN'                 # the seat is free again
+    assert len(env.live()) == 1                                                   # the other patient keeps theirs
+    for target in ('CONFIRMED', 'COMPLETED'):
+        s, b, _ = env.call('POST', path, role='doctor', user=DOCTOR, body={'status': target})
+        assert s == 409 and b['code'] == 'APPOINTMENT_CANCELLED'
+    s, b, _ = env.call('GET', '/patient/appointments', query={'view': 'cancelled'})
+    assert [i['status'] for i in b['items']] == ['CANCELLED_BY_DOCTOR']
+
+
+def test_appointment_status_is_only_for_the_owning_doctor_and_known_values(env):
+    slot = env.add_slot(DOCTOR, STD, START)
+    aid = env.book(slot)[1]['appointmentId']
+    path = f'/doctor/me/appointments/{aid}/status'
+    assert env.call('POST', path, role='doctor', user=DOCTOR2, body={'status': 'COMPLETED'})[0] == 404
+    assert env.call('POST', path, role='patient', user=21, body={'status': 'COMPLETED'})[0] == 403
+    assert env.call('POST', path, role='doctor', user=DOCTOR, body={'status': 'NONSENSE'})[0] == 400
+
+
+def test_blackout_day_cancellation_refunds_every_booking_that_day_and_is_repeat_safe(env):
+    day = START.astimezone(bl.zone('Asia/Kolkata')).date()
+    s1 = env.add_slot(DOCTOR, STD, START)
+    s2 = env.add_slot(DOCTOR, CAMP, START + timedelta(hours=2), capacity=3, minutes=60)
+    other_day = env.add_slot(DOCTOR, STD, START + timedelta(days=1))
+    env.add_patient(22, 'Ravi', 'K'); env.add_patient(23, 'Anu', 'M')
+    assert env.book(s1)[0] == 201
+    assert env.book(s2, user=22)[0] == 201
+    assert env.book(other_day, user=23)[0] == 201
+    body = {'date': day.isoformat(), 'reason': 'Conference'}
+    s, b, _ = env.call('POST', '/doctor/me/day-cancellations', role='doctor', user=DOCTOR, body=body)
+    assert s == 200 and b['slotsCancelled'] == 2 and b['appointmentsCancelled'] == 2
+    assert b['totalRefunded'] == '799.99'
+    assert {a['slot_id'] for a in env.live()} == {other_day}                      # the next day is untouched
+    assert env.slots.items[s1]['status'] == 'CLOSED' and env.slots.items[s2]['booked_count'] == 0
+    s, b, _ = env.call('POST', '/doctor/me/day-cancellations', role='doctor', user=DOCTOR, body=body)
+    assert s == 200 and b['appointmentsCancelled'] == 0 and len(env.db.ledger) == 2
+    assert env.call('POST', '/doctor/me/day-cancellations', role='doctor', user=DOCTOR, body={'date': 'x'})[0] == 400
 
 
 def test_booking_racing_a_doctor_cancellation_is_rolled_back(env, monkeypatch):
