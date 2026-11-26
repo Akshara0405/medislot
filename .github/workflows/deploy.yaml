@@ -19,6 +19,7 @@ on:
       - "schema/**"
       - "dashboard/**"
       - "pytest.ini"
+      - ".gitleaks.toml"
   workflow_dispatch:
 
 permissions:
