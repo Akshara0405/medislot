@@ -333,8 +333,10 @@ def money_total(amounts):
     return f'{total:.2f}'
 ID_PATTERN = re.compile(r'^[1-9][0-9]{0,18}$')     # every database id is an AUTO_INCREMENT integer
 # The status dropdown on each booked appointment in the doctor's Schedule tab.
+# Cancelling is done with "Cancel & refund all" on the slot, so it is not in this dropdown.
+# CANCEL_ALL cancels the whole slot: every patient booked on it is refunded in full and the slot closes.
 APPOINTMENT_STATUS_CHOICES = {'CONFIRMED': 'Confirmed', 'COMPLETED': 'Completed', 'NO_SHOW': 'No-show',
-                              'CANCELLED': 'Cancelled'}
+                              'CANCEL_ALL': 'Cancel & refund all'}
 APPOINTMENT_STATUS_LABELS = {'CONFIRMED': 'Confirmed', 'COMPLETED': 'Completed', 'NO_SHOW': 'No-show',
                              'CANCELLED_BY_PATIENT': 'Cancelled by patient', 'CANCELLED_BY_DOCTOR': 'Cancelled by you'}
 
@@ -502,11 +504,25 @@ def handle_dashboard_post():
                     outcome(result, '', 'Could not cancel the slot.')
 
         elif action == 'set_status':
-            # Doctor changes one appointment: Confirmed / Completed / Cancelled (cancelled = 100% refund).
+            # Doctor changes one appointment: Confirmed / Completed / No-show, or "Cancel & refund all" for the slot.
             tab = 'schedule'
             appointment_id, status = request.form.get('appointment_id', ''), request.form.get('status', '')
+            slot_id = request.form.get('slot_id', '')
+            reason = re.sub(r'[<>]', '', request.form.get('reason', '')).strip()
+            if len(reason) < 3:
+                reason = 'Cancelled by the doctor'
             if not ID_PATTERN.match(appointment_id) or status not in APPOINTMENT_STATUS_CHOICES:
                 flash('Choose a valid appointment status.', 'error')
+            elif status == 'CANCEL_ALL':
+                if not slot_id or len(slot_id) > 190 or '#' not in slot_id:
+                    flash('Invalid slot.', 'error')
+                else:
+                    result = api_request('POST', '/doctor/me/slot-cancellations',
+                                         payload={'slotId': slot_id, 'reason': reason[:300]})
+                    if result.ok:
+                        flash(api_message(result, 'Slot cancelled and every patient refunded in full.'), 'success')
+                    else:
+                        outcome(result, '', 'Could not cancel the slot.')
             else:
                 result = api_request('POST', f'/doctor/me/appointments/{appointment_id}/status',
                                      payload={'status': status})
