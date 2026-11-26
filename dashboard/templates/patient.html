@@ -161,6 +161,27 @@
 {% else %}<p class="empty">{{ 'You have no cancelled appointments.' if hf == 'cancelled' else 'Nothing here yet.' }}</p>{% endif %}
 </section>{% endif %}
 
+{% elif active == 'cancelled' %}
+{# ===================================================================== Cancelled appointments #}
+<section class="dash-card">
+<div class="sched-head">
+  <div><h2 class="m-0">Cancelled appointments</h2>
+    <p class="hint" style="margin:6px 0 0">Appointments cancelled by you or by the doctor, with what was refunded.</p></div>
+  <div class="sched-stats"><span><b>{{ booking.history|length }}</b> cancelled</span><span><b>₹{{ booking.get('refunded', '0.00') }}</b> refunded</span></div>
+</div>
+{% if booking.error %}<div class="alert error">{{ booking.error }}</div>{% endif %}
+{% if booking.history %}
+<table><thead><tr><th>Appointment</th><th>Doctor</th><th>Cancelled by</th><th>Refund</th></tr></thead><tbody>
+{% for a in booking.history %}<tr>
+  <td>{{ a.when }}<br><small class="muted">{{ a.consultation.label }} · {{ a.reference }}</small></td>
+  <td>{{ a.doctor.name }}<br><small class="muted">{{ a.doctor.hospital.name }}</small></td>
+  <td><span class="status-pill cancelled">{{ 'You' if a.status == 'CANCELLED_BY_PATIENT' else 'Doctor' }}</span>{% if a.updatedAt %}<br><small class="muted">on {{ a.updatedAt[:10] }}</small>{% endif %}</td>
+  <td>{% if a.refund %}<b>₹{{ a.refund.refundAmount }}</b> <small class="muted">({{ a.refund.refundPercent }}%)</small>{% else %}—{% endif %}</td>
+</tr>{% endfor %}
+</tbody></table>
+{% else %}<div class="empty-state"><h3>No cancelled appointments.</h3></div>{% endif %}
+</section>
+
 {% elif active == 'refunds' %}
 {# ===================================================================== Refund ledger (Milestone 5) #}
 <section class="dash-card"><h2 class="mt-0">Refunds</h2>

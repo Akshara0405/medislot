@@ -13,17 +13,21 @@
 {% set role = session.get('role') if session.get('token') else None %}
 {% set on_dashboard = request.path.rstrip('/') == '/patient/dashboard' %}
 {% set current_tab = request.args.get('tab', 'find') if on_dashboard else None %}
+{% set on_doctor = request.path.rstrip('/') == '/doctor/dashboard' %}
+{% set doctor_tab = request.args.get('tab', 'profile') if on_doctor else None %}
 <header class="topbar">
   <div class="shell nav">
     <div class="nav-left">
       <a class="brand" href="/"><span class="brand-mark">✚</span><span>medislot<span style="color:var(--teal)">.</span></span></a>
       <nav class="nav-main" aria-label="Main">
         {% if role == 'patient' %}
-          {% for key, label in [('find', 'Find a doctor'), ('appointments', 'My appointments'), ('refunds', 'Refunds'), ('profile', 'My profile')] %}
+          {% for key, label in [('find', 'Find a doctor'), ('appointments', 'My appointments'), ('cancelled', 'Cancelled'), ('refunds', 'Refunds'), ('profile', 'My profile')] %}
             <a class="nav-link{{ ' active' if current_tab == key else '' }}" href="/patient/dashboard{{ '' if key == 'find' else '?tab=' ~ key }}"{% if current_tab == key %} aria-current="page"{% endif %}>{{ label }}</a>
           {% endfor %}
         {% elif role == 'doctor' %}
-          <a class="nav-link{{ ' active' if request.path.startswith('/doctor/dashboard') else '' }}" href="/doctor/dashboard">My workspace</a>
+          {% for key, label in [('profile', 'Profile'), ('types', 'Consultation types'), ('availability', 'Availability'), ('schedule', 'Schedule'), ('blackouts', 'Blackouts'), ('cancelled', 'Cancelled')] %}
+            <a class="nav-link{{ ' active' if doctor_tab == key else '' }}" href="/doctor/dashboard?tab={{ key }}"{% if doctor_tab == key %} aria-current="page"{% endif %}>{{ label }}</a>
+          {% endfor %}
         {% else %}
           <a class="nav-link" href="/#how">How it works</a>
           <a class="nav-link" href="/patient/login">Patient sign in</a>

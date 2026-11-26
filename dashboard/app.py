@@ -319,7 +319,18 @@ def logout():
 
 TABS = [('profile', 'Profile overview'), ('types', 'Consultation types'), ('availability', 'Availability'),
         ('schedule', 'Schedule'), ('blackouts', 'Blackouts')]
-TAB_KEYS = {key for key, _ in TABS}
+TAB_KEYS = {key for key, _ in TABS} | {'cancelled'}
+
+
+def money_total(amounts):
+    """Sum of '450.00'-style amounts (None and bad values are skipped), formatted with two decimals."""
+    total = Decimal('0')
+    for value in amounts:
+        try:
+            total += Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError):
+            pass
+    return f'{total:.2f}'
 ID_PATTERN = re.compile(r'^[1-9][0-9]{0,18}$')     # every database id is an AUTO_INCREMENT integer
 # The status dropdown on each booked appointment in the doctor's Schedule tab.
 APPOINTMENT_STATUS_CHOICES = {'CONFIRMED': 'Confirmed', 'COMPLETED': 'Completed', 'CANCELLED': 'Cancelled'}
@@ -614,6 +625,12 @@ def dashboard():
                  'types': ('/doctor/me/consultation-types', None), 'blackouts': ('/doctor/me/blackouts', None),
                  'appointments': ('/doctor/me/appointments',
                                   {'from': day, 'days': span, 'includeCancelled': 'true'})}
+        if active == 'cancelled':     # Cancelled tab: the last 30 days and the next 30 days (the API's max window)
+            today = date.today()
+            calls['cancelled_past'] = ('/doctor/me/appointments', {'from': (today - timedelta(days=30)).isoformat(),
+                                                                   'days': 30, 'includeCancelled': 'true'})
+            calls['cancelled_next'] = ('/doctor/me/appointments', {'from': today.isoformat(), 'days': 30,
+                                                                   'includeCancelled': 'true'})
         with ThreadPoolExecutor(max_workers=len(calls)) as pool:
             futures = {k: pool.submit(api_request, 'GET', path, params=params, token=token)
                        for k, (path, params) in calls.items()}
@@ -628,10 +645,21 @@ def dashboard():
         types = [t for t in all_types if t.get('is_active')]
         blackouts = api_items(got['blackouts'])
         appointments = api_items(got['appointments'])
+        cancelled, cancelled_error = [], None
+        for key in ('cancelled_past', 'cancelled_next'):
+            if key in got:
+                if not got[key].ok:
+                    cancelled_error = api_message(got[key], 'Some cancelled appointments could not be loaded.')
+                cancelled += [a for a in api_items(got[key]) if str(a.get('status', '')).startswith('CANCELLED')]
     except requests.RequestException:
         flash('Unable to load your dashboard from the API.', 'error')
         profile = availability = schedule = None
         all_types, types, blackouts, catalog, appointments = [], [], [], [], []
+        cancelled, cancelled_error = [], 'MediSlot could not reach the API.'
+    # Newest cancellation first; one row per appointment.
+    cancelled = list({a['appointmentId']: decorate_appointment(a) for a in cancelled}.values())
+    cancelled.sort(key=lambda a: str(a.get('updatedAt') or ''), reverse=True)
+    cancelled_refunded = money_total(a.get('refund', {}).get('refundAmount') for a in cancelled)
     appts_by_slot = {}
     for a in appointments:            # every appointment of the slot (confirmed, completed and cancelled)
         if not str(a.get('appointmentId', '')).isdigit():
@@ -691,7 +719,8 @@ def dashboard():
         completed_total=completed_total, types=types, blackouts=blackouts, patterns=patterns,
         profile=profile_data, single_day=single, is_past_day=day_obj < date.today(),
         day_label=day_obj.strftime('%A %d %B %Y'), nav_key=nav_key,
-        status_choices=APPOINTMENT_STATUS_CHOICES,
+        status_choices=APPOINTMENT_STATUS_CHOICES, cancelled=cancelled, cancelled_error=cancelled_error,
+        cancelled_refunded=cancelled_refunded,
         schedule=decorated, schedule_days=schedule_days,
         schedule_error=(schedule is not None and not schedule_ok),
         prev_day=(day_obj - step).isoformat(), next_day=(day_obj + step).isoformat(),
@@ -710,8 +739,8 @@ def dashboard():
 # =====================================================================================================
 GENDER_OPTIONS = ['Female', 'Male', 'Non-binary', 'Other', 'Prefer not to say']
 BLOOD_GROUP_OPTIONS = ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-']
-PATIENT_TABS = [('find', 'Find a doctor'), ('appointments', 'My appointments'), ('refunds', 'Refunds'),
-                ('profile', 'My profile')]
+PATIENT_TABS = [('find', 'Find a doctor'), ('appointments', 'My appointments'), ('cancelled', 'Cancelled'),
+                ('refunds', 'Refunds'), ('profile', 'My profile')]
 IDEM_PATTERN = re.compile(r'^[A-Za-z0-9_\-:.]{8,64}$')
 TIER_LABELS = {'FULL': 'full refund', 'PARTIAL': 'partial refund', 'LATE': 'no refund', 'DOCTOR_CANCELLED': 'doctor cancelled'}
 PHONE_PATTERN = re.compile(r'^\+?[0-9][0-9 \-]{5,22}$')
@@ -931,7 +960,10 @@ def patient_dashboard():
             flash(api_message(me, 'Your profile could not be loaded.'), 'warning')
         if state['first_visit'] and profile.get('city'):
             state['city'] = profile['city']
-        if tab in ('appointments', 'refunds'):
+        if tab == 'cancelled':              # top-bar "Cancelled": every cancelled appointment with its refund
+            booking = load_booking_tab('appointments', 'cancelled')
+            booking['refunded'] = money_total((a.get('refund') or {}).get('refundAmount') for a in booking['history'])
+        elif tab in ('appointments', 'refunds'):
             history_filter = request.args.get('history', 'all')
             if history_filter not in {k for k, _ in HISTORY_FILTERS}:
                 history_filter = 'all'

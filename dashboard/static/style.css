@@ -336,3 +336,10 @@ td,th{text-align:left;padding:10px;border-bottom:1px solid var(--line)}
 .history-filter a{padding:6px 14px;border-radius:20px;border:1px solid #d6e2de;font-size:13px;font-weight:700;color:var(--muted);text-decoration:none;background:#fff}
 .history-filter a.on{background:var(--ink);border-color:var(--ink);color:#fff}
 .history-filter a small{opacity:.75;margin-left:4px}
+/* Status dropdown + Update button always stay inside the slot box */
+.slotpill{min-width:0}
+.appt-row{width:100%}
+.appt-row .slot-note{overflow-wrap:anywhere}
+.status-form{flex-wrap:wrap;width:100%}
+.status-form select{flex:1 1 90px;min-width:0;max-width:100%}
+.status-form .slot-btn{flex:0 0 auto}

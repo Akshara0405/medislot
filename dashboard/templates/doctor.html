@@ -4,19 +4,6 @@
 {% block content %}
 {% set initials = ((profile.get('first_name') or 'D')[:1] ~ (profile.get('last_name') or '')[:1])|upper %}
 <main class="shell dashboard">
-<div class="dash-head">
-  <div class="dash-title">
-    <div class="avatar sm">{% if profile.get('photo_url') %}<img src="{{ profile.get('photo_url') }}" alt="Your profile photo" onerror="this.remove()">{% endif %}<span>{{ initials }}</span></div>
-    <div><span class="eyebrow">Your professional space</span><h1>Good day, Dr. {{ (profile.get('first_name') or 'Doctor')|title }}.</h1>
-      <p class="muted">Manage your profile, consultation types, availability, schedule and blackout dates.</p></div>
-  </div>
-  <a class="ghost" href="/doctor/logout">Sign out ↗</a>
-</div>
-
-<nav class="tabs" role="tablist" aria-label="Dashboard sections">{% for key, label in tabs %}
-  <a class="tab{{ ' active' if key == active else '' }}" role="tab" data-tab="{{ key }}" href="{{ url_for('dashboard', tab=key) }}" aria-selected="{{ 'true' if key == active else 'false' }}">{{ label }}</a>{% endfor %}
-</nav>
-
 {# ===================================================================== Profile #}
 <section class="dash-card panel{{ ' active' if active == 'profile' else '' }}" id="panel-profile">
 <h2>Profile overview</h2>
@@ -163,6 +150,26 @@
   <div><label for="b-reason">Reason (optional)</label><input id="b-reason" name="reason" maxlength="200" class="w-280"></div>
   <button class="primary">Add blackout</button>
 </form>
+</section>
+
+{# ===================================================================== Cancelled appointments #}
+<section class="dash-card panel{{ ' active' if active == 'cancelled' else '' }}" id="panel-cancelled">
+<div class="sched-head">
+  <div><h2 class="m-0">Cancelled appointments</h2>
+    <p class="hint" style="margin:6px 0 0">Appointments from the last 30 days and the next 30 days that were cancelled by the patient or by you (including blackout days).</p></div>
+  <div class="sched-stats"><span><b>{{ cancelled|length }}</b> cancelled</span><span><b>₹{{ cancelled_refunded }}</b> refunded</span></div>
+</div>
+{% if cancelled_error %}<p class="notice" role="alert">{{ cancelled_error }}</p>{% endif %}
+{% if cancelled %}
+<table><thead><tr><th>Appointment</th><th>Patient</th><th>Cancelled by</th><th>Refund</th></tr></thead><tbody>
+{% for a in cancelled %}<tr>
+  <td>{{ a.when }}<br><small class="muted">{{ a.consultation.label }} · {{ a.reference }}</small></td>
+  <td>{{ a.patientName or 'Patient' }}</td>
+  <td><span class="status-pill cancelled">{{ 'You' if a.status == 'CANCELLED_BY_DOCTOR' else 'Patient' }}</span>{% if a.updatedAt %}<br><small class="muted">on {{ a.updatedAt[:10] }}</small>{% endif %}</td>
+  <td>{% if a.refund %}₹{{ a.refund.refundAmount }} <small class="muted">({{ a.refund.refundPercent }}%)</small>{% else %}—{% endif %}</td>
+</tr>{% endfor %}
+</tbody></table>
+{% else %}<p class="empty">No cancelled appointments in this period.</p>{% endif %}
 </section>
 </main>
 {% endblock %}
