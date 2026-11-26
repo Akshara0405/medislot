@@ -2,6 +2,28 @@ import sys, subprocess, uuid, os, json, time
 
 template, stack_name, *parameter_pairs = sys.argv[1:]
 region = os.environ.get("AWS_REGION", "ap-south-1")
+
+# CloudFormation rejects an inline --template-body over 51,200 bytes. Comments and blank lines count toward that,
+# so a large template is sent with full-line comments and blank lines removed (the file in the repo is unchanged).
+# Only done for templates without YAML block scalars (| or >), where a "#" line could be real content.
+TEMPLATE_BODY_LIMIT = 51200
+with open(template, encoding="utf-8") as fh:
+    source = fh.read()
+if len(source.encode("utf-8")) > TEMPLATE_BODY_LIMIT:
+    lines = source.splitlines()
+    has_block_scalar = any(l.rstrip().endswith((": |", ": |-", ": >", ": >-", ": |+", ": >+")) for l in lines)
+    if has_block_scalar:
+        raise SystemExit(f"{template} is over {TEMPLATE_BODY_LIMIT} bytes and has block scalars; "
+                         "upload it to S3 and deploy with --template-url instead.")
+    compact = "\n".join(l for l in lines if l.strip() and not l.lstrip().startswith("#")) + "\n"
+    size = len(compact.encode("utf-8"))
+    if size > TEMPLATE_BODY_LIMIT:
+        raise SystemExit(f"{template} is {size} bytes even without comments (limit {TEMPLATE_BODY_LIMIT}); "
+                         "split the stack or deploy it from S3 with --template-url.")
+    template = os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), "compact-" + os.path.basename(template))
+    with open(template, "w", encoding="utf-8") as fh:
+        fh.write(compact)
+    print(f"Template is over {TEMPLATE_BODY_LIMIT} bytes; sending a {size}-byte copy without comments.")
 parameters = []
 for pair in parameter_pairs:
     key, value = pair.split("=", 1)
