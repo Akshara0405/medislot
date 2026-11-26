@@ -1,0 +1,9 @@
+# Gitleaks config: keep every default rule, skip only known false positives.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Postman workspace/collection IDs written by the Postman app (identifiers, not credentials)"
+paths = [
+  '''^\.postman/resources\.yaml$''',
+]
