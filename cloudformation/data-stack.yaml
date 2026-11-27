@@ -39,7 +39,7 @@ Resources:
       VPCSecurityGroups:
         - Fn::ImportValue: !Sub 'MediSlot-${Environment}-DatabaseSecurityGroupId'
       # Milestone 7: 7 days of automated backups = point-in-time restore window for the DR drill.
-      BackupRetentionPeriod: 7
+      BackupRetentionPeriod: 1
       PreferredBackupWindow: '20:00-20:30'
       PreferredMaintenanceWindow: 'sun:21:00-sun:21:30'
       AutoMinorVersionUpgrade: true
