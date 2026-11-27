@@ -22,6 +22,21 @@ log = logging.getLogger()
 log.setLevel(logging.INFO)
 
 
+def _init_tracing():
+    """AWS X-Ray (Milestone 7): record boto3 (DynamoDB, EventBridge, SSM, SNS) and PyMySQL calls as subsegments of
+    the Lambda trace. Only inside Lambda with Active tracing; a no-op in tests or when the SDK is not packaged."""
+    if not os.environ.get('AWS_LAMBDA_FUNCTION_NAME') or not os.environ.get('AWS_XRAY_DAEMON_ADDRESS'):
+        return
+    try:
+        from aws_xray_sdk.core import patch
+        patch(['boto3', 'botocore', 'pymysql'])
+    except Exception:                       # tracing must never break a request
+        log.warning('xray_patch_skipped')
+
+
+_init_tracing()
+
+
 # --------------------------------------------------------------------------- AWS clients (created once per container)
 
 @lru_cache(maxsize=None)

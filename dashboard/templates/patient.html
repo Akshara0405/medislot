@@ -6,7 +6,24 @@
 {% block content %}
 <main class="shell dashboard" style="padding-top:0">
 
-{% if view == 'doctor' %}
+{% if view == 'reschedule' %}
+{# ===================================================================== Reschedule (Milestone 6) #}
+<p><a class="teal-link" href="{{ url_for('patient_dashboard', tab='appointments') }}">← Back to my appointments</a></p>
+<section class="dash-card">
+  <h2 class="mt-0">Reschedule {{ appt.reference }}</h2>
+  <p class="muted">{{ appt.doctor.name }} · {{ appt.consultation.label }} · now on <b>{{ appt.when }}</b></p>
+  <p class="hint">Pick another free slot of the same doctor and consultation. Rescheduling is free, allowed up to 6 hours before the appointment, at most twice per appointment (rescheduled so far: {{ appt.rescheduleCount or 0 }}). Your current seat is kept until the new one is confirmed.</p>
+  {% for day in days %}
+  <div class="day-row"><div class="day-tag"><b>{{ day.label }}</b><small>{{ day.slots|length }} free</small></div>
+    <div class="seat-grid">{% for s in day.slots %}
+      <form method="post" action="{{ url_for('patient_dashboard') }}" class="seat-card" onsubmit="this.querySelector('button').disabled=true;this.querySelector('button').textContent='Moving…'">
+        <span class="t">{{ s.start12 }}</span><span class="s">{{ s.freeSeats }} of {{ s.capacity }} free</span>
+        <input type="hidden" name="action" value="reschedule"><input type="hidden" name="appointment_id" value="{{ appt.appointmentId }}">
+        <input type="hidden" name="slot_id" value="{{ s.slotId }}"><button class="primary small" type="submit">Move here</button></form>
+    {% endfor %}</div></div>
+  {% else %}<div class="empty-state"><h3>No other free slots in the next two weeks.</h3></div>{% endfor %}
+</section>
+{% elif view == 'doctor' %}
 {# ===================================================================== Doctor page #}
 <p style="margin:22px 0 0"><a href="javascript:history.back()" class="teal-link">← Back to results</a></p>
 <section class="doc-hero">
@@ -53,13 +70,17 @@
             <input type="hidden" name="action" value="book"><input type="hidden" name="slot_id" value="{{ s.slotId }}">
             <input type="hidden" name="doctor_id" value="{{ doctor.doctorId }}"><input type="hidden" name="idem_key" value="{{ s.idem_key }}">
             <button class="primary" type="submit">Confirm · ₹{{ s.fee }}</button>
-          </form></details>{% endif %}</div>{% endfor %}</div>
+          </form></details>
+        {% elif s.status == 'FULL' and s.slotId %}<form method="post" action="{{ url_for('patient_dashboard') }}" class="inline waitlist-form">
+            <input type="hidden" name="action" value="join_waitlist"><input type="hidden" name="slot_id" value="{{ s.slotId }}">
+            <input type="hidden" name="doctor_id" value="{{ doctor.doctorId }}">
+            <button class="ghost small" type="submit">Join waitlist</button></form>{% endif %}</div>{% endfor %}</div>
     {% elif day.closed %}<div class="day-note closed">The doctor is not seeing patients this day.</div>
-    {% elif day.fullyBooked %}<div class="day-note full">Every slot is taken. A whole-day waitlist arrives with booking.</div>
+    {% elif day.fullyBooked %}<div class="day-note full">Every slot is taken. Untick "free seats only" to see full slots and join a waitlist.</div>
     {% else %}<div class="day-note">No consultations scheduled.</div>{% endif %}
   </div>
   {% endfor %}
-  <p class="hint" style="margin-top:14px">Seat counts are live. If two people book the last seat at the same moment, exactly one gets it and the other is told straight away.</p>
+  <p class="hint" style="margin-top:14px">Seat counts are live. If two people book the last seat at the same moment, exactly one gets it and the other is told straight away. A full slot has a waitlist: when a seat frees up it is held for the first patient in line for a few minutes.</p>
 {% endif %}
 </section>
 
@@ -129,7 +150,8 @@
     <div class="appt-main">
       <div class="appt-when"><b>{{ a.when }}</b><small>to {{ a.until }} · {{ a.timezone }}</small></div>
       <div><h3>{{ a.doctor.name }}</h3><p class="muted">{{ a.consultation.label }} · {{ a.doctor.hospital.name }} · ₹{{ a.fee }}</p>
-        <div class="doc-facts"><span class="chip">{{ a.reference }}</span></div></div>
+        <div class="doc-facts"><span class="chip">{{ a.reference }}</span>{% if a.rescheduleCount %}<span class="chip">rescheduled {{ a.rescheduleCount }}×</span>{% endif %}
+          <a class="ghost small" href="{{ url_for('patient_reschedule', appointment_id=a.appointmentId) }}">Reschedule</a></div></div>
     </div>
     {% set c = a.cancellation %}
     {% if c and c.cancellable %}
@@ -160,6 +182,34 @@
 </tbody></table>
 {% else %}<p class="empty">{{ 'You have no cancelled appointments.' if hf == 'cancelled' else 'Nothing here yet.' }}</p>{% endif %}
 </section>{% endif %}
+
+{% elif active == 'waitlists' %}
+{# ===================================================================== Waitlists + hold offers (Milestone 6) #}
+{% if booking.error %}<div class="alert error">{{ booking.error }}</div>{% endif %}
+<section class="dash-card">
+<div class="sched-head">
+  <div><h2 class="m-0">Waitlists</h2>
+    <p class="hint" style="margin:6px 0 0">When a seat frees up in a full slot, it is held for the first patient in line. Accept before the hold runs out or it moves to the next patient.</p></div>
+  <div class="sched-stats"><span><b>{{ booking.waitlists|length }}</b> of {{ booking.cap }} waitlists</span><span><b>{{ booking.pendingOffers }}</b> seat{{ '' if booking.pendingOffers == 1 else 's' }} held for you</span></div>
+</div>
+{% for w in booking.waitlists %}
+  <article class="appt-card{{ ' offer-live' if w.offer else '' }}">
+    <div class="appt-main">
+      <div class="appt-when"><b>{{ w.when }}</b><small>{{ w.timezone }}</small></div>
+      <div><h3>{{ w.doctor.name }}</h3><p class="muted">{{ w.consultation.label }}{% if w.consultation.fee %} · ₹{{ w.consultation.fee }}{% endif %}</p>
+        <div class="doc-facts">{% if w.offer %}<span class="chip offer-chip">Seat held for you until {{ w.offer.until }} ({{ w.offer.minutes }} min left)</span>
+          {% else %}<span class="chip">Position {{ w.position or '-' }} of {{ w.waiting }}</span>{% endif %}</div></div>
+    </div>
+    <div class="row-actions">
+      {% if w.offer %}
+      <form method="post" class="inline"><input type="hidden" name="action" value="accept_offer"><input type="hidden" name="token" value="{{ w.offer.offerId }}"><button class="primary" type="submit">Accept and book</button></form>
+      <form method="post" class="inline" onsubmit="return confirm('Decline this seat? It goes to the next patient.')"><input type="hidden" name="action" value="decline_offer"><input type="hidden" name="token" value="{{ w.offer.offerId }}"><button class="ghost" type="submit">Decline</button></form>
+      {% endif %}
+      <form method="post" class="inline" onsubmit="return confirm('Leave this waitlist?')"><input type="hidden" name="action" value="leave_waitlist"><input type="hidden" name="token" value="{{ w.waitlistId }}"><button class="ghost" type="submit">Leave waitlist</button></form>
+    </div>
+  </article>
+{% else %}<div class="empty-state"><h3>You are not on any waitlist.</h3><p class="hint">Open a doctor, untick "free seats only" and press <b>Join waitlist</b> on a full slot.</p></div>{% endfor %}
+</section>
 
 {% elif active == 'cancelled' %}
 {# ===================================================================== Cancelled appointments #}

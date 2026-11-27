@@ -344,3 +344,11 @@ td,th{text-align:left;padding:10px;border-bottom:1px solid var(--line)}
 .status-form select{flex:1 1 90px;min-width:0;max-width:100%}
 .status-form .slot-btn{flex:0 0 auto}
 .status-pill.no_show{background:#fff4e0;color:#8a5a00}
+
+/* ---- Milestone 6: waitlists, hold offers, reschedule */
+.ghost.small,.primary.small,a.ghost.small{padding:5px 12px;font-size:12px;border-radius:14px;margin-left:6px}
+.waitlist-form{margin-top:8px}
+.appt-card.offer-live{border-color:#f0b429;box-shadow:0 0 0 2px rgba(240,180,41,.25)}
+.chip.offer-chip{background:#fff4e0;color:#8a5a00;font-weight:700}
+.row-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:10px}
+form.seat-card{display:flex;flex-direction:column;gap:6px}

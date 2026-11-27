@@ -1,0 +1,359 @@
+{
+  "Comment": "MediSlot reschedule saga (Milestone 6). Forward: claim target seat -> move appointment in RDS -> release original seat -> finalize. If releasing the original seat fails after a successful claim, the compensation branch reverts the appointment and gives the target seat back, so the patient always holds exactly one appointment. Every task is idempotent (Step Functions may retry it).",
+  "StartAt": "Prepare",
+  "States": {
+    "Prepare": {
+      "Type": "Pass",
+      "Comment": "EventBridge delivers the whole event; keep only the request detail.",
+      "Parameters": {
+        "request.$": "$.detail",
+        "steps": {}
+      },
+      "Next": "ClaimTargetSeat"
+    },
+    "ClaimTargetSeat": {
+      "Type": "Task",
+      "Comment": "Take a seat in the target slot (optimistic concurrency on the Slots table).",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${BookingFunctionArn}",
+        "Payload": {
+          "action": "saga",
+          "step": "claim",
+          "request.$": "$.request"
+        }
+      },
+      "ResultSelector": {
+        "value.$": "$.Payload.body"
+      },
+      "ResultPath": "$.steps.claim",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "RecordRejected"
+        }
+      ],
+      "Next": "CommitReschedule"
+    },
+    "CommitReschedule": {
+      "Type": "Task",
+      "Comment": "Move the appointment row to the target slot in RDS (one transaction).",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${BookingFunctionArn}",
+        "Payload": {
+          "action": "saga",
+          "step": "commit",
+          "request.$": "$.request"
+        }
+      },
+      "ResultSelector": {
+        "value.$": "$.Payload.body"
+      },
+      "ResultPath": "$.steps.commit",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "CompensateReleaseTargetSeat"
+        }
+      ],
+      "Next": "ReleaseOriginalSeat"
+    },
+    "ReleaseOriginalSeat": {
+      "Type": "Task",
+      "Comment": "Give the original seat back. On failure -> compensation.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${BookingFunctionArn}",
+        "Payload": {
+          "action": "saga",
+          "step": "release",
+          "request.$": "$.request"
+        }
+      },
+      "ResultSelector": {
+        "value.$": "$.Payload.body"
+      },
+      "ResultPath": "$.steps.release",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "SeatReleaseFailed"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        },
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "CompensateRevertAppointment"
+        }
+      ],
+      "Next": "FinalizeReschedule"
+    },
+    "FinalizeReschedule": {
+      "Type": "Task",
+      "Comment": "Record SUCCEEDED, publish AppointmentRescheduled + SlotSeatFreed.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${BookingFunctionArn}",
+        "Payload": {
+          "action": "saga",
+          "step": "finalize",
+          "request.$": "$.request"
+        }
+      },
+      "ResultSelector": {
+        "value.$": "$.Payload.body"
+      },
+      "ResultPath": "$.steps.finalize",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.stuckError",
+          "Next": "RecordNeedsAttention"
+        }
+      ],
+      "Next": "RescheduleSucceeded"
+    },
+    "RescheduleSucceeded": {
+      "Type": "Succeed"
+    },
+    "CompensateRevertAppointment": {
+      "Type": "Task",
+      "Comment": "COMPENSATION: move the appointment back to its original slot.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${BookingFunctionArn}",
+        "Payload": {
+          "action": "saga",
+          "step": "revert",
+          "request.$": "$.request"
+        }
+      },
+      "ResultSelector": {
+        "value.$": "$.Payload.body"
+      },
+      "ResultPath": "$.steps.revert",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.stuckError",
+          "Next": "RecordNeedsAttention"
+        }
+      ],
+      "Next": "CompensateReleaseTargetSeat"
+    },
+    "CompensateReleaseTargetSeat": {
+      "Type": "Task",
+      "Comment": "COMPENSATION: give the claimed target seat back.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${BookingFunctionArn}",
+        "Payload": {
+          "action": "saga",
+          "step": "release-target",
+          "request.$": "$.request"
+        }
+      },
+      "ResultSelector": {
+        "value.$": "$.Payload.body"
+      },
+      "ResultPath": "$.steps.release_target",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.stuckError",
+          "Next": "RecordNeedsAttention"
+        }
+      ],
+      "Next": "RecordCompensated"
+    },
+    "RecordCompensated": {
+      "Type": "Task",
+      "Comment": "Record COMPENSATED (+ ReschedulesCompensated metric), unlock.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${BookingFunctionArn}",
+        "Payload": {
+          "action": "saga",
+          "step": "compensated",
+          "request.$": "$.request",
+          "error.$": "$.error"
+        }
+      },
+      "ResultSelector": {
+        "value.$": "$.Payload.body"
+      },
+      "ResultPath": "$.steps.compensated",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "RescheduleCompensated"
+    },
+    "RescheduleCompensated": {
+      "Type": "Fail",
+      "Error": "RescheduleCompensated",
+      "Cause": "The reschedule failed after the target seat was claimed. The compensation branch restored the original appointment and released the target seat."
+    },
+    "RecordRejected": {
+      "Type": "Task",
+      "Comment": "The target seat could not be claimed: nothing to undo.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${BookingFunctionArn}",
+        "Payload": {
+          "action": "saga",
+          "step": "rejected",
+          "request.$": "$.request",
+          "error.$": "$.error"
+        }
+      },
+      "ResultSelector": {
+        "value.$": "$.Payload.body"
+      },
+      "ResultPath": "$.steps.rejected",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "RescheduleRejected"
+    },
+    "RescheduleRejected": {
+      "Type": "Fail",
+      "Error": "RescheduleRejected",
+      "Cause": "The target seat could not be claimed. The original appointment is unchanged."
+    },
+    "RecordNeedsAttention": {
+      "Type": "Task",
+      "Comment": "Compensation itself failed: alarm + runbook.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${BookingFunctionArn}",
+        "Payload": {
+          "action": "saga",
+          "step": "stuck",
+          "request.$": "$.request",
+          "stuckError.$": "$.stuckError"
+        }
+      },
+      "ResultSelector": {
+        "value.$": "$.Payload.body"
+      },
+      "ResultPath": "$.steps.stuck",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "CompensationFailed"
+    },
+    "CompensationFailed": {
+      "Type": "Fail",
+      "Error": "CompensationFailed",
+      "Cause": "A compensation step failed after retries. See RUNBOOK.md, 'Reschedule needs attention'."
+    }
+  }
+}

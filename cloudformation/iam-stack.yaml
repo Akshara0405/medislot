@@ -40,17 +40,26 @@ Resources:
               - cloudformation:DescribeStackEvents
               - cloudformation:DescribeStackResources
               - cloudformation:GetTemplate
+              # Milestone 7: drift detection and the scripted teardown (operations workflow)
+              - cloudformation:DeleteStack
+              - cloudformation:DetectStackDrift
+              - cloudformation:DetectStackResourceDrift
+              - cloudformation:DescribeStackResourceDrifts
             Resource:
               - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-iam/*
               - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-network/*
               - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-data/*
               - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-auth/*
+              - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-workflows/*
+              - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-web/*
+              - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/medislot-${Environment}-observability/*
 
           - Sid: InspectCloudFormation
             Effect: Allow
             Action:
               - cloudformation:ValidateTemplate
               - cloudformation:DescribeStackResources
+              - cloudformation:DescribeStackDriftDetectionStatus
             Resource: "*"
 
           - Sid: ReadCallerIdentity

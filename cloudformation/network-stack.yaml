@@ -117,6 +117,16 @@ Resources:
       PrivateDnsEnabled: true
       SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
       SecurityGroupIds: [!GetAtt EndpointSecurityGroup.GroupId]
+  # Milestone 7: X-Ray traces from the Lambdas in the private subnets (there is no NAT).
+  XRayInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref MediSlotVPC
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.xray'
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      SecurityGroupIds: [!GetAtt EndpointSecurityGroup.GroupId]
   S3GatewayEndpoint:
     Type: AWS::EC2::VPCEndpoint
     Properties:

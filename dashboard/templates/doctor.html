@@ -80,14 +80,15 @@
 <section class="dash-card panel{{ ' active' if active == 'schedule' else '' }}" id="panel-schedule">
 {% set back = {'return_' ~ nav_key: day} %}
 <div class="sched-head">
-  <div><h2 class="m-0">{% if single_day %}{{ 'Past slots' if is_past_day else 'Slots' }} on {{ day_label }}{% else %}Your slots{% endif %}</h2>
-    <p class="hint" style="margin:6px 0 0">{% if single_day %}Only this date is shown · <a class="teal-link" href="{{ url_for('dashboard', tab='schedule', start=day) }}">show 30 days from here</a>{% else %}{{ day }} → next 30 days · pick a date to see just that day{% endif %} · times in your profile timezone</p></div>
+  <div><h2 class="m-0">{% if single_day %}{{ 'Past slots' if is_past_day else 'Slots' }} on {{ day_label }}{% elif week_view %}Week of {{ week_label }}{% else %}Your slots{% endif %}</h2>
+    <p class="hint" style="margin:6px 0 0">{% if single_day %}Only this date is shown · <a class="teal-link" href="{{ url_for('dashboard', tab='schedule', start=day) }}">show 30 days from here</a>{% elif week_view %}Monday to Sunday · <a class="teal-link" href="{{ url_for('dashboard', tab='schedule', start=day) }}">show 30 days from here</a>{% else %}{{ day }} → next 30 days · pick a date to see just that day{% endif %} · times in your profile timezone</p></div>
   <div class="sched-stats"><span><b>{{ slot_total }}</b> slots</span><span><b>{{ open_total }}</b> open</span>{% if completed_total %}<span><b>{{ completed_total }}</b> completed</span>{% endif %}{% if not single_day %}<span><b>{{ busy_days|length }}</b> days</span>{% endif %}</div>
 </div>
 <div class="day-nav">
-  <a class="ghost" href="{{ url_for('dashboard', tab='schedule', **{nav_key: prev_day}) }}">← {{ 'Previous day' if single_day else 'Earlier' }}</a>
+  <a class="ghost" href="{{ url_for('dashboard', tab='schedule', **{nav_key: prev_day}) }}">← {{ 'Previous day' if single_day else ('Previous week' if week_view else 'Earlier') }}</a>
   <form method="get" class="row-actions inline"><input type="hidden" name="tab" value="schedule"><input id="schedule-start" type="date" name="date" value="{{ day }}" aria-label="Show one date" onchange="this.form.submit()"><button class="ghost">Go</button></form>
-  <a class="ghost" href="{{ url_for('dashboard', tab='schedule', **{nav_key: next_day}) }}">{{ 'Next day' if single_day else 'Later' }} →</a>
+  <a class="ghost" href="{{ url_for('dashboard', tab='schedule', **{nav_key: next_day}) }}">{{ 'Next day' if single_day else ('Next week' if week_view else 'Later') }} →</a>
+  {% if not week_view %}<a class="ghost" href="{{ url_for('dashboard', tab='schedule', week=day) }}">Week view</a>{% endif %}
   {% if single_day %}<a class="ghost" href="{{ url_for('dashboard', tab='schedule') }}">Today + 30 days</a>{% endif %}
 </div>
 <div class="legend"><span class="lg open">Open</span><span class="lg full">Fully booked</span><span class="lg closed">Closed</span><span class="lg done">Completed / ended</span></div>
@@ -99,11 +100,11 @@
     {% if g.blocked %}<p class="blackout-note">Blackout day{% if g.reason %} · {{ g.reason }}{% endif %}. Slots are closed and booked appointments were cancelled with a full refund.</p>{% endif %}
     {% if not g.slots %}<p class="empty m-0">No slots on this date.</p>{% endif %}
     <div class="slot-grid">{% for s in g.slots %}
-      {% set closed = s.status == 'CLOSED' %}{% set full = (not closed) and s.booked_count|int >= s.capacity|int %}
+      {% set closed = s.status == 'CLOSED' %}{% set full = (not closed) and (s.booked_count|int + s.held_count|int) >= s.capacity|int %}
       <div class="slotpill {{ 'done' if s.ended else ('closed' if closed else ('full' if full else 'open')) }}">
         <span class="st">{{ s.start_local }}</span><span class="et">to {{ s.end_local }}</span><span class="sty">{{ s.type_label }}</span>
         {% if s.ended %}<span class="seat">{{ 'Completed' if s.completed else 'Ended · not booked' }}{% if s.booked_count|int %} · {{ s.booked_count }}/{{ s.capacity }} seen{% endif %}</span>
-        {% else %}<span class="seat">{{ s.booked_count }}/{{ s.capacity }} booked{% if closed %} · closed{% elif full %} · full{% endif %}{% if not s.future %} · in progress{% endif %}</span>{% endif %}
+        {% else %}<span class="seat">{{ s.booked_count }}/{{ s.capacity }} booked{% if s.held_count %} · {{ s.held_count }} held for waitlist{% endif %}{% if closed %} · closed{% elif full %} · full{% endif %}{% if not s.future %} · in progress{% endif %}</span>{% endif %}
         {% for a in s.appointments %}
         <div class="appt-row">
           <span class="slot-note">👤 {{ a.name }} <small class="muted">{{ a.reference }}</small></span>

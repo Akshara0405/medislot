@@ -1,4 +1,4 @@
-name: MediSlot CI and Deployment (Milestone 5 booking engine)
+name: MediSlot CI and Deployment
 
 on:
   pull_request:
@@ -20,6 +20,7 @@ on:
       - "dashboard/**"
       - "pytest.ini"
       - ".gitleaks.toml"
+      - "statemachines/**"
   workflow_dispatch:
 
 permissions:
@@ -70,8 +71,35 @@ jobs:
             pytest -q -k "mandatory_1 or mandatory_2" tests/test_m5_booking.py
           done
 
+      - name: Milestone 6 mandatory tests (reschedule saga compensation + waitlist exclusivity), run 5 times
+        env:
+          AWS_REGION: ap-south-1
+          AWS_DEFAULT_REGION: ap-south-1
+        run: |
+          for run in 1 2 3 4 5; do
+            pytest -q -k "mandatory_3 or mandatory_4" tests/test_m6_workflows.py
+          done
+
+      - name: Full test report (JUnit)
+        if: always()
+        env:
+          AWS_REGION: ap-south-1
+          AWS_DEFAULT_REGION: ap-south-1
+        run: pytest -q --junitxml=unit-test-results.xml
+
+      - name: Publish unit test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-results
+          path: unit-test-results.xml
+          if-no-files-found: ignore
+
       - name: Python syntax check
-        run: python -m compileall -q lambdas tests dashboard
+        run: python -m compileall -q lambdas tests dashboard scripts
+
+      - name: Validate the Step Functions definition (JSON)
+        run: python -c "import json; json.load(open('statemachines/reschedule.asl.json'))"
 
       - name: Validate CloudFormation templates
         run: |
@@ -92,7 +120,7 @@ jobs:
 
   deploy:
     name: deploy
-    if: github.ref == 'refs/heads/feature/milestone-2-foundation' && github.event_name != 'pull_request'
+    if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/milestone-2-foundation') && github.event_name != 'pull_request'
     needs: ci
     runs-on: ubuntu-latest
     environment: dev
@@ -136,6 +164,15 @@ jobs:
 
       - name: Verify OIDC identity
         run: aws sts get-caller-identity
+
+      - name: Resolve account, artifact bucket and template bucket
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+          echo "ACCOUNT=${ACCOUNT}" >> "$GITHUB_ENV"
+          # Templates over 51,200 bytes (auth stack) are deployed from S3 (scripts/deploy_stack.py)
+          echo "TEMPLATE_BUCKET=medislot-${ENVIRONMENT}-artifacts-${ACCOUNT}" >> "$GITHUB_ENV"
 
       # The initial IAM bootstrap must be deployed by an authorized
       # AWS administrator before this step can run successfully.
@@ -231,7 +268,7 @@ jobs:
           AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
           BUCKET="medislot-${ENVIRONMENT}-artifacts-${AWS_ACCOUNT_ID}"
 
-          for fn in authentication authorization doctor patient materializer booking; do
+          for fn in authentication authorization doctor patient materializer booking notifier; do
             tmp="$(mktemp -d)"
 
             cp -R "lambdas/${fn}/." "$tmp/"
@@ -257,6 +294,10 @@ jobs:
             rm -rf "$tmp" "$GITHUB_WORKSPACE/${fn}.zip"
           done
 
+          # Milestone 6: the reschedule saga definition (Step Functions reads it from S3 at deploy time)
+          aws s3 cp statemachines/reschedule.asl.json \
+            "s3://${BUCKET}/lambda/${GITHUB_SHA}/reschedule.asl.json" --sse AES256 --region "$AWS_REGION"
+
       - name: Package and upload Flask dashboard
         shell: bash
         run: |
@@ -281,7 +322,20 @@ jobs:
             "medislot-${ENVIRONMENT}-auth" \
             "Environment=${ENVIRONMENT}" \
             "ArtifactBucket=medislot-${ENVIRONMENT}-artifacts-${ACCOUNT}" \
-            "ArtifactPrefix=lambda/${GITHUB_SHA}"
+            "ArtifactPrefix=lambda/${GITHUB_SHA}" \
+            "FaultInjection=${{ vars.FAULT_INJECTION || 'enabled' }}"
+
+      - name: Deploy workflows stack (Milestone 6 - saga, queues, notifier, schedules)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/deploy_stack.py \
+            cloudformation/workflows-stack.yaml \
+            "medislot-${ENVIRONMENT}-workflows" \
+            "Environment=${ENVIRONMENT}" \
+            "ArtifactBucket=medislot-${ENVIRONMENT}-artifacts-${ACCOUNT}" \
+            "ArtifactPrefix=lambda/${GITHUB_SHA}" \
+            "NotificationEmail=${{ vars.NOTIFICATION_EMAIL }}"
 
       - name: Deploy EC2 Flask dashboard stack
         shell: bash
@@ -304,6 +358,19 @@ jobs:
           INSTANCE_ID="$(aws cloudformation describe-stacks --stack-name "medislot-${ENVIRONMENT}-web" --region "$AWS_REGION" --query "Stacks[0].Outputs[?OutputKey=='DashboardInstanceId'].OutputValue | [0]" --output text)"
           aws ec2 reboot-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION"
           aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID" --region "$AWS_REGION"
+          echo "WEB_INSTANCE_ID=${INSTANCE_ID}" >> "$GITHUB_ENV"
+
+      - name: Deploy observability stack (Milestone 7 - dashboard, alarms, budget, X-Ray sampling)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/deploy_stack.py \
+            cloudformation/observability-stack.yaml \
+            "medislot-${ENVIRONMENT}-observability" \
+            "Environment=${ENVIRONMENT}" \
+            "AlarmEmail=${{ vars.ALARM_EMAIL }}" \
+            "WebInstanceId=${WEB_INSTANCE_ID}" \
+            "MonthlyBudgetUsd=${{ vars.MONTHLY_BUDGET_USD || '30' }}"
 
       - name: Print deployed API outputs
         shell: bash
@@ -415,6 +482,32 @@ jobs:
           echo "::add-mask::${MEDISLOT_CI_PASSWORD}"
           pytest -v -s -m live tests/test_m5_booking.py --junitxml=m5-live-results.xml
 
+      - name: Milestone 6 smoke test - scheduled jobs run, and running them twice changes nothing
+        shell: bash
+        run: |
+          set -euo pipefail
+          for action in reminders reminders offer-sweep no-show-sweep; do
+            aws lambda invoke --function-name "medislot-${ENVIRONMENT}-booking" --payload "{\"action\":\"${action}\"}" \
+              --cli-binary-format raw-in-base64-out --cli-read-timeout 60 "/tmp/m6-${action}.json" \
+              --region "$AWS_REGION" > /tmp/m6-meta.json
+            echo "${action}: $(cat /tmp/m6-${action}.json)"
+            if grep -q FunctionError /tmp/m6-meta.json; then echo "::error::${action} failed"; exit 1; fi
+          done
+          python -c "
+          import json
+          body = json.load(open('/tmp/m6-reminders.json'))['body']
+          assert body['queued'] == 0, f'second reminder run queued again: {body}'
+          print('Reminder dispatcher is idempotent:', body)
+          "
+          aws stepfunctions describe-state-machine --region "$AWS_REGION" \
+            --state-machine-arn "arn:aws:states:${AWS_REGION}:${ACCOUNT}:stateMachine:medislot-${ENVIRONMENT}-reschedule-saga" \
+            --query '{name:name,status:status,tracing:tracingConfiguration.enabled}' --output table
+
+      - name: Drift detection report (every MediSlot stack should be IN_SYNC)
+        continue-on-error: true
+        shell: bash
+        run: python scripts/drift_check.py --environment "${ENVIRONMENT}" --region "$AWS_REGION" --report drift-report.json
+
       - name: Publish integration test report
         if: always()
         uses: actions/upload-artifact@v4
@@ -423,6 +516,7 @@ jobs:
           path: |
             integration-results.xml
             m5-live-results.xml
+            drift-report.json
             /tmp/explain-search.json
             /tmp/booking-policy.json
           if-no-files-found: ignore

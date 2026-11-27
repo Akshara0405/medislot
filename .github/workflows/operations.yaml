@@ -1,0 +1,71 @@
+name: MediSlot operations (drift check, DR drill, teardown)
+
+# Manual only. Uses the same GitHub OIDC deployment role as the main pipeline.
+#   drift-check  CloudFormation drift detection on every stack (fails if any stack is not IN_SYNC)
+#   dr-drill     RDS + DynamoDB point-in-time restore into temporary copies, measured, then deleted
+#   teardown     delete every stack except iam (type DELETE-medislot-<env> to confirm), then re-run the
+#                "MediSlot CI and Deployment" workflow to redeploy from scratch
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: What to run
+        required: true
+        type: choice
+        options: [drift-check, dr-drill, teardown]
+      confirm:
+        description: For teardown only - type DELETE-medislot-dev
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: medislot-operations
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+  ENVIRONMENT: ${{ vars.ENVIRONMENT || 'dev' }}
+
+jobs:
+  operate:
+    runs-on: ubuntu-latest
+    environment: dev
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN || secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Drift check
+        if: inputs.action == 'drift-check'
+        run: python scripts/drift_check.py --environment "$ENVIRONMENT" --region "$AWS_REGION" --report drift-report.json --strict
+
+      - name: DR drill (measured point-in-time restore)
+        if: inputs.action == 'dr-drill'
+        run: python scripts/dr_drill.py --environment "$ENVIRONMENT" --region "$AWS_REGION" --report dr-drill-report.json
+
+      - name: Teardown
+        if: inputs.action == 'teardown'
+        run: python scripts/teardown.py --environment "$ENVIRONMENT" --region "$AWS_REGION" --confirm "${{ inputs.confirm }}"
+
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: operations-${{ inputs.action }}
+          path: |
+            drift-report.json
+            dr-drill-report.json
+          if-no-files-found: ignore

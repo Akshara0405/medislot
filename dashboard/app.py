@@ -561,7 +561,7 @@ def handle_dashboard_post():
         flash('MediSlot could not reach the API. Please try again.', 'error')
     # Come back to the same schedule view (one chosen date, or the 30-day window) after a change.
     back = {}
-    for key in ('date', 'start'):
+    for key in ('date', 'start', 'week'):
         value = request.form.get('return_' + key, '')
         try:
             back[key] = date.fromisoformat(value).isoformat()
@@ -623,12 +623,15 @@ def dashboard():
     # Schedule tab: ?date=YYYY-MM-DD shows ONLY that date (the date picker); ?start=YYYY-MM-DD (or nothing) shows
     # the 30-day window starting there. Past dates work too: their slots are shown as completed / ended.
     single = bool(request.args.get('date'))
+    week = bool(request.args.get('week')) and not single
     try:
-        day_obj = date.fromisoformat(request.args.get('date') or request.args.get('start') or '')
+        day_obj = date.fromisoformat(request.args.get('date') or request.args.get('week') or request.args.get('start') or '')
     except ValueError:
-        day_obj, single = date.today(), False
+        day_obj, single, week = date.today(), False, False
+    if week:                                          # ?week=<any day> -> Monday..Sunday of that week
+        day_obj -= timedelta(days=day_obj.weekday())
     day = day_obj.isoformat()
-    span = 1 if single else 30
+    span = 1 if single else (7 if week else 30)
     try:
         # The five reads do not depend on each other, so they run at the same time (one API round trip, not five).
         if session.get('refresh_token') and time.time() > session.get('token_exp', 0) - 60:
@@ -727,14 +730,15 @@ def dashboard():
                      and int(s.get('booked_count') or 0) < int(s.get('capacity') or 1))
     completed_total = sum(1 for g in schedule_days for s in g['slots'] if s['completed'])
     # One chosen date is always shown (even when empty); the 30-day window only lists days with slots.
-    busy_days = schedule_days if single else [g for g in schedule_days if g['slots'] or g['blocked']]
+    busy_days = schedule_days if (single or week) else [g for g in schedule_days if g['slots'] or g['blocked']]
     step = timedelta(days=span)
-    nav_key = 'date' if single else 'start'
+    nav_key = 'date' if single else ('week' if week else 'start')
     return render_template(
         'doctor.html',
         tabs=TABS, active=active, day=day, busy_days=busy_days, slot_total=slot_total, open_total=open_total,
         completed_total=completed_total, types=types, blackouts=blackouts, patterns=patterns,
-        profile=profile_data, single_day=single, is_past_day=day_obj < date.today(),
+        profile=profile_data, single_day=single, week_view=week, is_past_day=day_obj < date.today(),
+        week_label=f"{day_obj.strftime('%d %b')} - {(day_obj + timedelta(days=6)).strftime('%d %b %Y')}",
         day_label=day_obj.strftime('%A %d %B %Y'), nav_key=nav_key,
         status_choices=APPOINTMENT_STATUS_CHOICES, cancelled=cancelled, cancelled_error=cancelled_error,
         cancelled_refunded=cancelled_refunded,
@@ -756,8 +760,8 @@ def dashboard():
 # =====================================================================================================
 GENDER_OPTIONS = ['Female', 'Male', 'Non-binary', 'Other', 'Prefer not to say']
 BLOOD_GROUP_OPTIONS = ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-']
-PATIENT_TABS = [('find', 'Find a doctor'), ('appointments', 'My appointments'), ('cancelled', 'Cancelled'),
-                ('refunds', 'Refunds'), ('profile', 'My profile')]
+PATIENT_TABS = [('find', 'Find a doctor'), ('appointments', 'My appointments'), ('waitlists', 'Waitlists'),
+                ('cancelled', 'Cancelled'), ('refunds', 'Refunds'), ('profile', 'My profile')]
 IDEM_PATTERN = re.compile(r'^[A-Za-z0-9_\-:.]{8,64}$')
 TIER_LABELS = {'FULL': 'full refund', 'PARTIAL': 'partial refund', 'LATE': 'no refund', 'DOCTOR_CANCELLED': 'doctor cancelled'}
 PHONE_PATTERN = re.compile(r'^\+?[0-9][0-9 \-]{5,22}$')
@@ -977,7 +981,9 @@ def patient_dashboard():
             flash(api_message(me, 'Your profile could not be loaded.'), 'warning')
         if state['first_visit'] and profile.get('city'):
             state['city'] = profile['city']
-        if tab == 'cancelled':              # top-bar "Cancelled": every cancelled appointment with its refund
+        if tab == 'waitlists':              # Milestone 6: my waitlists + pending hold offers
+            booking = load_waitlists()
+        elif tab == 'cancelled':              # top-bar "Cancelled": every cancelled appointment with its refund
             booking = load_booking_tab('appointments', 'cancelled')
             booking['refunded'] = money_total((a.get('refund') or {}).get('refundAmount') for a in booking['history'])
         elif tab in ('appointments', 'refunds'):
@@ -1030,6 +1036,95 @@ def decorate_appointment(a):
 
 
 HISTORY_FILTERS = [('all', 'All history'), ('past', 'Past'), ('cancelled', 'Cancelled')]
+
+
+def load_waitlists():
+    """Waitlists tab (Milestone 6): every active waitlist with position, and any seat being held for me."""
+    out = {'upcoming': [], 'history': [], 'refunds': None, 'error': None, 'waitlists': [], 'cap': 5,
+           'pendingOffers': 0}
+    result = api_request('GET', '/patient/waitlists')
+    if not result.ok:
+        out['error'] = api_message(result, 'Your waitlists could not be loaded.')
+        return out
+    data = result.json()
+    for w in data.get('items', []):
+        w['when'] = local_label(w.get('startsAt'), w.get('timezone'), '%a %d %b %Y, %I:%M %p')
+        if w.get('offer'):
+            w['offer']['until'] = local_label(w['offer'].get('expiresAt'), w.get('timezone'), '%I:%M %p')
+            w['offer']['minutes'] = max(0, int(w['offer'].get('secondsLeft') or 0) // 60)
+    out.update(waitlists=data.get('items', []), cap=data.get('cap', 5), pendingOffers=data.get('pendingOffers', 0))
+    return out
+
+
+def handle_waitlist_post(action):
+    """join_waitlist / leave_waitlist / accept_offer / decline_offer (Milestone 6). Returns a redirect."""
+    back_tab = url_for('patient_dashboard', tab='waitlists')
+    if action == 'join_waitlist':
+        slot_id, doctor_id = request.form.get('slot_id', ''), request.form.get('doctor_id', '')
+        back = url_for('patient_doctor', doctor_id=int(doctor_id)) if ID_PATTERN.match(doctor_id) else back_tab
+        if not slot_id or len(slot_id) > 190 or '#' not in slot_id:
+            flash('That waitlist form is no longer valid.', 'error')
+            return redirect(back)
+        result = api_request('POST', '/patient/waitlists', payload={'slotId': slot_id})
+        if result.status_code in (200, 201):
+            data = result.json()
+            flash(f"You are number {data.get('position')} on the waitlist. If a seat opens, it is held for you and "
+                  f"you are notified.", 'success')
+            return redirect(back_tab)
+        if api_code(result) == 'SEATS_AVAILABLE':
+            flash('A seat just opened in that slot - you can book it directly.', 'warning')
+        else:
+            flash(api_message(result, 'Could not join the waitlist.'), 'error')
+        return redirect(back)
+    token = request.form.get('token', '')
+    if not re.fullmatch(r'[A-Za-z0-9_\-]{8,200}(\.[0-9a-f]{32})?', token):
+        flash('Unknown waitlist or offer.', 'error')
+        return redirect(back_tab)
+    if action == 'leave_waitlist':
+        result = api_request('DELETE', f'/patient/waitlists/{token}')
+        flash('You left the waitlist.' if result.ok else api_message(result, 'Could not leave the waitlist.'),
+              'success' if result.ok else 'error')
+        return redirect(back_tab)
+    if action == 'accept_offer':
+        result = api_request('POST', f'/patient/offers/{token}/accept')
+        if result.status_code in (200, 201):
+            data = result.json()
+            flash(f"Booked from the waitlist: {data['doctor']['name']} on "
+                  f"{local_label(data['startsAt'], data.get('timezone'))}. Reference {data['reference']}.", 'success')
+            return redirect(url_for('patient_dashboard', tab='appointments'))
+        flash(api_message(result, 'The offer could not be accepted.'), 'error')
+        return redirect(back_tab)
+    if action == 'decline_offer':
+        result = api_request('POST', f'/patient/offers/{token}/decline')
+        flash('Offer declined - the seat goes to the next patient.' if result.ok
+              else api_message(result, 'Could not decline the offer.'), 'success' if result.ok else 'error')
+        return redirect(back_tab)
+    return redirect(back_tab)
+
+
+def handle_reschedule_post():
+    appointment_id, slot_id = request.form.get('appointment_id', ''), request.form.get('slot_id', '')
+    if not ID_PATTERN.match(appointment_id) or not slot_id or len(slot_id) > 190 or '#' not in slot_id:
+        flash('That reschedule form is no longer valid.', 'error')
+        return redirect(url_for('patient_dashboard', tab='appointments'))
+    result = api_request('POST', f'/patient/appointments/{appointment_id}/reschedule', payload={'slotId': slot_id})
+    data = {}
+    try:
+        data = result.json()
+    except ValueError:
+        pass
+    if result.status_code == 200 and data.get('status') == 'SUCCEEDED':
+        moved = data.get('appointment') or {}
+        flash(f"Rescheduled to {local_label(moved.get('startsAt'), moved.get('timezone'))}. "
+              f"Reference {moved.get('reference', '')}.", 'success')
+    elif result.status_code == 202:
+        flash('Your reschedule is being processed. Refresh in a few seconds to see the new time.', 'warning')
+    elif data.get('status') in ('COMPENSATED', 'REJECTED'):
+        flash(data.get('message') or 'The reschedule did not go through. Your appointment is unchanged.', 'warning')
+    else:
+        flash(api_message(result, 'The reschedule did not go through.'), 'error')
+        return redirect(url_for('patient_reschedule', appointment_id=int(appointment_id)))
+    return redirect(url_for('patient_dashboard', tab='appointments'))
 
 
 def load_booking_tab(tab, history_filter='all'):
@@ -1146,6 +1241,10 @@ def handle_patient_post():
     try:
         if action in ('book', 'cancel_appointment'):
             return handle_booking_post(action)
+        if action in ('join_waitlist', 'leave_waitlist', 'accept_offer', 'decline_offer'):
+            return handle_waitlist_post(action)
+        if action == 'reschedule':
+            return handle_reschedule_post()
         if action == 'profile':
             payload = {api: request.form.get(field, '').strip() for field, api in PATIENT_PROFILE_FORM.items()
                        if field in request.form}
@@ -1239,6 +1338,35 @@ def patient_doctor(doctor_id):
                            start=start, end=end, type_id=type_id, only_free=only_free,
                            prev_week=prev_week, next_week=next_week,
                            next_open_time=twelve_hour((doctor.get('nextOpenSlot') or {}).get('localStart')))
+
+
+@app.get('/patient/appointments/<int:appointment_id>/reschedule')
+def patient_reschedule(appointment_id):
+    """Pick a new slot (same doctor, same consultation type) for one upcoming appointment."""
+    if not is_patient():
+        return redirect(url_for('patient_login'))
+    try:
+        res = api_request('GET', f'/patient/appointments/{appointment_id}')
+        if not res.ok:
+            flash(api_message(res, 'That appointment could not be loaded.'), 'error')
+            return redirect(url_for('patient_dashboard', tab='appointments'))
+        appt = decorate_appointment(res.json())
+        tz_name = appt.get('timezone') or 'Asia/Kolkata'
+        today = datetime.now(ZoneInfo(tz_name)).date()
+        slots_res = public_get(f"/doctors/{appt['doctor']['doctorId']}/slots", {
+            'from': today.isoformat(), 'to': (today + timedelta(days=13)).isoformat(),
+            'consultationTypeId': appt['consultation']['consultationTypeId'], 'includeFull': 'false'})
+        slots = slots_res.json() if slots_res.ok else {'days': []}
+    except requests.RequestException:
+        flash('MediSlot could not reach the API. Please try again.', 'error')
+        return redirect(url_for('patient_dashboard', tab='appointments'))
+    days = []
+    for day in slots.get('days', []):
+        choices = [dict(s, start12=twelve_hour(s['localStart'])) for s in day.get('slots', [])
+                   if s.get('freeSeats') and s.get('slotId') != appt['slotId']]
+        if choices:
+            days.append({'label': date.fromisoformat(day['date']).strftime('%a %d %b'), 'slots': choices})
+    return render_template('patient.html', view='reschedule', appt=appt, days=days)
 
 
 @app.errorhandler(413)

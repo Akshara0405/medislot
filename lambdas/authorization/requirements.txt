@@ -1,2 +1,3 @@
 PyJWT==2.10.1
 PyMySQL==1.1.1
+aws-xray-sdk

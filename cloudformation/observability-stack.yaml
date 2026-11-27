@@ -1,0 +1,454 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  MediSlot Milestone 7 observability - the medislot-operations CloudWatch dashboard, alarms in six categories
+  (API, Lambda, queues/DLQs, workflows, database, business) delivering to SNS, an X-Ray sampling rule, and the
+  monthly AWS Budget. Deployed last (it only reads metrics of the other stacks).
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, prod]
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: E-mail that receives alarm and budget notifications (confirm the subscription e-mail).
+  WebInstanceId:
+    Type: String
+    Default: ''
+    Description: EC2 instance id of the web portal (from the web stack), for the dashboard and its status alarm.
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 30
+    MinValue: 1
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
+  HasWebInstance: !Not [!Equals [!Ref WebInstanceId, '']]
+  IsDev: !Equals [!Ref Environment, dev]
+
+Resources:
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'medislot-${Environment}-alarms'
+      DisplayName: MediSlot alarms
+
+  AlarmTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlarmTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudWatchAlarms
+            Effect: Allow
+            Principal: {Service: cloudwatch.amazonaws.com}
+            Action: sns:Publish
+            Resource: !Ref AlarmTopic
+            Condition: {StringEquals: {'aws:SourceAccount': !Ref 'AWS::AccountId'}}
+          - Sid: Budgets
+            Effect: Allow
+            Principal: {Service: budgets.amazonaws.com}
+            Action: sns:Publish
+            Resource: !Ref AlarmTopic
+            Condition: {StringEquals: {'aws:SourceAccount': !Ref 'AWS::AccountId'}}
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  OperationsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !If [IsDev, medislot-operations, !Sub 'medislot-operations-${Environment}']
+      DashboardBody: !Sub '{"widgets":[{"type":"text","x":0,"y":0,"width":24,"height":3,"properties":{"markdown":"# MediSlot operations (${Environment})\\nAPI Gateway -> Lambda (VPC) -> RDS MySQL + DynamoDB; EventBridge -> Step Functions / SQS -> Lambda -> SNS. [X-Ray service map](https://${AWS::Region}.console.aws.amazon.com/xray/home?region=${AWS::Region}#/service-map) \u00b7 [Reschedule saga executions](https://${AWS::Region}.console.aws.amazon.com/states/home?region=${AWS::Region}#/statemachines) \u00b7 [Alarms](https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#alarmsV2:) \u00b7 Runbook: docs/RUNBOOK.md"}},{"type":"metric","x":0,"y":3,"width":8,"height":6,"properties":{"title":"API requests and errors","region":"${AWS::Region}","stat":"Sum","period":60,"view":"timeSeries","metrics":[["AWS/ApiGateway","Count","ApiName","medislot-${Environment}-api","Stage","${Environment}",{"label":"requests"}],["AWS/ApiGateway","4XXError","ApiName","medislot-${Environment}-api","Stage","${Environment}",{"label":"4xx"}],["AWS/ApiGateway","5XXError","ApiName","medislot-${Environment}-api","Stage","${Environment}",{"label":"5xx"}]]}},{"type":"metric","x":8,"y":3,"width":8,"height":6,"properties":{"title":"API latency (ms)","region":"${AWS::Region}","stat":"p95","period":60,"view":"timeSeries","metrics":[["AWS/ApiGateway","Latency","ApiName","medislot-${Environment}-api","Stage","${Environment}",{"stat":"p50","label":"p50"}],["AWS/ApiGateway","Latency","ApiName","medislot-${Environment}-api","Stage","${Environment}",{"stat":"p95","label":"p95"}],["AWS/ApiGateway","Latency","ApiName","medislot-${Environment}-api","Stage","${Environment}",{"stat":"p99","label":"p99"}]]}},{"type":"metric","x":16,"y":3,"width":8,"height":6,"properties":{"title":"Lambda throttles and concurrency (account)","region":"${AWS::Region}","stat":"Sum","period":60,"view":"timeSeries","metrics":[["AWS/Lambda","Throttles",{"label":"throttles"}],["AWS/Lambda","ConcurrentExecutions",{"stat":"Maximum","label":"max concurrent"}]]}},{"type":"metric","x":0,"y":9,"width":12,"height":6,"properties":{"title":"Lambda errors by function","region":"${AWS::Region}","stat":"Sum","period":60,"view":"timeSeries","metrics":[["AWS/Lambda","Errors","FunctionName","medislot-${Environment}-authentication",{"label":"authentication"}],["AWS/Lambda","Errors","FunctionName","medislot-${Environment}-authorization",{"label":"authorization"}],["AWS/Lambda","Errors","FunctionName","medislot-${Environment}-doctor",{"label":"doctor"}],["AWS/Lambda","Errors","FunctionName","medislot-${Environment}-patient",{"label":"patient"}],["AWS/Lambda","Errors","FunctionName","medislot-${Environment}-booking",{"label":"booking"}],["AWS/Lambda","Errors","FunctionName","medislot-${Environment}-slot-materializer",{"label":"slot-materializer"}],["AWS/Lambda","Errors","FunctionName","medislot-${Environment}-notifier",{"label":"notifier"}]]}},{"type":"metric","x":12,"y":9,"width":12,"height":6,"properties":{"title":"Lambda duration p95 by function (ms)","region":"${AWS::Region}","stat":"p95","period":60,"view":"timeSeries","metrics":[["AWS/Lambda","Duration","FunctionName","medislot-${Environment}-authentication",{"label":"authentication"}],["AWS/Lambda","Duration","FunctionName","medislot-${Environment}-authorization",{"label":"authorization"}],["AWS/Lambda","Duration","FunctionName","medislot-${Environment}-doctor",{"label":"doctor"}],["AWS/Lambda","Duration","FunctionName","medislot-${Environment}-patient",{"label":"patient"}],["AWS/Lambda","Duration","FunctionName","medislot-${Environment}-booking",{"label":"booking"}],["AWS/Lambda","Duration","FunctionName","medislot-${Environment}-slot-materializer",{"label":"slot-materializer"}],["AWS/Lambda","Duration","FunctionName","medislot-${Environment}-notifier",{"label":"notifier"}]]}},{"type":"metric","x":0,"y":15,"width":8,"height":6,"properties":{"title":"Bookings","region":"${AWS::Region}","stat":"Sum","period":300,"view":"timeSeries","metrics":[["MediSlot/Booking","BookingsConfirmed","Environment","${Environment}",{"label":"confirmed"}],["MediSlot/Booking","IdempotentReplays","Environment","${Environment}",{"label":"idempotent replays"}],["MediSlot/Booking","BookingRetriesExhausted","Environment","${Environment}",{"label":"gave up (503)"}],[{"expression":"SEARCH(''{MediSlot/Booking,Environment,Reason} MetricName=\"BookingsRejected\" Environment=\"${Environment}\"'', ''Sum'', 300)","id":"rej","label":"rejected"}]]}},{"type":"metric","x":8,"y":15,"width":8,"height":6,"properties":{"title":"Booking contention (conflict retries)","region":"${AWS::Region}","stat":"Sum","period":300,"view":"timeSeries","metrics":[["MediSlot/Booking","BookingConflictRetries","Environment","${Environment}",{"label":"retries"}],["MediSlot/Booking","BookingConflictRetries","Environment","${Environment}",{"stat":"SampleCount","label":"attempts"}]]}},{"type":"metric","x":16,"y":15,"width":8,"height":6,"properties":{"title":"Cancellations and refunds by tier","region":"${AWS::Region}","stat":"Sum","period":300,"view":"bar","metrics":[[{"expression":"SEARCH(''{MediSlot/Booking,Environment,Tier} MetricName=\"CancellationsByTier\" Environment=\"${Environment}\"'', ''Sum'', 300)","id":"c"}],[{"expression":"SEARCH(''{MediSlot/Booking,Environment,Tier} MetricName=\"RefundAmount\" Environment=\"${Environment}\"'', ''Sum'', 300)","id":"r"}]]}},{"type":"metric","x":0,"y":21,"width":8,"height":6,"properties":{"title":"Reschedule saga outcomes","region":"${AWS::Region}","stat":"Sum","period":300,"view":"timeSeries","metrics":[["MediSlot/Booking","ReschedulesSucceeded","Environment","${Environment}",{"label":"succeeded"}],["MediSlot/Booking","ReschedulesCompensated","Environment","${Environment}",{"label":"compensated"}],["MediSlot/Booking","ReschedulesRejected","Environment","${Environment}",{"label":"rejected"}],["MediSlot/Booking","RescheduleCompensationFailed","Environment","${Environment}",{"label":"compensation failed"}]]}},{"type":"metric","x":8,"y":21,"width":8,"height":6,"properties":{"title":"Step Functions executions","region":"${AWS::Region}","stat":"Sum","period":300,"view":"timeSeries","metrics":[["AWS/States","ExecutionsStarted","StateMachineArn","arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:medislot-${Environment}-reschedule-saga",{"label":"started"}],["AWS/States","ExecutionsSucceeded","StateMachineArn","arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:medislot-${Environment}-reschedule-saga",{"label":"succeeded"}],["AWS/States","ExecutionsFailed","StateMachineArn","arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:medislot-${Environment}-reschedule-saga",{"label":"failed"}],["AWS/States","ExecutionsTimedOut","StateMachineArn","arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:medislot-${Environment}-reschedule-saga",{"label":"timedout"}]]}},{"type":"metric","x":16,"y":21,"width":8,"height":6,"properties":{"title":"Waitlist and hold offers","region":"${AWS::Region}","stat":"Sum","period":300,"view":"timeSeries","metrics":[["MediSlot/Booking","WaitlistJoins","Environment","${Environment}",{"label":"joins"}],["MediSlot/Booking","WaitlistPromotions","Environment","${Environment}",{"label":"promotions (offers)"}],["MediSlot/Booking","OffersAccepted","Environment","${Environment}",{"label":"accepted"}],["MediSlot/Booking","OffersDeclined","Environment","${Environment}",{"label":"declined"}],["MediSlot/Booking","OffersExpired","Environment","${Environment}",{"label":"expired"}]]}},{"type":"metric","x":0,"y":27,"width":8,"height":6,"properties":{"title":"Notifications","region":"${AWS::Region}","stat":"Sum","period":300,"view":"timeSeries","metrics":[["MediSlot/Booking","NotificationsDispatched","Environment","${Environment}",{"label":"dispatched"}],["MediSlot/Booking","NotificationDuplicatesSkipped","Environment","${Environment}",{"label":"duplicates skipped"}],["MediSlot/Booking","NotificationFailures","Environment","${Environment}",{"label":"failures"}],["MediSlot/Booking","RemindersQueued","Environment","${Environment}",{"label":"reminders queued"}],["MediSlot/Booking","NoShowsMarked","Environment","${Environment}",{"label":"no-shows marked"}]]}},{"type":"metric","x":8,"y":27,"width":8,"height":6,"properties":{"title":"Queues: visible messages (DLQs must stay 0)","region":"${AWS::Region}","stat":"Maximum","period":60,"view":"timeSeries","metrics":[["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","medislot-${Environment}-notifications",{"stat":"Maximum","label":"notifications"}],["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","medislot-${Environment}-waitlist-promotions",{"stat":"Maximum","label":"waitlist-promotions"}],["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","medislot-${Environment}-notifications-dlq",{"stat":"Maximum","label":"notifications-dlq"}],["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","medislot-${Environment}-waitlist-promotions-dlq",{"stat":"Maximum","label":"waitlist-promotions-dlq"}],["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","medislot-${Environment}-event-delivery-dlq",{"stat":"Maximum","label":"event-delivery-dlq"}]]}},{"type":"metric","x":16,"y":27,"width":8,"height":6,"properties":{"title":"EventBridge rule deliveries","region":"${AWS::Region}","stat":"Sum","period":300,"view":"timeSeries","metrics":[["AWS/Events","Invocations","RuleName","medislot-${Environment}-notification-events","EventBusName","medislot-${Environment}-events",{"label":"notification-events Invocations"}],["AWS/Events","FailedInvocations","RuleName","medislot-${Environment}-notification-events","EventBusName","medislot-${Environment}-events",{"label":"notification-events FailedInvocations"}],["AWS/Events","Invocations","RuleName","medislot-${Environment}-seat-freed","EventBusName","medislot-${Environment}-events",{"label":"seat-freed Invocations"}],["AWS/Events","FailedInvocations","RuleName","medislot-${Environment}-seat-freed","EventBusName","medislot-${Environment}-events",{"label":"seat-freed FailedInvocations"}],["AWS/Events","Invocations","RuleName","medislot-${Environment}-reschedule-requested","EventBusName","medislot-${Environment}-events",{"label":"reschedule-requested Invocations"}],["AWS/Events","FailedInvocations","RuleName","medislot-${Environment}-reschedule-requested","EventBusName","medislot-${Environment}-events",{"label":"reschedule-requested FailedInvocations"}]]}},{"type":"metric","x":0,"y":33,"width":8,"height":6,"properties":{"title":"RDS MySQL","region":"${AWS::Region}","stat":"Average","period":300,"view":"timeSeries","metrics":[["AWS/RDS","CPUUtilization","DBInstanceIdentifier","medislot-${Environment}-mysql",{"stat":"Average","label":"CPU %"}],["AWS/RDS","DatabaseConnections","DBInstanceIdentifier","medislot-${Environment}-mysql",{"stat":"Maximum","label":"connections"}]]}},{"type":"metric","x":8,"y":33,"width":8,"height":6,"properties":{"title":"RDS free storage and memory (bytes)","region":"${AWS::Region}","stat":"Minimum","period":300,"view":"timeSeries","metrics":[["AWS/RDS","FreeStorageSpace","DBInstanceIdentifier","medislot-${Environment}-mysql",{"label":"free storage"}],["AWS/RDS","FreeableMemory","DBInstanceIdentifier","medislot-${Environment}-mysql",{"label":"freeable memory"}]]}},{"type":"metric","x":16,"y":33,"width":8,"height":6,"properties":{"title":"DynamoDB Slots table","region":"${AWS::Region}","stat":"Sum","period":300,"view":"timeSeries","metrics":[["AWS/DynamoDB","ConsumedWriteCapacityUnits","TableName","MediSlot-${Environment}-DoctorSlots",{"label":"WCU"}],["AWS/DynamoDB","ConsumedReadCapacityUnits","TableName","MediSlot-${Environment}-DoctorSlots",{"label":"RCU"}],["AWS/DynamoDB","ConditionalCheckFailedRequests","TableName","MediSlot-${Environment}-DoctorSlots",{"label":"conditional check failed"}],["AWS/DynamoDB","ThrottledRequests","TableName","MediSlot-${Environment}-DoctorSlots",{"label":"throttled"}]]}},{"type":"metric","x":0,"y":39,"width":8,"height":6,"properties":{"title":"Web portal EC2","region":"${AWS::Region}","stat":"Average","period":300,"view":"timeSeries","metrics":[["AWS/EC2","CPUUtilization","InstanceId","${WebInstanceId}",{"stat":"Average","label":"CPU %"}],["AWS/EC2","StatusCheckFailed","InstanceId","${WebInstanceId}",{"stat":"Maximum","label":"status check failed"}]]}},{"type":"log","x":8,"y":39,"width":16,"height":6,"properties":{"title":"Latest Lambda errors","region":"${AWS::Region}","view":"table","query":"SOURCE ''/aws/lambda/medislot-${Environment}-booking'' | SOURCE ''/aws/lambda/medislot-${Environment}-notifier'' | SOURCE ''/aws/lambda/medislot-${Environment}-patient'' | SOURCE ''/aws/lambda/medislot-${Environment}-doctor'' | fields @timestamp, @log, message, route, errorType, error | filter level = ''ERROR'' | sort @timestamp desc | limit 30"}}]}'
+
+  ApiServerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'medislot-${Environment}-api-server-errors'
+      AlarmDescription: '[API] API Gateway returned 5 or more 5xx responses in 5 minutes.'
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - {Name: ApiName, Value: !Sub 'medislot-${Environment}-api'}
+        - {Name: Stage, Value: !Ref Environment}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+  ApiLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'medislot-${Environment}-api-latency'
+      AlarmDescription: '[API] API Gateway p95 latency above 5 seconds for 15 minutes.'
+      Namespace: AWS/ApiGateway
+      MetricName: Latency
+      Dimensions:
+        - {Name: ApiName, Value: !Sub 'medislot-${Environment}-api'}
+        - {Name: Stage, Value: !Ref Environment}
+      ExtendedStatistic: p95
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 5000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+  BookingLambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'medislot-${Environment}-booking-lambda-errors'
+      AlarmDescription: '[Lambda] The booking Lambda raised errors (saga steps, sweepers or API).'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - {Name: FunctionName, Value: !Sub 'medislot-${Environment}-booking'}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+  NotifierLambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'medislot-${Environment}-notifier-lambda-errors'
+      AlarmDescription: '[Lambda] The notifier Lambda raised errors.'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - {Name: FunctionName, Value: !Sub 'medislot-${Environment}-notifier'}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+  AuthorizerLambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'medislot-${Environment}-authorizer-lambda-errors'
+      AlarmDescription: '[Lambda] The JWT authorizer raised errors (every protected call fails).'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - {Name: FunctionName, Value: !Sub 'medislot-${Environment}-authorization'}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+  LambdaThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'medislot-${Environment}-lambda-throttles'
+      AlarmDescription: '[Lambda] Lambda invocations are being throttled (account concurrency limit).'
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+  NotificationsDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'medislot-${Environment}-notifications-dlq'
+      AlarmDescription: '[Queues] Notifications failed 5 times and are in the DLQ (patients not notified).'
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - {Name: QueueName, Value: !Sub 'medislot-${Environment}-notifications-dlq'}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+  WaitlistDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'medislot-${Environment}-waitlist-dlq'
+      AlarmDescription: '[Queues] Waitlist promotions failed 5 times and are in the DLQ (freed seats not offered).'
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - {Name: QueueName, Value: !Sub 'medislot-${Environment}-waitlist-promotions-dlq'}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+  EventDeliveryDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'medislot-${Environment}-event-delivery-dlq'
+      AlarmDescription: '[Queues] EventBridge or Scheduler could not deliver an event to its target.'
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - {Name: QueueName, Value: !Sub 'medislot-${Environment}-event-delivery-dlq'}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+  NotificationsBacklogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'medislot-${Environment}-notifications-backlog'
+      AlarmDescription: '[Queues] Oldest notification waiting more than 10 minutes.'
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - {Name: QueueName, Value: !Sub 'medislot-${Environment}-notifications'}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 600
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+  RescheduleCompensationFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'medislot-${Environment}-reschedule-compensation-failed'
+      AlarmDescription: '[Workflow] A reschedule saga compensation failed - follow RUNBOOK.md "Reschedule needs attention".'
+      Namespace: MediSlot/Booking
+      MetricName: RescheduleCompensationFailed
+      Dimensions:
+        - {Name: Environment, Value: !Ref Environment}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+  ReschedulesCompensatedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'medislot-${Environment}-reschedules-compensated'
+      AlarmDescription: '[Workflow] More than 3 reschedules were rolled back by compensation in one hour.'
+      Namespace: MediSlot/Booking
+      MetricName: ReschedulesCompensated
+      Dimensions:
+        - {Name: Environment, Value: !Ref Environment}
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+  SagaTimedOutAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'medislot-${Environment}-saga-timed-out'
+      AlarmDescription: '[Workflow] A reschedule saga execution timed out.'
+      Namespace: AWS/States
+      MetricName: ExecutionsTimedOut
+      Dimensions:
+        - {Name: StateMachineArn, Value: !Sub 'arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:medislot-${Environment}-reschedule-saga'}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+  DatabaseCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'medislot-${Environment}-database-cpu'
+      AlarmDescription: '[Database] RDS CPU above 80% for 15 minutes.'
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions:
+        - {Name: DBInstanceIdentifier, Value: !Sub 'medislot-${Environment}-mysql'}
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+  DatabaseStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'medislot-${Environment}-database-storage'
+      AlarmDescription: '[Database] RDS free storage below 2 GB.'
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions:
+        - {Name: DBInstanceIdentifier, Value: !Sub 'medislot-${Environment}-mysql'}
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 2147483648
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+  DatabaseConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'medislot-${Environment}-database-connections'
+      AlarmDescription: '[Database] More than 60 RDS connections (db.t3.micro limit is about 66).'
+      Namespace: AWS/RDS
+      MetricName: DatabaseConnections
+      Dimensions:
+        - {Name: DBInstanceIdentifier, Value: !Sub 'medislot-${Environment}-mysql'}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 60
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+  BookingRetriesExhaustedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'medislot-${Environment}-booking-retries-exhausted'
+      AlarmDescription: '[Business] A booking gave up after the maximum optimistic-concurrency retries (503).'
+      Namespace: MediSlot/Booking
+      MetricName: BookingRetriesExhausted
+      Dimensions:
+        - {Name: Environment, Value: !Ref Environment}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+  EventPublishFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'medislot-${Environment}-event-publish-failures'
+      AlarmDescription: '[Business] Events could not be published to EventBridge (notifications / waitlist may be missed).'
+      Namespace: MediSlot/Booking
+      MetricName: EventPublishFailures
+      Dimensions:
+        - {Name: Environment, Value: !Ref Environment}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+  NotificationFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'medislot-${Environment}-notification-failures'
+      AlarmDescription: '[Business] Notification deliveries are failing (SNS or the dispatch log).'
+      Namespace: MediSlot/Booking
+      MetricName: NotificationFailures
+      Dimensions:
+        - {Name: Environment, Value: !Ref Environment}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  WebStatusCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasWebInstance
+    Properties:
+      AlarmName: !Sub 'medislot-${Environment}-web-status-check'
+      AlarmDescription: '[API] The web portal EC2 instance failed its status checks.'
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions:
+        - {Name: InstanceId, Value: !Ref WebInstanceId}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  XRaySamplingRule:
+    Type: AWS::XRay::SamplingRule
+    Properties:
+      SamplingRule:
+        RuleName: !Sub 'medislot-${Environment}-all'
+        Priority: 100
+        FixedRate: 1.0
+        ReservoirSize: 5
+        ServiceName: '*'
+        ServiceType: '*'
+        Host: '*'
+        HTTPMethod: '*'
+        URLPath: '*'
+        ResourceARN: '*'
+        Version: 1
+
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub 'medislot-${Environment}-monthly'
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: {Amount: !Ref MonthlyBudgetUsd, Unit: USD}
+        CostFilters:
+          TagKeyValue: ['user:Project$MediSlot']
+      NotificationsWithSubscribers:
+        - Notification: {NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 80, ThresholdType: PERCENTAGE}
+          Subscribers:
+            - {SubscriptionType: SNS, Address: !Ref AlarmTopic}
+        - Notification: {NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: 100, ThresholdType: PERCENTAGE}
+          Subscribers:
+            - {SubscriptionType: SNS, Address: !Ref AlarmTopic}
+
+Outputs:
+  DashboardUrl:
+    Value: !Sub
+      - 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${Name}'
+      - Name: !If [IsDev, medislot-operations, !Sub 'medislot-operations-${Environment}']
+  AlarmTopicArn:
+    Value: !Ref AlarmTopic

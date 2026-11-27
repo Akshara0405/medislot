@@ -38,7 +38,10 @@ Resources:
       DBSubnetGroupName: !Ref DBSubnetGroup
       VPCSecurityGroups:
         - Fn::ImportValue: !Sub 'MediSlot-${Environment}-DatabaseSecurityGroupId'
-      BackupRetentionPeriod: 1
+      # Milestone 7: 7 days of automated backups = point-in-time restore window for the DR drill.
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: '20:00-20:30'
+      PreferredMaintenanceWindow: 'sun:21:00-sun:21:30'
       AutoMinorVersionUpgrade: true
       CopyTagsToSnapshot: true
       Tags:
@@ -98,6 +101,8 @@ Resources:
       TimeToLiveSpecification:
         AttributeName: expires_at
         Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
       SSESpecification:
         SSEEnabled: true
 
@@ -119,6 +124,8 @@ Resources:
       TimeToLiveSpecification:
         AttributeName: expires_at
         Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
       SSESpecification:
         SSEEnabled: true
 
@@ -150,6 +157,8 @@ Resources:
               KeyType: RANGE
           Projection:
             ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
       SSESpecification:
         SSEEnabled: true
 
@@ -184,6 +193,8 @@ Resources:
       TimeToLiveSpecification:
         AttributeName: expires_at
         Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
       SSESpecification:
         SSEEnabled: true
 
@@ -201,6 +212,8 @@ Resources:
       TimeToLiveSpecification:
         AttributeName: expires_at
         Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
       SSESpecification:
         SSEEnabled: true
 
@@ -306,6 +319,14 @@ Resources:
       Description: MediSlot patient booking limits and optimistic-concurrency retry settings (JSON).
       Value: '{"maxUpcomingPerPatient":3,"minLeadMinutes":0,"maxOccAttempts":10,"backoffBaseMs":15,"backoffCapMs":400}'
 
+  WorkflowRulesParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/medislot/${Environment}/booking/workflow-rules'
+      Type: String
+      Description: Milestone 6 rules (JSON) - reschedule cutoff and limit, waitlist cap, hold minutes, reminders, no-show grace.
+      Value: '{"rescheduleCutoffHours":6,"maxReschedules":2,"waitlistCap":5,"holdMinutes":15,"reminderHours":[24,2],"noShowGraceMinutes":60}'
+
   BookingEventBus:
     Type: AWS::Events::EventBus
     Properties:
@@ -392,3 +413,9 @@ Outputs:
     Value: !Ref HoldOffersTable
   NotificationLogTableName:
     Value: !Ref NotificationLogTable
+    Export:
+      Name: !Sub 'MediSlot-${Environment}-NotificationLogTableName'
+  DatabaseInstanceId:
+    Value: !Sub 'medislot-${Environment}-mysql'
+    Export:
+      Name: !Sub 'MediSlot-${Environment}-DatabaseInstanceId'

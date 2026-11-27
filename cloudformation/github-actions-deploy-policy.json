@@ -2,165 +2,227 @@
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "CloudFormationDeployment",
+      "Sid": "NetworkAndCompute",
       "Effect": "Allow",
       "Action": [
-        "cloudformation:CreateChangeSet",
-        "cloudformation:DescribeChangeSet",
-        "cloudformation:ExecuteChangeSet",
-        "cloudformation:DeleteChangeSet",
-        "cloudformation:DescribeStacks",
-        "cloudformation:DescribeStackEvents",
-        "cloudformation:DescribeStackResources",
-        "cloudformation:GetTemplate",
-        "cloudformation:ValidateTemplate",
-        "cloudformation:ListStackResources",
-        "cloudformation:DescribeStackResource",
-        "cloudformation:ListChangeSets"
+        "ec2:AssociateRouteTable",
+        "ec2:AttachInternetGateway",
+        "ec2:AuthorizeSecurityGroupEgress",
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:CreateInternetGateway",
+        "ec2:CreateRoute",
+        "ec2:CreateRouteTable",
+        "ec2:CreateSecurityGroup",
+        "ec2:CreateSubnet",
+        "ec2:CreateTags",
+        "ec2:CreateVpc",
+        "ec2:CreateVpcEndpoint",
+        "ec2:DeleteInternetGateway",
+        "ec2:DeleteRoute",
+        "ec2:DeleteRouteTable",
+        "ec2:DeleteSecurityGroup",
+        "ec2:DeleteSubnet",
+        "ec2:DeleteTags",
+        "ec2:DeleteVpc",
+        "ec2:DeleteVpcEndpoints",
+        "ec2:DescribeAccountAttributes",
+        "ec2:DescribeAvailabilityZones",
+        "ec2:DescribeImages",
+        "ec2:DescribeInstanceAttribute",
+        "ec2:DescribeInstanceStatus",
+        "ec2:DescribeInstances",
+        "ec2:DescribeInternetGateways",
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:DescribePrefixLists",
+        "ec2:DescribeRouteTables",
+        "ec2:DescribeSecurityGroupRules",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeTags",
+        "ec2:DescribeVolumes",
+        "ec2:DescribeVpcAttribute",
+        "ec2:DescribeVpcEndpoints",
+        "ec2:DescribeVpcs",
+        "ec2:DetachInternetGateway",
+        "ec2:DisassociateRouteTable",
+        "ec2:ModifyInstanceAttribute",
+        "ec2:ModifyInstanceMetadataOptions",
+        "ec2:ModifySubnetAttribute",
+        "ec2:ModifyVpcAttribute",
+        "ec2:ModifyVpcEndpoint",
+        "ec2:RebootInstances",
+        "ec2:RevokeSecurityGroupEgress",
+        "ec2:RevokeSecurityGroupIngress",
+        "ec2:RunInstances",
+        "ec2:StartInstances",
+        "ec2:StopInstances",
+        "ec2:TerminateInstances"
       ],
       "Resource": "*"
     },
     {
-      "Sid": "ProvisionMediSlotInfrastructure",
+      "Sid": "DatabaseAndBackups",
       "Effect": "Allow",
       "Action": [
-        "ec2:CreateVpc",
-        "ec2:DeleteVpc",
-        "ec2:Describe*",
-        "ec2:ModifyVpcAttribute",
-        "ec2:CreateTags",
-        "ec2:DeleteTags",
-        "ec2:CreateSubnet",
-        "ec2:DeleteSubnet",
-        "ec2:ModifySubnetAttribute",
-        "ec2:CreateInternetGateway",
-        "ec2:DeleteInternetGateway",
-        "ec2:AttachInternetGateway",
-        "ec2:DetachInternetGateway",
-        "ec2:CreateRouteTable",
-        "ec2:DeleteRouteTable",
-        "ec2:AssociateRouteTable",
-        "ec2:DisassociateRouteTable",
-        "ec2:CreateRoute",
-        "ec2:DeleteRoute",
-        "ec2:CreateSecurityGroup",
-        "ec2:DeleteSecurityGroup",
-        "ec2:AuthorizeSecurityGroupIngress",
-        "ec2:AuthorizeSecurityGroupEgress",
-        "ec2:RevokeSecurityGroupIngress",
-        "ec2:RevokeSecurityGroupEgress",
-        "ec2:CreateVpcEndpoint",
-        "ec2:DeleteVpcEndpoints",
-        "rds:CreateDBSubnetGroup",
-        "rds:DeleteDBSubnetGroup",
-        "rds:Describe*",
-        "rds:CreateDBInstance",
-        "rds:ModifyDBInstance",
-        "rds:DeleteDBInstance",
         "rds:AddTagsToResource",
+        "rds:CreateDBInstance",
+        "rds:CreateDBSnapshot",
+        "rds:CreateDBSubnetGroup",
+        "rds:DeleteDBInstance",
+        "rds:DeleteDBInstanceAutomatedBackup",
+        "rds:DeleteDBSubnetGroup",
+        "rds:DescribeDBEngineVersions",
+        "rds:DescribeDBInstanceAutomatedBackups",
+        "rds:DescribeDBInstances",
+        "rds:DescribeDBParameterGroups",
+        "rds:DescribeDBSnapshots",
+        "rds:DescribeDBSubnetGroups",
+        "rds:DescribeEvents",
+        "rds:DescribeOrderableDBInstanceOptions",
         "rds:ListTagsForResource",
-        "dynamodb:CreateTable",
-        "dynamodb:UpdateTable",
-        "dynamodb:DeleteTable",
-        "dynamodb:DescribeTable",
-        "dynamodb:DescribeContinuousBackups",
-        "dynamodb:UpdateContinuousBackups",
-        "dynamodb:TagResource",
-        "dynamodb:UntagResource",
-        "dynamodb:ListTagsOfResource",
-        "s3:CreateBucket",
-        "s3:DeleteBucket",
-        "s3:PutBucketPublicAccessBlock",
-        "s3:GetBucketPublicAccessBlock",
-        "s3:PutEncryptionConfiguration",
-        "s3:GetEncryptionConfiguration",
-        "s3:PutBucketVersioning",
-        "s3:GetBucketVersioning",
-        "s3:PutBucketTagging",
-        "s3:GetBucketTagging",
-        "s3:ListBucket",
-        "s3:GetBucketLocation",
-        "s3:PutObject",
-        "s3:GetObject",
-        "s3:DeleteObject",
-        "ssm:PutParameter",
+        "rds:ModifyDBInstance",
+        "rds:ModifyDBSubnetGroup",
+        "rds:RemoveTagsFromResource",
+        "rds:RestoreDBInstanceToPointInTime"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ParametersAndSecrets",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:AddTagsToResource",
+        "ssm:DeleteParameter",
         "ssm:GetParameter",
         "ssm:GetParameters",
-        "ssm:DeleteParameter",
-        "ssm:AddTagsToResource",
-        "ssm:RemoveTagsFromResource",
+        "ssm:ListTagsForResource",
+        "ssm:PutParameter",
+        "ssm:RemoveTagsFromResource"
+      ],
+      "Resource": [
+        "arn:aws:ssm:*:084767318885:parameter/medislot/*",
+        "arn:aws:ssm:*::parameter/aws/service/ami-amazon-linux-latest/*"
+      ]
+    },
+    {
+      "Sid": "LambdaFunctions",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:AddPermission",
         "lambda:CreateFunction",
-        "lambda:UpdateFunctionCode",
-        "lambda:UpdateFunctionConfiguration",
         "lambda:DeleteFunction",
         "lambda:GetFunction",
         "lambda:GetFunctionConfiguration",
-        "lambda:AddPermission",
-        "lambda:RemovePermission",
         "lambda:InvokeFunction",
+        "lambda:ListTags",
+        "lambda:RemovePermission",
         "lambda:TagResource",
         "lambda:UntagResource",
-        "lambda:ListTags",
-        "apigateway:GET",
-        "apigateway:POST",
-        "apigateway:PUT",
-        "apigateway:PATCH",
-        "apigateway:DELETE",
-        "logs:CreateLogGroup",
-        "logs:DeleteLogGroup",
-        "logs:PutRetentionPolicy",
-        "logs:DeleteRetentionPolicy",
-        "logs:DescribeLogGroups",
-        "logs:TagResource",
-        "logs:UntagResource",
-        "kms:Decrypt",
-        "sts:GetCallerIdentity"
+        "lambda:UpdateFunctionCode",
+        "lambda:UpdateFunctionConfiguration"
+      ],
+      "Resource": [
+        "arn:aws:lambda:*:084767318885:function:medislot-*"
+      ]
+    },
+    {
+      "Sid": "QueuesAndTopics",
+      "Effect": "Allow",
+      "Action": [
+        "sns:CreateTopic",
+        "sns:DeleteTopic",
+        "sns:GetSubscriptionAttributes",
+        "sns:GetTopicAttributes",
+        "sns:ListSubscriptionsByTopic",
+        "sns:ListTagsForResource",
+        "sns:SetSubscriptionAttributes",
+        "sns:SetTopicAttributes",
+        "sns:Subscribe",
+        "sns:TagResource",
+        "sns:Unsubscribe",
+        "sns:UntagResource",
+        "sqs:CreateQueue",
+        "sqs:DeleteQueue",
+        "sqs:GetQueueAttributes",
+        "sqs:GetQueueUrl",
+        "sqs:ListQueueTags",
+        "sqs:SetQueueAttributes",
+        "sqs:TagQueue",
+        "sqs:UntagQueue"
+      ],
+      "Resource": [
+        "arn:aws:sqs:*:084767318885:medislot-*",
+        "arn:aws:sns:*:084767318885:medislot-*"
+      ]
+    },
+    {
+      "Sid": "ObservabilityAndCost",
+      "Effect": "Allow",
+      "Action": [
+        "budgets:ModifyBudget",
+        "budgets:ViewBudget",
+        "cloudwatch:DeleteAlarms",
+        "cloudwatch:DeleteDashboards",
+        "cloudwatch:DescribeAlarms",
+        "cloudwatch:GetDashboard",
+        "cloudwatch:ListTagsForResource",
+        "cloudwatch:PutDashboard",
+        "cloudwatch:PutMetricAlarm",
+        "cloudwatch:TagResource",
+        "cloudwatch:UntagResource",
+        "xray:CreateSamplingRule",
+        "xray:DeleteSamplingRule",
+        "xray:GetSamplingRules",
+        "xray:ListTagsForResource",
+        "xray:TagResource",
+        "xray:UntagResource",
+        "xray:UpdateSamplingRule"
       ],
       "Resource": "*"
     },
     {
-      "Sid": "ManageOnlyMediSlotRoles",
+      "Sid": "DecryptDeploymentSecrets",
       "Effect": "Allow",
       "Action": [
-        "iam:CreateRole",
-        "iam:DeleteRole",
-        "iam:GetRole",
-        "iam:UpdateAssumeRolePolicy",
-        "iam:TagRole",
-        "iam:UntagRole",
-        "iam:PutRolePolicy",
-        "iam:DeleteRolePolicy",
-        "iam:AttachRolePolicy",
-        "iam:DetachRolePolicy"
+        "kms:CreateGrant",
+        "kms:Decrypt",
+        "kms:DescribeKey"
       ],
-      "Resource": [
-        "arn:aws:iam::084767318885:role/MediSlot-*",
-        "arn:aws:iam::084767318885:role/medislot-*"
-      ]
+      "Resource": "arn:aws:kms:*:084767318885:key/*",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": [
+            "ssm.ap-south-1.amazonaws.com",
+            "rds.ap-south-1.amazonaws.com",
+            "sns.ap-south-1.amazonaws.com"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "ReadCallerIdentity",
+      "Effect": "Allow",
+      "Action": [
+        "sts:GetCallerIdentity"
+      ],
+      "Resource": "*"
     },
     {
       "Sid": "ManageOnlyMediSlotManagedPolicies",
       "Effect": "Allow",
       "Action": [
         "iam:CreatePolicy",
-        "iam:DeletePolicy",
-        "iam:GetPolicy",
         "iam:CreatePolicyVersion",
+        "iam:DeletePolicy",
         "iam:DeletePolicyVersion",
-        "iam:SetDefaultPolicyVersion"
+        "iam:GetPolicy",
+        "iam:GetPolicyVersion",
+        "iam:ListPolicyVersions",
+        "iam:SetDefaultPolicyVersion",
+        "iam:TagPolicy",
+        "iam:UntagPolicy"
       ],
       "Resource": "arn:aws:iam::084767318885:policy/MediSlot-*"
-    },
-    {
-      "Sid": "ListIAMMetadata",
-      "Effect": "Allow",
-      "Action": [
-        "iam:ListRolePolicies",
-        "iam:ListAttachedRolePolicies",
-        "iam:ListPolicyVersions",
-        "iam:ListInstanceProfilesForRole"
-      ],
-      "Resource": "*"
     },
     {
       "Sid": "PassOnlyMediSlotRoles",
@@ -168,17 +230,20 @@
       "Action": "iam:PassRole",
       "Resource": [
         "arn:aws:iam::084767318885:role/MediSlot-*",
-        "arn:aws:iam::084767318885:role/medislot-*"
+        "arn:aws:iam::084767318885:role/medislot-*",
+        "arn:aws:iam::084767318885:role/MediSlotApiGatewayCloudWatchRole"
       ]
     },
     {
-      "Sid": "CreateRDSServiceLinkedRole",
+      "Sid": "CreateServiceLinkedRoles",
       "Effect": "Allow",
       "Action": "iam:CreateServiceLinkedRole",
       "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "iam:AWSServiceName": "rds.amazonaws.com"
+          "iam:AWSServiceName": [
+            "rds.amazonaws.com"
+          ]
         }
       }
     }

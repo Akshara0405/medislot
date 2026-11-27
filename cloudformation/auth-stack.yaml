@@ -7,6 +7,11 @@ Parameters:
     AllowedValues: [dev, test, prod]
   ArtifactBucket: {Type: String}
   ArtifactPrefix: {Type: String}
+  FaultInjection:
+    Type: String
+    Default: disabled
+    AllowedValues: [enabled, disabled]
+    Description: enabled (dev only) lets a reschedule request carry X-Fault-Injection to force a saga failure.
 Resources:
   LambdaExecutionBasePolicy:
     Type: AWS::IAM::ManagedPolicy
@@ -21,8 +26,13 @@ Resources:
           - Effect: Allow
             Action: [logs:CreateLogStream, logs:PutLogEvents]
             Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/medislot-${Environment}-*:*'
+          # AWS requirement: Lambda VPC networking actions do not support resource-level permissions.
           - Effect: Allow
             Action: [ec2:CreateNetworkInterface, ec2:DescribeNetworkInterfaces, ec2:DeleteNetworkInterface, ec2:AssignPrivateIpAddresses, ec2:UnassignPrivateIpAddresses]
+            Resource: '*'
+          # AWS requirement: X-Ray trace upload does not support resource-level permissions (Milestone 7 tracing).
+          - Effect: Allow
+            Action: [xray:PutTraceSegments, xray:PutTelemetryRecords]
             Resource: '*'
   AuthenticationRole:
     Type: AWS::IAM::Role
@@ -43,7 +53,8 @@ Resources:
                 Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-AuthTokens'
               - Effect: Allow
                 Action: [kms:Decrypt]
-                Resource: '*'
+                Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition: {StringEquals: {'kms:ViaService': !Sub 'ssm.${AWS::Region}.amazonaws.com'}}
   AuthorizationRole:
     Type: AWS::IAM::Role
     Properties:
@@ -63,13 +74,15 @@ Resources:
                 Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-AuthTokens'
               - Effect: Allow
                 Action: [kms:Decrypt]
-                Resource: '*'
+                Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition: {StringEquals: {'kms:ViaService': !Sub 'ssm.${AWS::Region}.amazonaws.com'}}
   AuthenticationFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub 'medislot-${Environment}-authentication'
       Runtime: python3.12
       Handler: lambda_function.handler
+      TracingConfig: {Mode: Active}
       Role: !GetAtt AuthenticationRole.Arn
       # 60 s for the one-off "migrate" action. 512 MB doubles the CPU share, which halves bcrypt time on login/sign-up.
       Timeout: 60
@@ -87,6 +100,7 @@ Resources:
       FunctionName: !Sub 'medislot-${Environment}-authorization'
       Runtime: python3.12
       Handler: lambda_function.handler
+      TracingConfig: {Mode: Active}
       Role: !GetAtt AuthorizationRole.Arn
       Timeout: 10
       MemorySize: 256
@@ -113,7 +127,8 @@ Resources:
                 Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/*'
               - Effect: Allow
                 Action: [kms:Decrypt]
-                Resource: '*'
+                Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition: {StringEquals: {'kms:ViaService': !Sub 'ssm.${AWS::Region}.amazonaws.com'}}
               - Effect: Allow
                 Action: [dynamodb:Query, dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:BatchWriteItem]
                 Resource:
@@ -137,6 +152,7 @@ Resources:
       FunctionName: !Sub 'medislot-${Environment}-doctor'
       Runtime: python3.12
       Handler: lambda_function.handler
+      TracingConfig: {Mode: Active}
       Role: !GetAtt DoctorRole.Arn
       Timeout: 28
       MemorySize: 512
@@ -169,7 +185,8 @@ Resources:
                 Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/*'
               - Effect: Allow
                 Action: [kms:Decrypt]
-                Resource: '*'
+                Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition: {StringEquals: {'kms:ViaService': !Sub 'ssm.${AWS::Region}.amazonaws.com'}}
               # GET /doctors/{doctorId}/slots (shared by patients and doctors) is read-only: Query on the LSI, nothing else.
               - Effect: Allow
                 Action: [dynamodb:Query]
@@ -202,6 +219,7 @@ Resources:
       Description: Patient profile CRUD, doctor search, public doctor profile and the shared doctor/patient slots endpoint.
       Runtime: python3.12
       Handler: lambda_function.handler
+      TracingConfig: {Mode: Active}
       Role: !GetAtt PatientRole.Arn
       Timeout: 28
       MemorySize: 512
@@ -239,7 +257,8 @@ Resources:
                 Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/*'
               - Effect: Allow
                 Action: [kms:Decrypt]
-                Resource: '*'
+                Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition: {StringEquals: {'kms:ViaService': !Sub 'ssm.${AWS::Region}.amazonaws.com'}}
               - Effect: Allow
                 # DeleteItem: removes unbooked slots of consultation types that no longer exist.
                 Action: [dynamodb:Query, dynamodb:PutItem, dynamodb:DeleteItem]
@@ -258,6 +277,7 @@ Resources:
       FunctionName: !Sub 'medislot-${Environment}-slot-materializer'
       Runtime: python3.12
       Handler: lambda_function.handler
+      TracingConfig: {Mode: Active}
       Role: !GetAtt MaterializerRole.Arn
       Timeout: 300
       MemorySize: 512
@@ -648,7 +668,8 @@ Resources:
                 Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/medislot/${Environment}/*'
               - Effect: Allow
                 Action: [kms:Decrypt]
-                Resource: '*'
+                Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition: {StringEquals: {'kms:ViaService': !Sub 'ssm.${AWS::Region}.amazonaws.com'}}
               # Seats: read + conditional update only. No PutItem/DeleteItem: the booking engine can never
               # create or remove a slot, only take or give back a seat under a version check.
               - Effect: Allow
@@ -672,6 +693,22 @@ Resources:
                 Action: [events:PutEvents]
                 Resource: !ImportValue
                   Fn::Sub: 'MediSlot-${Environment}-BookingEventBusArn'
+              # Milestone 6: waitlists, hold offers, reminder markers
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-Waitlist'
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-HoldOffers'
+              - Effect: Allow
+                Action: [dynamodb:Query]
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-HoldOffers/index/GSI_OfferExpiry'
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:DeleteItem]
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/MediSlot-${Environment}-NotificationLog'
+              # Milestone 6: the waitlist-promotions queue (SlotSeatFreed) triggers this function
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes, sqs:ChangeMessageVisibility]
+                Resource: !Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:medislot-${Environment}-waitlist-promotions'
   BookingLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -682,9 +719,10 @@ Resources:
     DependsOn: BookingLogGroup
     Properties:
       FunctionName: !Sub 'medislot-${Environment}-booking'
-      Description: Booking engine (Milestone 5) - optimistic concurrency, idempotency, cancellations, refund ledger, events.
+      Description: Booking engine (M5) + reschedule saga steps, waitlists, hold offers, reminders, no-show sweeper (M6).
       Runtime: python3.12
       Handler: lambda_function.handler
+      TracingConfig: {Mode: Active}
       Role: !GetAtt BookingRole.Arn
       Timeout: 28
       MemorySize: 512
@@ -703,6 +741,10 @@ Resources:
             Fn::Sub: 'MediSlot-${Environment}-IdempotencyTableName'
           EVENT_BUS_NAME: !ImportValue
             Fn::Sub: 'MediSlot-${Environment}-BookingEventBusName'
+          WAITLIST_TABLE: !Sub 'MediSlot-${Environment}-Waitlist'
+          HOLD_OFFERS_TABLE: !Sub 'MediSlot-${Environment}-HoldOffers'
+          NOTIFICATION_LOG_TABLE: !Sub 'MediSlot-${Environment}-NotificationLog'
+          FAULT_INJECTION: !Ref FaultInjection
   # Seat sweeper: gives back the seat of any cancellation whose in-request release did not finish.
   BookingSeatSweeperSchedule:
     Type: AWS::Events::Rule
@@ -756,6 +798,33 @@ Resources:
   DoctorAppointmentItemResource:
     Type: AWS::ApiGateway::Resource
     Properties: {RestApiId: !Ref RestApi, ParentId: !Ref DoctorAppointmentsResource, PathPart: '{appointmentId}'}
+  PatientAppointmentRescheduleResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref PatientAppointmentItemResource, PathPart: reschedule}
+  PatientReschedulesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref PatientResource, PathPart: reschedules}
+  PatientRescheduleItemResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref PatientReschedulesResource, PathPart: '{requestId}'}
+  PatientWaitlistsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref PatientResource, PathPart: waitlists}
+  PatientWaitlistItemResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref PatientWaitlistsResource, PathPart: '{waitlistId}'}
+  PatientOffersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref PatientResource, PathPart: offers}
+  PatientOfferItemResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref PatientOffersResource, PathPart: '{offerId}'}
+  PatientOfferAcceptResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref PatientOfferItemResource, PathPart: accept}
+  PatientOfferDeclineResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref RestApi, ParentId: !Ref PatientOfferItemResource, PathPart: decline}
   DoctorAppointmentStatusResource:
     Type: AWS::ApiGateway::Resource
     Properties: {RestApiId: !Ref RestApi, ParentId: !Ref DoctorAppointmentItemResource, PathPart: 'status'}
@@ -849,21 +918,70 @@ Resources:
       AuthorizationType: CUSTOM
       AuthorizerId: !Ref ApiAuthorizer
       Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'}
-  BookingRetriesExhaustedAlarm:
-    Type: AWS::CloudWatch::Alarm
+  BookingReschedulePostMethod:
+    Type: AWS::ApiGateway::Method
     Properties:
-      AlarmName: !Sub 'medislot-${Environment}-booking-retries-exhausted'
-      AlarmDescription: A booking gave up after maxOccAttempts optimistic-concurrency retries (503 to the patient).
-      Namespace: MediSlot/Booking
-      MetricName: BookingRetriesExhausted
-      Dimensions: [{Name: Environment, Value: !Ref Environment}]
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-  # One page for the checkpoint: contention (retries) next to outcomes, cancellations by refund tier, events.
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PatientAppointmentRescheduleResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'}
+  BookingRescheduleStatusGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PatientRescheduleItemResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'}
+  BookingWaitlistsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PatientWaitlistsResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'}
+  BookingWaitlistsPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PatientWaitlistsResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'}
+  BookingWaitlistDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PatientWaitlistItemResource
+      HttpMethod: DELETE
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'}
+  BookingOfferAcceptPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PatientOfferAcceptResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'}
+  BookingOfferDeclinePostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PatientOfferDeclineResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration: {Type: AWS_PROXY, IntegrationHttpMethod: POST, Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingFunction.Arn}/invocations'}
+  # (The BookingRetriesExhausted alarm moved to observability-stack.yaml with the other Milestone 7 alarms.)
   BookingDashboard:
     Type: AWS::CloudWatch::Dashboard
     Properties:
@@ -905,12 +1023,12 @@ Resources:
   # A NEW logical id per change makes CloudFormation create a fresh deployment that includes the new routes
   # (Milestone 5 booking engine + shared doctor/patient slots endpoint, /doctor/me/schedule removed;
   #  then doctor appointment status + day cancellations for blackouts).
-  ApiDeploymentDoctorStatus:
+  ApiDeploymentMilestone6:
     Type: AWS::ApiGateway::Deployment
-    DependsOn: [BookingAppointmentsPostMethod, BookingAppointmentsGetMethod, BookingAppointmentItemGetMethod, BookingRefundQuoteGetMethod, BookingCancelPostMethod, BookingRefundsGetMethod, BookingDoctorAppointmentsGetMethod, BookingSlotCancellationsPostMethod, BookingDayCancellationsPostMethod, BookingAppointmentStatusPostMethod, PatientMePostMethod, PatientMePutMethod, PatientMeDeleteMethod, PatientProfileItemGetMethod, DirectorySearchGetMethod, DirectoryFiltersGetMethod, DirectoryDoctorGetMethod, DirectoryDoctorSlotsGetMethod, DoctorSlotBlocksPostMethod, HospitalsGetMethod, RegisterPatientMethod, RegisterDoctorMethod, LoginMethod, RefreshMethod, LogoutMethod, PatientMeMethod, DoctorMeMethod, DoctorMePutMethod, DoctorPhotoPostMethod, DoctorAvailabilityGetMethod, DoctorAvailabilityPutMethod, DoctorTypesGetMethod, DoctorTypesPostMethod, DoctorTypeItemPutMethod, DoctorTypeItemDeleteMethod, DoctorBlackoutsGetMethod, DoctorBlackoutsPostMethod, DoctorBlackoutItemDeleteMethod]
+    DependsOn: [BookingReschedulePostMethod, BookingRescheduleStatusGetMethod, BookingWaitlistsGetMethod, BookingWaitlistsPostMethod, BookingWaitlistDeleteMethod, BookingOfferAcceptPostMethod, BookingOfferDeclinePostMethod, BookingAppointmentsPostMethod, BookingAppointmentsGetMethod, BookingAppointmentItemGetMethod, BookingRefundQuoteGetMethod, BookingCancelPostMethod, BookingRefundsGetMethod, BookingDoctorAppointmentsGetMethod, BookingSlotCancellationsPostMethod, BookingDayCancellationsPostMethod, BookingAppointmentStatusPostMethod, PatientMePostMethod, PatientMePutMethod, PatientMeDeleteMethod, PatientProfileItemGetMethod, DirectorySearchGetMethod, DirectoryFiltersGetMethod, DirectoryDoctorGetMethod, DirectoryDoctorSlotsGetMethod, DoctorSlotBlocksPostMethod, HospitalsGetMethod, RegisterPatientMethod, RegisterDoctorMethod, LoginMethod, RefreshMethod, LogoutMethod, PatientMeMethod, DoctorMeMethod, DoctorMePutMethod, DoctorPhotoPostMethod, DoctorAvailabilityGetMethod, DoctorAvailabilityPutMethod, DoctorTypesGetMethod, DoctorTypesPostMethod, DoctorTypeItemPutMethod, DoctorTypeItemDeleteMethod, DoctorBlackoutsGetMethod, DoctorBlackoutsPostMethod, DoctorBlackoutItemDeleteMethod]
     Properties:
       RestApiId: !Ref RestApi
-      Description: !Sub 'MediSlot ${Environment} API deployment - doctor appointment status + blackout day cancellations'
+      Description: !Sub 'MediSlot ${Environment} API deployment - Milestone 6 reschedule, waitlists, hold offers'
   # One JSON line per API call (success or failure), with total latency, Lambda latency and authorizer latency.
   ApiAccessLogGroup:
     Type: AWS::Logs::LogGroup
@@ -921,8 +1039,9 @@ Resources:
     Type: AWS::ApiGateway::Stage
     Properties:
       RestApiId: !Ref RestApi
-      DeploymentId: !Ref ApiDeploymentDoctorStatus
+      DeploymentId: !Ref ApiDeploymentMilestone6
       StageName: !Ref Environment
+      TracingEnabled: true
       AccessLogSetting:
         DestinationArn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ApiAccessLogGroup}'
         Format: '{"requestId":"$context.requestId","time":"$context.requestTime","ip":"$context.identity.sourceIp","method":"$context.httpMethod","resource":"$context.resourcePath","path":"$context.path","status":"$context.status","latencyMs":"$context.responseLatency","lambdaLatencyMs":"$context.integration.latency","lambdaStatus":"$context.integration.status","authorizerStatus":"$context.authorizer.status","authorizerLatencyMs":"$context.authorizer.latency","userId":"$context.authorizer.userId","error":"$context.error.message"}'
@@ -971,6 +1090,12 @@ Outputs:
   MaterializerFunctionName: {Value: !Ref MaterializerFunction}
   PatientFunctionName: {Value: !Ref PatientFunction}
   BookingFunctionName: {Value: !Ref BookingFunction}
+  BookingFunctionArn:
+    Value: !GetAtt BookingFunction.Arn
+    Export: {Name: !Sub 'MediSlot-${Environment}-BookingFunctionArn'}
+  RestApiId:
+    Value: !Ref RestApi
+    Export: {Name: !Sub 'MediSlot-${Environment}-RestApiId'}
   BookingUrl:
     Description: POST here with an Idempotency-Key header to book a slot.
     Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/patient/appointments'

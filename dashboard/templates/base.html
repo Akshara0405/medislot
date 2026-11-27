@@ -21,7 +21,7 @@
       <a class="brand" href="/"><span class="brand-mark">✚</span><span>medislot<span style="color:var(--teal)">.</span></span></a>
       <nav class="nav-main" aria-label="Main">
         {% if role == 'patient' %}
-          {% for key, label in [('find', 'Find a doctor'), ('appointments', 'My appointments'), ('cancelled', 'Cancelled'), ('refunds', 'Refunds'), ('profile', 'My profile')] %}
+          {% for key, label in [('find', 'Find a doctor'), ('appointments', 'My appointments'), ('waitlists', 'Waitlists'), ('cancelled', 'Cancelled'), ('refunds', 'Refunds'), ('profile', 'My profile')] %}
             <a class="nav-link{{ ' active' if current_tab == key else '' }}" href="/patient/dashboard{{ '' if key == 'find' else '?tab=' ~ key }}"{% if current_tab == key %} aria-current="page"{% endif %}>{{ label }}</a>
           {% endfor %}
         {% elif role == 'doctor' %}

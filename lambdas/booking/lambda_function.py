@@ -1,8 +1,10 @@
-"""MediSlot booking engine Lambda (Milestone 5): bookings, concurrency, idempotency, cancellations, refunds.
+"""MediSlot booking engine Lambda (Milestones 5 + 6): bookings, concurrency, idempotency, cancellations, refunds,
+reschedule saga steps, waitlists, hold offers, reminders and the no-show sweeper.
 
-Everything Milestone 5 adds lives in this ONE file. Read docs/CONCURRENCY_DESIGN_NOTE.md first.
-RDS tables used: appointments, refund_ledger (plus the existing users, patients, doctors, hospitals,
-consultation_types, consultations). DynamoDB tables used: Slots, Idempotency.
+Milestone 5 lives in this file; Milestone 6 lives in workflows.py (same zip). Read docs/CONCURRENCY_DESIGN_NOTE.md
+and docs/DESIGN_NOTES.md first. RDS tables used: appointments, refund_ledger (plus users, patients, doctors,
+hospitals, consultation_types, consultations). DynamoDB tables used: Slots, Idempotency, Waitlist, HoldOffers,
+NotificationLog.
 
   Patient (JWT authorizer; /patient/* only accepts patient tokens)
     POST   /patient/appointments                            book a seat  (header Idempotency-Key required)
@@ -11,6 +13,10 @@ consultation_types, consultations). DynamoDB tables used: Slots, Idempotency.
     GET    /patient/appointments/{appointmentId}/refund-quote   what a cancellation would refund right now
     POST   /patient/appointments/{appointmentId}/cancel     cancel + refund (repeat-safe)
     GET    /patient/refunds                                 the caller's refund ledger
+    POST   /patient/appointments/{appointmentId}/reschedule  {"slotId"}  (Milestone 6, Step Functions saga)
+    GET    /patient/reschedules/{requestId}                 saga outcome
+    GET|POST /patient/waitlists, DELETE /patient/waitlists/{waitlistId}
+    POST   /patient/offers/{offerId}/accept | /decline       hold offers from a waitlist
 
   Doctor (JWT authorizer; /doctor/* only accepts doctor tokens)
     GET    /doctor/me/appointments?from=YYYY-MM-DD&days=1..30&includeCancelled=true|false
@@ -22,6 +28,8 @@ consultation_types, consultations). DynamoDB tables used: Slots, Idempotency.
     {"action": "release-pending"}                 EventBridge schedule (5 min): free seats a cancellation missed
     {"action": "reconcile-slot", "slotId": ...}   compare a slot's seats with RDS (+ "releaseOrphans": true)
     {"action": "policy"}                          show the refund policy and limits read from SSM
+    {"action": "saga" | "offer-sweep" | "reminders" | "no-show-sweep" | "promote"}   Milestone 6 (workflows.py)
+    SQS records from the waitlist-promotions queue                                 Milestone 6 (workflows.py)
 
 How a seat is taken (the short version)
   1. Idempotency-Key is claimed in DynamoDB (conditional put). A replay returns the ORIGINAL response.
@@ -36,12 +44,14 @@ How a seat is taken (the short version)
   5. AppointmentBooked / AppointmentCancelled / SlotSeatFreed / SlotCancelled go to EventBridge after commit.
 """
 import base64
+import contextlib
 import hashlib
 import json
 import logging
 import os
 import random
 import re
+import sys
 import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
@@ -426,6 +436,9 @@ def reserve_seat(table, slot_id, ref, now, lim, stats, sleep=None, rng=None):
         item = read_slot(table, slot_id)
         if not item:
             raise ApiError(404, 'SLOT_NOT_FOUND', 'Slot not found.')
+        if item.get('hold_ref') == ref:
+            raise ApiError(409, 'OFFER_PENDING', 'A seat in this slot is being held for you from the waitlist. '
+                                                 'Accept the offer under Waitlists to book it.')
         if ref in (item.get('booking_refs') or set()):
             # This patient already holds a seat here (a live booking, one still being written, or one whose
             # cancellation is still releasing it). One seat per patient per slot.
@@ -471,8 +484,8 @@ def release_seat(table, slot_id, ref, max_attempts=8, sleep=None):
     sleep = sleep or time.sleep
     for attempt in range(1, max_attempts + 1):
         item = read_slot(table, slot_id)
-        if not item or ref not in (item.get('booking_refs') or set()):
-            return False
+        if not item or ref not in (item.get('booking_refs') or set()) or item.get('hold_ref') == ref:
+            return False                              # (a held seat is released by workflows.release_hold only)
         seen = int(item.get('version', 0) or 0)
         stays_closed = item.get('status') == CLOSED or item.get('manual_block')
         values = {':one': 1, ':next': seen + 1, ':ref': ref, ':refset': {ref},
@@ -485,7 +498,8 @@ def release_seat(table, slot_id, ref, max_attempts=8, sleep=None):
                 Key=slot_key_for(slot_id),
                 UpdateExpression='SET booked_count = if_not_exists(booked_count, :one) - :one, version = :next, '
                                  '#s = :status DELETE booking_refs :refset',
-                ConditionExpression=guard + ' AND contains(booking_refs, :ref)',
+                ConditionExpression=guard + ' AND contains(booking_refs, :ref)'
+                                            ' AND (attribute_not_exists(hold_ref) OR hold_ref <> :ref)',
                 ExpressionAttributeNames={'#s': 'status'}, ExpressionAttributeValues=values)
             return True
         except ClientError as exc:
@@ -732,19 +746,20 @@ class Store:
                         (doctor_id, naive(start_utc), naive(end_utc)))
             return cur.fetchall()
 
-    def limit_problem(self, cur, booking, lim, now):
-        """The first patient-limit rule this booking would break, as an ApiError, or None."""
+    def limit_problem(self, cur, booking, lim, now, exclude=None):
+        """The first patient-limit rule this booking would break, as an ApiError, or None.
+        `exclude` = an appointment id to ignore (the one being rescheduled)."""
         day_start, day_end = local_day_bounds(booking['local_date'], booking['timezone'])
         cur.execute("SELECT "
                     "COALESCE(SUM(a.slot_id = %s), 0) AS same_slot, "
                     "COALESCE(SUM(a.doctor_id = %s AND a.slot_start_utc >= %s AND a.slot_start_utc < %s), 0) AS same_doctor_day, "
                     "COALESCE(SUM(a.slot_start_utc > %s), 0) AS upcoming, "
                     "COALESCE(SUM(a.slot_start_utc < %s AND a.slot_end_utc > %s), 0) AS overlapping "
-                    "FROM appointments a WHERE a.patient_id = %s AND a.active_flag = 1 "
+                    "FROM appointments a WHERE a.patient_id = %s AND a.active_flag = 1 AND a.appointment_id <> %s "
                     "AND (a.slot_end_utc > %s OR (a.slot_start_utc >= %s AND a.slot_start_utc < %s))",
                     (booking['slot_id'], booking['doctor_id'], naive(day_start), naive(day_end), naive(now),
-                     naive(booking['ends_at']), naive(booking['starts_at']), booking['patient_id'], naive(now),
-                     naive(day_start), naive(day_end)))
+                     naive(booking['ends_at']), naive(booking['starts_at']), booking['patient_id'], int(exclude or 0),
+                     naive(now), naive(day_start), naive(day_end)))
         row = cur.fetchone() or {}
         if int(row.get('same_slot') or 0):
             return ApiError(409, 'ALREADY_BOOKED', 'You already have a seat in this slot.')
@@ -901,6 +916,93 @@ class Store:
             metric('RefundAmount', float(refund['refundAmount']), 'None', Tier=DOCTOR_CANCEL_TIER)
         return row, refund, True
 
+    # ------------------------------------------------------------------ Milestone 6
+    def reschedule_precheck(self, booking, lim, now, appointment_id):
+        with self.conn.cursor() as cur:
+            problem = self.limit_problem(cur, booking, lim, now, exclude=appointment_id)
+        self.conn.rollback()
+        return problem
+
+    def move_appointment(self, appointment_id, from_slot, booking, lim, now, slot_cancelled):
+        """Saga step 2: move one CONFIRMED appointment to the target slot (one transaction). Idempotent:
+        returns 'moved', or 'already' when a previous attempt of this step already moved it."""
+        self.conn.rollback()
+        with self.conn.cursor() as cur:
+            cur.execute('SELECT user_id FROM users WHERE user_id = %s AND is_active = TRUE FOR UPDATE',
+                        (booking['patient_id'],))
+            if not cur.fetchone():
+                raise ApiError(403, 'ACCOUNT_INACTIVE', 'This account is closed.')
+            cur.execute('SELECT user_id FROM doctors WHERE user_id = %s LOCK IN SHARE MODE', (booking['doctor_id'],))
+            cur.execute('SELECT appointment_id, status, slot_id FROM appointments WHERE appointment_id = %s '
+                        'AND patient_id = %s FOR UPDATE', (appointment_id, booking['patient_id']))
+            row = cur.fetchone()
+            if row and row['slot_id'] == booking['slot_id']:
+                self.conn.commit()
+                return 'already'
+            if not row or row['status'] != CONFIRMED or row['slot_id'] != from_slot:
+                raise ApiError(409, 'APPOINTMENT_CHANGED', 'The appointment changed while it was being rescheduled.')
+            if slot_cancelled():
+                raise ApiError(409, 'SLOT_CANCELLED', 'The doctor has cancelled the target slot.')
+            problem = self.limit_problem(cur, booking, lim, now, exclude=appointment_id)
+            if problem:
+                raise problem
+            cur.execute('UPDATE appointments SET slot_id = %s, slot_start_utc = %s, slot_end_utc = %s, '
+                        'reschedule_count = reschedule_count + 1 WHERE appointment_id = %s AND slot_id = %s '
+                        "AND status = 'CONFIRMED'",
+                        (booking['slot_id'], naive(booking['starts_at']), naive(booking['ends_at']), appointment_id,
+                         from_slot))
+        self.conn.commit()
+        return 'moved'
+
+    def unmove_appointment(self, appointment_id, to_slot, original):
+        """Saga compensation: put the appointment back in its original slot. Idempotent ('reverted' / 'already')."""
+        self.conn.rollback()
+        with self.conn.cursor() as cur:
+            cur.execute('UPDATE appointments SET slot_id = %s, slot_start_utc = %s, slot_end_utc = %s, '
+                        'reschedule_count = GREATEST(reschedule_count, 1) - 1 WHERE appointment_id = %s AND slot_id = %s',
+                        (original['slot_id'], naive(original['starts_at']), naive(original['ends_at']),
+                         appointment_id, to_slot))
+            changed = cur.rowcount
+        self.conn.commit()
+        return 'reverted' if changed else 'already'
+
+    @contextlib.contextmanager
+    def patient_lock(self, patient_id):
+        """Hold the patient's users row (FOR UPDATE) while the block runs: serialises one patient's waitlist joins."""
+        self.conn.rollback()
+        with self.conn.cursor() as cur:
+            cur.execute('SELECT user_id FROM users WHERE user_id = %s FOR UPDATE', (patient_id,))
+        try:
+            yield
+        finally:
+            self.conn.rollback()
+
+    def upcoming_confirmed(self, start_utc, end_utc, limit=1000):
+        with self.conn.cursor() as cur:
+            cur.execute(APPOINTMENT_SELECT + "WHERE a.status = 'CONFIRMED' AND a.slot_start_utc > %s "
+                        'AND a.slot_start_utc <= %s ORDER BY a.slot_start_utc LIMIT %s',
+                        (naive(start_utc), naive(end_utc), limit))
+            rows = cur.fetchall()
+        self.conn.rollback()
+        return rows
+
+    def stale_confirmed(self, cutoff, limit=200):
+        with self.conn.cursor() as cur:
+            cur.execute(APPOINTMENT_SELECT + "WHERE a.status = 'CONFIRMED' AND a.slot_end_utc <= %s "
+                        'ORDER BY a.slot_end_utc LIMIT %s', (naive(cutoff), limit))
+            rows = cur.fetchall()
+        self.conn.rollback()
+        return rows
+
+    def mark_no_show(self, appointment_id, cutoff):
+        self.conn.rollback()
+        with self.conn.cursor() as cur:
+            cur.execute("UPDATE appointments SET status = 'NO_SHOW', active_flag = NULL WHERE appointment_id = %s "
+                        "AND status = 'CONFIRMED' AND slot_end_utc <= %s", (appointment_id, naive(cutoff)))
+            changed = cur.rowcount
+        self.conn.commit()
+        return bool(changed)
+
     def unreleased_cancellations(self, now, limit=200):
         """Cancelled appointments of future slots, where the patient holds no newer live booking of that slot."""
         with self.conn.cursor() as cur:
@@ -964,9 +1066,21 @@ def publish(events, attempts=3, sleep=None):
 
 
 def appointment_event(kind, row, **extra):
-    return (kind, dict({'appointmentId': int(row['appointment_id']), 'patientId': int(row['patient_id']),
-                        'doctorId': int(row['doctor_id']), 'slotId': row['slot_id'],
-                        'startsAt': iso(utc(row['slot_start_utc'])), 'occurredAt': iso(clock())}, **extra))
+    detail = {'appointmentId': int(row['appointment_id']), 'patientId': int(row['patient_id']),
+              'doctorId': int(row['doctor_id']), 'slotId': row['slot_id'],
+              'startsAt': iso(utc(row['slot_start_utc'])), 'occurredAt': iso(clock()),
+              'reference': short_ref(row['appointment_id'])}
+    # Names and timezone when the row came from APPOINTMENT_SELECT, so the notifier (outside the VPC, no RDS)
+    # can write a readable message.
+    if row.get('doctor_first'):
+        detail['doctorName'] = f"Dr. {row['doctor_first']} {row.get('doctor_last') or ''}".strip()
+    if row.get('patient_first'):
+        detail['patientName'] = f"{row['patient_first']} {row.get('patient_last') or ''}".strip()
+    if row.get('timezone'):
+        detail['timezone'] = row['timezone']
+    if row.get('type_label'):
+        detail['consultation'] = row['type_label']
+    return kind, dict(detail, **extra)
 
 
 def free_seat(row, bookable, cause):
@@ -1027,6 +1141,14 @@ ROUTES = {
     ('POST', '/doctor/me/appointments/{appointmentId}/status'): 'doctor_set_status',
     ('POST', '/doctor/me/slot-cancellations'): 'doctor_cancel_slot',
     ('POST', '/doctor/me/day-cancellations'): 'doctor_cancel_day',
+    # Milestone 6 (workflows.py)
+    ('POST', '/patient/appointments/{appointmentId}/reschedule'): 'reschedule',
+    ('GET', '/patient/reschedules/{requestId}'): 'reschedule_status',
+    ('GET', '/patient/waitlists'): 'list_waitlists',
+    ('POST', '/patient/waitlists'): 'join_waitlist',
+    ('DELETE', '/patient/waitlists/{waitlistId}'): 'leave_waitlist',
+    ('POST', '/patient/offers/{offerId}/accept'): 'accept_offer',
+    ('POST', '/patient/offers/{offerId}/decline'): 'decline_offer',
 }
 
 
@@ -1044,10 +1166,21 @@ def resolve(event):
         params['appointmentId'] = parts[2]
         if len(parts) == 3:
             return '/patient/appointments/{appointmentId}', params
-        if len(parts) == 4 and parts[3] in ('refund-quote', 'cancel'):
+        if len(parts) == 4 and parts[3] in ('refund-quote', 'cancel', 'reschedule'):
             return '/patient/appointments/{appointmentId}/' + parts[3], params
     elif parts == ['patient', 'refunds']:
         return '/patient/refunds', params
+    elif len(parts) == 3 and parts[:2] == ['patient', 'reschedules']:
+        params['requestId'] = parts[2]
+        return '/patient/reschedules/{requestId}', params
+    elif parts[:2] == ['patient', 'waitlists'] and len(parts) in (2, 3):
+        if len(parts) == 2:
+            return '/patient/waitlists', params
+        params['waitlistId'] = parts[2]
+        return '/patient/waitlists/{waitlistId}', params
+    elif len(parts) == 4 and parts[:2] == ['patient', 'offers'] and parts[3] in ('accept', 'decline'):
+        params['offerId'] = parts[2]
+        return '/patient/offers/{offerId}/' + parts[3], params
     elif parts in (['doctor', 'me', 'appointments'], ['doctor', 'me', 'slot-cancellations'],
                    ['doctor', 'me', 'day-cancellations']):
         return '/' + '/'.join(parts), params
@@ -1067,6 +1200,9 @@ def caller(event, role):
 @logged('booking')
 def handler(event, context):
     event = event or {}
+    workflows.bind(_SELF)
+    if event.get('Records'):                         # SQS: waitlist-promotions queue (SlotSeatFreed events)
+        return workflows.handle_sqs(event)
     if event.get('action'):
         return direct_action(event)
     cid = correlation(event)
@@ -1202,6 +1338,9 @@ def take_seat(store, patient_id, scope, idem, record, state, slot_id, match, cid
     doctor_id, type_id = int(match.group(1)), int(match.group(2))
     if str(slot.get('doctor_id')) != str(doctor_id) or str(slot.get('consultation_type_id')) != str(type_id):
         raise ApiError(409, 'SLOT_INVALID', 'This slot is not bookable.')
+    if slot.get('hold_ref') == ref:
+        raise ApiError(409, 'OFFER_PENDING', 'A seat in this slot is being held for you from the waitlist. '
+                                             'Accept the offer under Waitlists to book it.')
     adopt = state == 'takeover' and record.get('slot_version') is not None and \
         ref in (slot.get('booking_refs') or set())        # the dead attempt already holds our seat: finish it
     if not adopt:
@@ -1421,6 +1560,7 @@ def doctor_appointments(store, event, params, cid):
 def cancel_slot_core(store, table, doctor_id, slot_id, reason, now, cause='SLOT_CANCELLED_BY_DOCTOR'):
     """Close one slot and cancel + fully refund every live booking on it. Returns (rows, events to publish)."""
     close_slot(table, slot_id, now)                   # 1. CLOSED + cancelled_by_doctor: no new seat from here on
+    workflows.withdraw_offers(slot_id)                # (a waitlist offer on it is withdrawn, its seat released)
     rows = store.cancel_slot(doctor_id, slot_id, now)  # 2. every live booking -> cancelled + 100% refund
     events = []
     for row in rows:                                  # 3. seats back, then events
@@ -1556,6 +1696,16 @@ def direct_action(event):
         if action == 'reconcile-slot':
             return {'statusCode': 200, 'body': reconcile_slot(store, str(event.get('slotId') or ''),
                                                               bool(event.get('releaseOrphans')))}
+        if action == 'saga':                          # Step Functions task: errors must propagate (Retry/Catch)
+            return {'statusCode': 200, 'body': workflows.saga_step(store, event)}
+        if action == 'offer-sweep':
+            return {'statusCode': 200, 'body': workflows.expire_offers(store=store)}
+        if action == 'reminders':
+            return {'statusCode': 200, 'body': workflows.dispatch_reminders(store)}
+        if action == 'no-show-sweep':
+            return {'statusCode': 200, 'body': workflows.sweep_no_shows(store)}
+        if action == 'promote':
+            return {'statusCode': 200, 'body': workflows.promote(str(event.get('slotId') or ''))}
         return {'statusCode': 400, 'body': {'message': f'unknown action {action!r}'}}
     finally:
         release(conn)
@@ -1588,7 +1738,7 @@ def reconcile_slot(store, slot_id, release_orphans=False):
     item = read_slot(slots_table(), slot_id)
     if not item:
         return {'slotId': slot_id, 'found': False}
-    refs = set(item.get('booking_refs') or set())
+    refs = set(item.get('booking_refs') or set()) - {item.get('hold_ref')}   # a waitlist hold is not a booking
     # COMPLETED and NO_SHOW appointments keep their seat (the slot is in the past), so they count as live here too.
     live = {seat_ref(r['patient_id']) for r in store.slot_rows(slot_id)
             if r['status'] in (CONFIRMED, COMPLETED, NO_SHOW)}
@@ -1598,3 +1748,24 @@ def reconcile_slot(store, slot_id, release_orphans=False):
             'seatTags': len(refs), 'liveAppointments': len(live), 'missingSeats': sorted(live - refs),
             'orphanTags': orphans, 'released': released,
             'consistent': int(item.get('booked_count', 0) or 0) == len(refs) == len(live) and refs == live}
+
+
+# =============================================================================================== Milestone 6 wiring
+
+class _Self:
+    """This module as an object, so workflows.py reaches every helper (and every test monkeypatch) through it."""
+
+    def __getattr__(self, name):
+        try:
+            return globals()[name]
+        except KeyError:
+            raise AttributeError(name)
+
+
+_SELF = _Self()
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import workflows  # noqa: E402  (same folder in the Lambda zip)
+
+workflows.bind(_SELF)
+from workflows import (accept_offer, decline_offer, join_waitlist, leave_waitlist, list_waitlists,  # noqa: E402,F401
+                       reschedule, reschedule_status)
