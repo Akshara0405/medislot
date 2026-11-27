@@ -3,7 +3,8 @@
 useDefault = true
 
 [allowlist]
-description = "Postman workspace/collection IDs written by the Postman app (identifiers, not credentials)"
+description = "Known false positives: Postman workspace IDs and fake tokens in unit tests (not credentials)"
 paths = [
   '''^\.postman/resources\.yaml$''',
+  '''^tests/test_m6_portal\.py$''',
 ]
